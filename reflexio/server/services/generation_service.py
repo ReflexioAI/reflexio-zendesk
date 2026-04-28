@@ -36,6 +36,10 @@ from reflexio.server.services.profile.profile_generation_service import (
 from reflexio.server.services.profile.profile_generation_service_utils import (
     ProfileGenerationRequest,
 )
+from reflexio.server.services.reflection.reflection_service import ReflectionService
+from reflexio.server.services.reflection.reflection_service_utils import (
+    ReflectionServiceRequest,
+)
 
 logger = logging.getLogger(__name__)
 # Stale lock timeout - if cleanup started > 10 min ago and still "in_progress", assume it crashed
@@ -171,6 +175,15 @@ class GenerationService:
             # Extract source (empty string treated as None)
             source = publish_user_interaction_request.source or None
 
+            # Reflection runs as its own sliding-window step BEFORE the
+            # extractor pool spins up, so any replacements it makes are
+            # visible to the extractors when they retrieve existing
+            # profile/playbook context. Wrapped in a broad except so a
+            # reflection bug never breaks the publish.
+            self._maybe_run_reflection(
+                user_id=user_id, agent_version=agent_version, source=source
+            )
+
             # Create generation services and requests
             # Each service writes to separate storage tables and has no dependencies on others
             profile_generation_service = ProfileGenerationService(
@@ -296,6 +309,34 @@ class GenerationService:
     # private methods
     # ===============================
 
+    def _maybe_run_reflection(
+        self, *, user_id: str, agent_version: str, source: str | None
+    ) -> None:
+        """Best-effort reflection pass before extraction.
+
+        Any failure is caught and logged so the surrounding publish
+        flow (extraction + delayed evaluation) is unaffected.
+        """
+        try:
+            service = ReflectionService(
+                request_context=self.request_context,
+                llm_client=self.client,
+            )
+            service.run(
+                ReflectionServiceRequest(
+                    user_id=user_id,
+                    agent_version=agent_version,
+                    source=source,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — must not break publish
+            logger.warning(
+                "reflection step failed for user %s: %s (error_type=%s)",
+                user_id,
+                exc,
+                type(exc).__name__,
+            )
+
     def _cleanup_old_interactions_if_needed(self) -> None:
         """
         Check total interaction count and cleanup oldest interactions if threshold exceeded.
@@ -378,6 +419,7 @@ class GenerationService:
                 shadow_content=interaction_data.shadow_content,
                 expert_content=interaction_data.expert_content,
                 tools_used=interaction_data.tools_used,
+                citations=interaction_data.citations,
             )
             for interaction_data in interaction_data_list
         ]
