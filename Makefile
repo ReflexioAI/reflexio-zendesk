@@ -12,7 +12,8 @@
 #   - git (for the release flow)
 
 .PHONY: help bump release publish publish-dry test-pypi clean version \
-        check-version check-clean check-branch check-up-to-date
+        check-version check-clean check-branch check-up-to-date \
+        check-tag-free verify-dist
 
 PYPROJECT := pyproject.toml
 VERSION_CURRENT := $(shell grep -E '^version = ' $(PYPROJECT) | head -1 | cut -d'"' -f2)
@@ -43,10 +44,22 @@ check-up-to-date:
 	@[ -z "$$(git log HEAD..origin/main --oneline)" ] \
 	  || { echo "error: local main is behind origin/main — pull first" >&2; exit 1; }
 
+check-tag-free: check-version
+	@if git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null; then \
+	  echo "error: tag v$(VERSION) already exists locally" >&2; exit 1; fi
+	@if git ls-remote --exit-code --tags origin "refs/tags/v$(VERSION)" >/dev/null 2>&1; then \
+	  echo "error: tag v$(VERSION) already exists on origin" >&2; exit 1; fi
+
+verify-dist:
+	@actual=$$(grep -E '^version = ' $(PYPROJECT) | head -1 | cut -d'"' -f2); \
+	  ls dist/*-$$actual* >/dev/null 2>&1 \
+	    || { echo "error: dist/ has no artifacts for version $$actual" >&2; exit 1; }; \
+	  echo "✓ dist/ contains artifacts for version $$actual"
+
 clean: ## Remove build artifacts
 	rm -rf dist/ build/ *.egg-info
 
-bump: check-version ## Rewrite version in pyproject.toml and refresh uv.lock
+bump: check-version check-clean ## Rewrite version in pyproject.toml and refresh uv.lock
 	@echo "→ bumping to $(VERSION)"
 	@sed -i.bak -E 's/^version = "[^"]+"/version = "$(VERSION)"/' $(PYPROJECT)
 	@rm -f $(PYPROJECT).bak
@@ -58,6 +71,7 @@ bump: check-version ## Rewrite version in pyproject.toml and refresh uv.lock
 publish: clean ## Build and publish current version to PyPI
 	@echo "→ uv build"
 	uv build
+	@$(MAKE) verify-dist
 	@echo "→ uv publish"
 	uv publish dist/*
 
@@ -72,7 +86,7 @@ test-pypi: clean ## Build and publish current version to TestPyPI
 	@echo "→ uv publish --publish-url https://test.pypi.org/legacy/"
 	uv publish --publish-url https://test.pypi.org/legacy/ dist/*
 
-release: check-version check-clean check-branch check-up-to-date bump ## Bump + commit + tag + publish + push
+release: check-version check-clean check-branch check-up-to-date check-tag-free bump ## Bump + commit + tag + publish + push
 	@echo "→ committing release v$(VERSION)"
 	git add $(PYPROJECT) uv.lock
 	git commit -m "Release v$(VERSION)"
