@@ -25,19 +25,17 @@ SERVICE_COLORS: dict[str, str] = {
 # ANSI codes for log-level severity highlighting in service output.
 # Keys are matched against the level token captured by `_LEVEL_RE`.
 _LEVEL_COLORS: dict[str, str] = {
-    "ERROR": "31",       # red
+    "ERROR": "31",  # red
     "CRITICAL": "1;31",  # bold red
-    "WARNING": "33",     # yellow
-    "WARN": "33",        # yellow (Next.js / some loggers)
+    "WARNING": "33",  # yellow
+    "WARN": "33",  # yellow (Next.js / some loggers)
 }
 
 # Match a log-level token at the start of a line, optionally bracketed,
 # followed by a typical separator (":", whitespace, or " - "). Covers
 # uvicorn ("ERROR:    msg"), stdlib logging ("[ERROR] msg"), and the
 # "ERROR - msg" style used by Next.js / some custom loggers.
-_LEVEL_RE = re.compile(
-    r"^(?:\[)?(ERROR|CRITICAL|WARNING|WARN)(?:\])?(?::|\s+-\s+|\s+)"
-)
+_LEVEL_RE = re.compile(r"^(?:\[)?(ERROR|CRITICAL|WARNING|WARN)(?:\])?(?::|\s+-\s+|\s+)")
 
 # Canonical log file paths — stored in ~/.reflexio/logs/ (not the project directory)
 _LOG_DIR = str(Path.home() / ".reflexio" / "logs")
@@ -141,7 +139,12 @@ class DuplicateFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         """Return False to suppress duplicate messages within the time window."""
-        key = (record.name, record.msg)
+        # record.msg can be any object (callers sometimes pass a list/dict
+        # directly to logger.warning). Stringify so the key is always
+        # hashable — otherwise this filter raises TypeError and crashes
+        # whatever was being logged. Surfaced via the Nomic embedder
+        # pre-warm path that calls logger.warning(load_return_list).
+        key = (record.name, str(record.msg))
         now = time.monotonic()
 
         with self._lock:
@@ -162,6 +165,7 @@ def print_startup_banner(
     *,
     supabase_port: int | None = 54321,
     log_file: str = DEV_LOG_FILE,
+    config_paths: dict[str, str] | None = None,
 ) -> None:
     """Print a consolidated startup summary banner with service URLs.
 
@@ -169,6 +173,10 @@ def print_startup_banner(
         ports: Mapping of service name to port number.
         supabase_port: Supabase port, or None if not running.
         log_file: Path to the log file.
+        config_paths: Optional mapping of config-label → path string (e.g.
+            ``{"env": "~/.reflexio/.env", "config": "~/.reflexio/configs/config_default.json"}``).
+            Renders as a "Config" section above the "Logs" line so operators
+            can see at a glance which files the server actually loaded.
     """
     lines = []
     width = 44
@@ -191,8 +199,24 @@ def print_startup_banner(
         status = colorize("ready", "32")
         lines.append(f"{label}{url:<26}{status}")
 
+    home = str(Path.home())
+
+    def _collapse_home(path: str) -> str:
+        # Collapse HOME to ~ for readability; absolute paths stay absolute
+        # so log scrapers and copy-paste still work when outside HOME.
+        return "~" + path[len(home) :] if path.startswith(home) else path
+
+    if config_paths:
+        lines.append(f"{'-' * width}")
+        for label, path in config_paths.items():
+            lines.append(f"  {label:<11}{_collapse_home(str(path))}")
+
     lines.append(f"{'-' * width}")
-    lines.append(f"  Logs       {log_file}")
+    # Logs section — surface both the general dev log and the LLM I/O log.
+    # LLM_IO_LOG_FILE is the one operators hit first when debugging prompt /
+    # tool-call issues; it's opaque without this pointer.
+    lines.append(f"  Dev log    {_collapse_home(log_file)}")
+    lines.append(f"  LLM I/O    {_collapse_home(LLM_IO_LOG_FILE)}")
     lines.append(f"{'=' * width}\n")
 
     # Print all at once to avoid interleaving

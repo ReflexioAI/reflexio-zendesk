@@ -1,0 +1,35 @@
+{
+  "id": "oscillated_self_correction",
+  "group": "group3_loop_behavior",
+  "category": "oscillated_self_correction",
+  "existing_storage": [],
+  "session": "User: I think I like jazz. Actually wait, it's classical I prefer.",
+  "mock_llm_responses": [
+    {"tool_calls": [
+      {"id": "s1", "name": "search_user_profiles", "args": {"query": "music preferences", "top_k": 10}}
+    ]},
+    {"tool_calls": [
+      {"id": "c1", "name": "create_user_profile", "args": {
+        "content": "user likes jazz",
+        "ttl": "infinity",
+        "source_span": "I think I like jazz"
+      }}
+    ]},
+    {"tool_calls": [
+      {"id": "d1", "name": "delete_user_profile", "args": {"id": "tentative::profile::0"}}
+    ]},
+    {"tool_calls": [
+      {"id": "c2", "name": "create_user_profile", "args": {
+        "content": "user prefers classical music",
+        "ttl": "infinity",
+        "source_span": "I prefer classical"
+      }}
+    ]},
+    {"tool_calls": [
+      {"id": "f1", "name": "finish", "args": {}}
+    ]}
+  ],
+  "expected_outcome": "finish_tool",
+  "expected_applied_count": 1,
+  "expected_violations": []
+}

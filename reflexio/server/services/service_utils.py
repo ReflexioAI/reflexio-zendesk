@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from reflexio.cli.log_format import LLM_IO_LOG_FILE, next_llm_entry_id
@@ -25,6 +26,42 @@ logger = logging.getLogger(__name__)
 MODEL_RESPONSE_LEVEL = 25
 
 
+def _format_response_for_logging(response: Any) -> Any:
+    """Render ``ToolCallingChatResponse`` with pretty tool_calls; pass others through.
+
+    The dataclass's ``__repr__`` (which ``%s`` formatting falls back to)
+    prints each tool_call as an opaque object handle
+    (``<ChatCompletionMessageToolCall object at 0x…>``), erasing the
+    tool name + arguments the model emitted. This helper detects that
+    one case and renders a multi-line human-readable form using the
+    same ``_format_tool_calls`` helper the request-side formatter uses.
+
+    All other response types (strings, Pydantic ``BaseModel`` instances
+    from classic extractors / deduplicators / aggregators) fall through
+    unchanged so the existing log shape is preserved.
+
+    Lazy-imports ``ToolCallingChatResponse`` to avoid a circular
+    ``service_utils`` ↔ ``litellm_client`` dependency at module load.
+    """
+    try:
+        from reflexio.server.llm.litellm_client import ToolCallingChatResponse
+    except Exception:  # noqa: BLE001 - fall back gracefully if the import fails
+        return response
+
+    if not isinstance(response, ToolCallingChatResponse):
+        return response
+
+    lines = [
+        f"ToolCallingChatResponse(finish_reason={response.finish_reason!r}):",
+        f"  content: {response.content!r}",
+    ]
+    if response.tool_calls:
+        lines.extend(_format_tool_calls(response.tool_calls))
+    else:
+        lines.append("  tool_calls: []")
+    return "\n".join(lines)
+
+
 def log_model_response(
     target_logger: logging.Logger, label: str, response: Any
 ) -> None:
@@ -38,13 +75,16 @@ def log_model_response(
         response (Any): The model response to log
     """
     entry_id = next_llm_entry_id()
+    # Special-case ToolCallingChatResponse so tool_calls render as
+    # id/name/arguments instead of opaque ``<… object at 0x…>`` handles.
+    formatted = _format_response_for_logging(response)
     # Full response to llm_io.log only (level 15 < INFO 20, so console ignores it)
     target_logger.log(
         LLM_PROMPT_LEVEL,
         "[#%d] %s: %s",
         entry_id,
         label,
-        response,
+        formatted,
         extra={"entry_id": entry_id, "label": label},
     )
     # One-line summary to console
@@ -229,8 +269,36 @@ def format_sessions_to_history_string(
 
     formatted_groups = []
     for group_name in sorted_group_names:
-        # Format header with session name
-        group_header = f"=== Session: {group_name} ==="
+        # Format header with session name AND its earliest interaction date.
+        # Without the date, downstream extraction agents have no anchor for
+        # resolving relative-time references in the conversation
+        # ("X weeks ago", "yesterday", "two days before the wedding") —
+        # they fall back to real-world `now()` and encode every event as
+        # today's date, breaking temporal-reasoning queries.
+        #
+        # We use the earliest *interaction* timestamp, not request.created_at,
+        # because Request.created_at defaults to `now()` on construction —
+        # only interactions reliably carry the conversation's true wall-clock
+        # time when the publisher provides it.
+        all_ts: list[int] = [
+            i.created_at
+            for ri in grouped_by_name[group_name]
+            for i in ri.interactions
+            if i.created_at
+        ]
+        first_ts = min(all_ts) if all_ts else 0
+        if first_ts:
+            try:
+                session_date_iso = datetime.fromtimestamp(
+                    first_ts, tz=UTC
+                ).strftime("%Y-%m-%d")
+                group_header = (
+                    f"=== Session: {group_name} (date: {session_date_iso}) ==="
+                )
+            except (OverflowError, OSError, ValueError):
+                group_header = f"=== Session: {group_name} ==="
+        else:
+            group_header = f"=== Session: {group_name} ==="
 
         # Combine all interactions from all requests in this session
         all_interactions = []
@@ -479,6 +547,57 @@ def extract_json_from_string(text: str) -> dict:
     return {}
 
 
+def _format_tool_calls(tool_calls: list[Any]) -> list[str]:
+    """Render an assistant message's ``tool_calls`` list for the log.
+
+    Accepts either the OpenAI SDK object shape (with ``.function.name`` /
+    ``.function.arguments`` attrs) or the dict shape that pass-through
+    serialisation may produce. Returns one indented line per call with the
+    tool_call_id, the tool name, and the parsed arguments — so the log
+    reader can correlate each tool_call with its tool-role response.
+    """
+    lines: list[str] = ["  tool_calls:"]
+    for tc in tool_calls:
+        # Extract id, name, arguments from either attribute or mapping shape.
+        tc_id = getattr(tc, "id", None) or (
+            tc.get("id") if isinstance(tc, dict) else None
+        )
+        fn = getattr(tc, "function", None)
+        if fn is not None:
+            name = getattr(fn, "name", None)
+            args_raw = getattr(fn, "arguments", None)
+        elif isinstance(tc, dict):
+            fn_dict = tc.get("function", {}) or {}
+            name = fn_dict.get("name") if isinstance(fn_dict, dict) else None
+            args_raw = fn_dict.get("arguments") if isinstance(fn_dict, dict) else None
+        else:
+            name = None
+            args_raw = None
+
+        # arguments comes through as a JSON string from the provider — parse
+        # for readability, fall back to raw text on malformed JSON.
+        parsed_args: Any
+        if isinstance(args_raw, str):
+            try:
+                parsed_args = json.loads(args_raw)
+            except json.JSONDecodeError:
+                parsed_args = args_raw
+        else:
+            parsed_args = args_raw
+
+        lines.append(f"    - id: {tc_id}")
+        lines.append(f"      name: {name}")
+        # Logging path must never raise — fall back to repr() on
+        # non-serializable argument objects (datetime, sets, custom
+        # types, etc.) so a logging call can't take down a request.
+        try:
+            rendered_args = json.dumps(parsed_args)
+        except (TypeError, ValueError):
+            rendered_args = repr(parsed_args)
+        lines.append(f"      arguments: {rendered_args}")
+    return lines
+
+
 def format_messages_for_logging(messages: list[dict[str, Any]]) -> str:
     """
     Format messages for logging with proper newlines in text content.
@@ -493,6 +612,14 @@ def format_messages_for_logging(messages: list[dict[str, Any]]) -> str:
     for i, msg in enumerate(messages):
         formatted_parts.append(f"Message {i + 1}:")
         formatted_parts.append(f"  role: {msg.get('role', 'unknown')}")
+
+        # Tool-role messages carry a ``tool_call_id`` that correlates them
+        # back to the assistant's emitted call — render it so readers can
+        # reconstruct which response answered which call.
+        tool_call_id = msg.get("tool_call_id")
+        if tool_call_id is not None:
+            formatted_parts.append(f"  tool_call_id: {tool_call_id}")
+
         content = msg.get("content", "")
 
         if isinstance(content, str):
@@ -522,6 +649,14 @@ def format_messages_for_logging(messages: list[dict[str, Any]]) -> str:
         else:
             # Fallback to JSON for other types
             formatted_parts.append(f"  content: {json.dumps(content, indent=4)}")
+
+        # Assistant messages with tool_calls must render the call list —
+        # otherwise the log shows ``content: null`` with no visibility into
+        # which tools the model invoked. Classic extraction doesn't use
+        # tool-calling, but the agentic pipeline relies on it heavily.
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            formatted_parts.extend(_format_tool_calls(tool_calls))
 
         formatted_parts.append("")  # Empty line between messages
 

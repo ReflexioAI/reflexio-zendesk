@@ -26,6 +26,7 @@ class InstallLocation(Enum):
     CURRENT_PROJECT = "current_project"
     ALL_PROJECTS = "all_projects"
 
+
 app = typer.Typer(
     help="Configure Reflexio: run 'init' for plain CLI setup, or one of "
     "the integration commands (openclaw, claude-code) to also install "
@@ -425,7 +426,9 @@ def _install_openclaw_integration() -> bool:
         typer.echo("Plugin installed and registered")
         return True
 
-    typer.echo("Error: Plugin not loaded -- check 'openclaw plugins inspect reflexio-federated'")
+    typer.echo(
+        "Error: Plugin not loaded -- check 'openclaw plugins inspect reflexio-federated'"
+    )
     return False
 
 
@@ -659,15 +662,31 @@ def _merge_hook_config(
 
     # Session start hook (SessionStart) — checks/starts Reflexio server proactively
     session_start_hook_sh = handler_js_path.parent / "session_start_hook.sh"
-    _upsert_hook(hooks, "SessionStart", f"bash {shlex.quote(str(session_start_hook_sh))}")
+    _upsert_hook(
+        hooks, "SessionStart", f"bash {shlex.quote(str(session_start_hook_sh))}"
+    )
 
     # Search hook (UserPromptSubmit) — injects Reflexio context before Claude responds
     search_hook_js = handler_js_path.parent / "search_hook.js"
     _upsert_hook(hooks, "UserPromptSubmit", f"node {shlex.quote(str(search_hook_js))}")
 
-    # Stop hook (expert mode) — publishes session transcript for extraction
+    # Stop hook (expert mode) — publishes session transcript for extraction.
+    # On non-expert (re)install, remove the hook if it was previously installed.
     if expert:
         _upsert_hook(hooks, "Stop", f"node {shlex.quote(str(handler_js_path))}")
+    else:
+        stop_hooks = hooks.get("Stop", [])
+        cleaned = [
+            entry
+            for entry in stop_hooks
+            if not any(
+                "reflexio" in h.get("command", "") for h in entry.get("hooks", [])
+            )
+        ]
+        if cleaned:
+            hooks["Stop"] = cleaned
+        elif "Stop" in hooks:
+            del hooks["Stop"]
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
@@ -771,12 +790,16 @@ def _install_claude_code_integration(
     rules_dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(rules_src, rules_dest)
 
-    # Expert mode: also install /reflexio-extract command
+    # Expert mode: also install /reflexio-extract command.
+    # Non-expert (re)install: remove expert-only artifacts if present.
+    cmd_dest_dir = claude_dir / "commands" / "reflexio-extract"
     if expert:
         cmd_src = integration_dir / "commands" / "reflexio-extract" / "SKILL.md"
-        cmd_dest = claude_dir / "commands" / "reflexio-extract" / "SKILL.md"
-        cmd_dest.parent.mkdir(parents=True, exist_ok=True)
+        cmd_dest = cmd_dest_dir / "SKILL.md"
+        cmd_dest_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(cmd_src, cmd_dest)
+    elif cmd_dest_dir.exists():
+        shutil.rmtree(cmd_dest_dir)
 
     # Configure hook
     handler_js = integration_dir / "hook" / "handler.js"
@@ -845,9 +868,7 @@ def _remove_from_dir(base_dir: Path) -> None:
     typer.echo(f"  Removed hook from: {settings_path}")
 
 
-def _uninstall_claude_code(
-    project_dir: Path, *, global_install: bool = False
-) -> None:
+def _uninstall_claude_code(project_dir: Path, *, global_install: bool = False) -> None:
     """Remove the Reflexio integration from Claude Code.
 
     When ``--global`` or ``--project-dir`` is explicit, removes from that
@@ -963,7 +984,9 @@ def claude_code_setup(
         target = (
             Path.home()
             if global_install
-            else Path(project_dir) if project_dir is not None else Path.cwd()
+            else Path(project_dir)
+            if project_dir is not None
+            else Path.cwd()
         )
         _uninstall_claude_code(target, global_install=global_install)
         return
@@ -976,11 +999,7 @@ def claude_code_setup(
         location = InstallLocation.CURRENT_PROJECT
     else:
         location = _prompt_install_location()
-        target = (
-            Path.home()
-            if location == InstallLocation.ALL_PROJECTS
-            else Path.cwd()
-        )
+        target = Path.home() if location == InstallLocation.ALL_PROJECTS else Path.cwd()
 
     # Step 1: Load .env path
     from reflexio.cli.env_loader import load_reflexio_env
@@ -1048,7 +1067,9 @@ def claude_code_setup(
         typer.echo("Note: User-level hooks fire for ALL Claude Code sessions.")
     typer.echo("")
     if location == InstallLocation.ALL_PROJECTS:
-        typer.echo("Next: Start any Claude Code session — Reflexio is active in all projects.")
+        typer.echo(
+            "Next: Start any Claude Code session — Reflexio is active in all projects."
+        )
     else:
         typer.echo("Next: Start a Claude Code session in this project.")
     if is_remote:
@@ -1057,3 +1078,119 @@ def claude_code_setup(
         typer.echo(
             "The skill will guide Claude to check and start the Reflexio server automatically."
         )
+
+
+@app.command("openai-codex")
+def openai_codex_setup(
+    no_browser: Annotated[
+        bool,
+        typer.Option(
+            "--no-browser",
+            help="Don't auto-open the browser; print the URL to copy/paste instead.",
+        ),
+    ] = False,
+    timeout: Annotated[
+        int,
+        typer.Option(
+            "--timeout",
+            help="Seconds to wait for the OAuth callback before failing.",
+        ),
+    ] = 300,
+    show: Annotated[
+        bool,
+        typer.Option(
+            "--show",
+            help="Print currently saved Codex token metadata and exit (no login).",
+        ),
+    ] = False,
+    logout: Annotated[
+        bool,
+        typer.Option(
+            "--logout",
+            help="Delete the saved Codex token file and exit.",
+        ),
+    ] = False,
+) -> None:
+    """Sign in to OpenAI via your ChatGPT subscription (Codex OAuth).
+
+    Stores access + refresh tokens at ``~/.reflexio/auth/openai-codex.json``.
+    The codex proxy and any other reflexio component that needs OpenAI auth
+    reads from this file directly — no dependency on OpenClaw or any other
+    CLI. The proxy auto-refreshes the access token when it nears expiry.
+
+    Run this once, then start the codex proxy with::
+
+        ./reflexio_ext/scripts/start_with_codex_proxy.sh
+
+    Re-run this command if your subscription tier changes or the
+    refresh_token gets revoked (rare).
+    """
+    # Imported here so plain `reflexio --help` doesn't require the OAuth
+    # module to load (slight startup speedup; mostly cosmetic).
+    from reflexio.cli.codex_auth import (
+        REFLEXIO_CODEX_TOKENS_PATH,
+        get_fresh_tokens,
+        load_tokens_raw,
+        login_interactive,
+    )
+
+    if logout:
+        if REFLEXIO_CODEX_TOKENS_PATH.exists():
+            REFLEXIO_CODEX_TOKENS_PATH.unlink()
+            typer.echo(f"Removed {REFLEXIO_CODEX_TOKENS_PATH}")
+        else:
+            typer.echo("No saved Codex tokens to remove.")
+        return
+
+    if show:
+        tokens = load_tokens_raw()
+        if tokens is None:
+            typer.echo(f"No tokens at {REFLEXIO_CODEX_TOKENS_PATH}.")
+            typer.echo("Run `reflexio setup openai-codex` to sign in.")
+            raise typer.Exit(1)
+        typer.echo(f"  path:      {REFLEXIO_CODEX_TOKENS_PATH}")
+        typer.echo(f"  email:     {tokens.email}")
+        typer.echo(f"  plan_type: {tokens.plan_type}")
+        typer.echo(
+            f"  account_id ...{tokens.account_id[-8:]}"
+            if tokens.account_id
+            else "  account_id (empty)"
+        )
+        typer.echo(f"  expires_at: {tokens.expires_at} (unix epoch)")
+        typer.echo(f"  expired:   {tokens.is_expired()}")
+        return
+
+    typer.echo("Starting OpenAI Codex OAuth flow...")
+    try:
+        tokens = login_interactive(
+            open_browser=not no_browser,
+            timeout_s=timeout,
+        )
+    except TimeoutError as e:
+        typer.echo(f"Timed out: {e}")
+        raise typer.Exit(1) from e
+    except ValueError as e:
+        typer.echo(f"Login failed: {e}")
+        raise typer.Exit(1) from e
+
+    typer.echo("")
+    typer.echo("Sign-in successful.")
+    typer.echo(f"  saved to:  {REFLEXIO_CODEX_TOKENS_PATH}")
+    if tokens.email:
+        typer.echo(f"  email:     {tokens.email}")
+    typer.echo(f"  plan_type: {tokens.plan_type}")
+    typer.echo("")
+    typer.echo(
+        "Verify the token resolves cleanly via the proxy's health endpoint:"
+    )
+    typer.echo("  curl -s http://127.0.0.1:11435/health | jq")
+    typer.echo("")
+    typer.echo(
+        "If the saved plan_type doesn't match what you expect (e.g. shows "
+        "'plus' instead of 'max-x20'), wait a minute for OpenAI to propagate "
+        "the subscription change and re-run this command — the JWT is issued "
+        "at sign-in time."
+    )
+    # Exercise the refresh path immediately so any clock skew between the
+    # JWT's `exp` claim and our local clock is caught now, not at first use.
+    _ = get_fresh_tokens()

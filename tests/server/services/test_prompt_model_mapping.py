@@ -31,13 +31,13 @@ _PROMPT_BANK_DIR = (
 PROMPT_VERSION_MAP: dict[str, tuple[str, str | None]] = {
     "playbook_extraction_main": ("v1.0.0", "playbook_extraction"),
     "playbook_extraction_main_incremental": ("v1.0.0", "playbook_extraction"),
-    "playbook_extraction_context": ("v4.0.1", None),
-    "playbook_extraction_context_incremental": ("v4.0.1", None),
+    "playbook_extraction_context": ("v4.0.2", None),
+    "playbook_extraction_context_incremental": ("v4.0.0", None),
     "playbook_should_generate": ("v3.0.0", "boolean_evaluation"),
     "playbook_should_generate_expert": ("v1.0.0", "boolean_evaluation"),
     "playbook_extraction_context_expert": ("v3.0.0", None),
     "playbook_extraction_main_expert": ("v1.0.0", "playbook_extraction"),
-    "playbook_aggregation": ("v2.0.0", "playbook_aggregation"),
+    "playbook_aggregation": ("v2.1.0", "playbook_aggregation"),
     "playbook_deduplication": ("v2.0.0", "playbook_deduplication"),
     "profile_update_main": ("v1.0.0", "profile_extraction"),
     "profile_update_main_incremental": ("v1.0.0", "profile_extraction"),
@@ -52,17 +52,41 @@ PROMPT_VERSION_MAP: dict[str, tuple[str, str | None]] = {
         "agent_success_evaluation_comparison",
     ),
     "shadow_content_evaluation": ("v1.0.0", None),
+    "memory_reflection": ("v1.0.0", None),
     "query_reformulation": ("v1.0.0", None),
     "document_expansion": ("v1.0.0", None),
+    # Agentic extraction pipeline — three parallel axes + unify + self-critique
+    "extraction_user_profile": ("v1.3.3", None),
+    "extraction_user_profile_agent_rec": ("v1.1.3", None),
+    "extraction_user_playbook": ("v1.0.0", None),
+    "extraction_unify": ("v1.0.0", None),
+    "extraction_self_critique": ("v1.0.0", None),
+    # Agentic search pipeline — single-loop agent with cross-encoder + LLM rerank
+    "search_agent": ("v1.10.3", None),
+    "compress_session_for_query": ("v1.3.0", None),
+    "rerank_relevance": ("v1.1.0", None),
+    # Answer-LLM system prompt for memory-grounded user questions
+    "answer_synthesis": ("v1.5.2", None),
 }
 
 
 def _get_latest_prompt_version(prompt_id: str) -> str:
-    """Scan prompt_bank/<prompt_id>/ for the latest v*.prompt.md file."""
+    """Scan prompt_bank/<prompt_id>/ for the latest v*.prompt.md file.
+
+    Sorted by semver tuple, not lexically — without this v1.10.0 would
+    sort BEFORE v1.9.0 and the trip-wire would lock to a stale version.
+    """
     prompt_dir = _PROMPT_BANK_DIR / prompt_id
     if not prompt_dir.is_dir():
         pytest.fail(f"Prompt directory not found: {prompt_dir}")
-    versions = sorted(prompt_dir.glob("v*.prompt.md"))
+
+    def _semver_key(p: Path) -> tuple[int, ...]:
+        try:
+            return tuple(int(x) for x in p.stem.removeprefix("v").removesuffix(".prompt").split("."))
+        except ValueError:
+            return (0,)
+
+    versions = sorted(prompt_dir.glob("v*.prompt.md"), key=_semver_key)
     if not versions:
         pytest.fail(f"No version files found in {prompt_dir}")
     return versions[-1].stem.split(".prompt")[0]

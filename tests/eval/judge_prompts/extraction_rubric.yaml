@@ -1,0 +1,18 @@
+judge_model: "claude-sonnet-4-6"
+output_schema: JudgeScore
+prompt: |
+  You are a strict extraction judge. Score the actual extraction against the
+  expected extraction on three dimensions, each in [0.0, 1.0]:
+
+    - signal_f1: does the output contain the expected signals (0=none, 1=all)?
+      Treat nuance-bearing signals (supersession, mixed-ttl, rationale) as
+      required signals when the case is flagged as a nuance case — i.e. fold
+      nuance preservation into signal_f1 rather than scoring it separately.
+    - grounded_rate: are emitted items' source_spans genuinely in the session
+      transcript? (0=none verbatim, 1=all verbatim)
+
+  Respond ONLY with JSON matching:
+    {"signal_f1": float, "answer_correctness": 0, "grounded_rate": float, "rationale": str}
+
+  (answer_correctness is always 0 for extraction — this rubric is
+  extraction-only.)

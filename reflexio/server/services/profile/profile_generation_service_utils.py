@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from reflexio.models.api_schema.common import NEVER_EXPIRES_TIMESTAMP
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.models.api_schema.service_schemas import (
     ProfileTimeToLive,
@@ -91,6 +92,18 @@ class ProfileAddItem(BaseModel):
         default=None,
         description="Metadata extracted for the profile based on metadata definition",
     )
+    source_span: str | None = Field(
+        default=None,
+        description="Verbatim excerpt from the source that most directly supports this profile item",
+    )
+    notes: str | None = Field(
+        default=None,
+        description="Free-form extraction notes — confidence, caveats, or alternative readings",
+    )
+    reader_angle: str | None = Field(
+        default=None,
+        description="The extraction perspective or reader role that surfaced this item",
+    )
 
     # OpenAI structured output requires explicit schema constraints
     model_config = ConfigDict(
@@ -161,9 +174,10 @@ def calculate_expiration_timestamp(
     Returns:
         The expiration timestamp for the profile.
     """
-    expiration_timestamp = datetime.max
-    last_modified_datetime = datetime.fromtimestamp(last_modified_timestamp)
+    if profile_time_to_live == ProfileTimeToLive.INFINITY:
+        return NEVER_EXPIRES_TIMESTAMP
 
+    last_modified_datetime = datetime.fromtimestamp(last_modified_timestamp)
     if profile_time_to_live == ProfileTimeToLive.ONE_DAY:
         expiration_timestamp = last_modified_datetime + timedelta(days=1)
     elif profile_time_to_live == ProfileTimeToLive.ONE_WEEK:
@@ -174,16 +188,9 @@ def calculate_expiration_timestamp(
         expiration_timestamp = last_modified_datetime + timedelta(days=90)
     elif profile_time_to_live == ProfileTimeToLive.ONE_YEAR:
         expiration_timestamp = last_modified_datetime + timedelta(days=365)
-    elif profile_time_to_live == ProfileTimeToLive.INFINITY:
-        expiration_timestamp = datetime.max
     else:
         raise ValueError(f"Invalid profile time to live: {profile_time_to_live}")
-    try:
-        return int(expiration_timestamp.timestamp())
-    except (OverflowError, OSError, ValueError):
-        import sys
-
-        return sys.maxsize
+    return int(expiration_timestamp.timestamp())
 
 
 def check_string_token_overlap(str1: str, str2: str, threshold: float = 0.7) -> bool:

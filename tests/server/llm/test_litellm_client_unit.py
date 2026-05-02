@@ -38,6 +38,7 @@ from reflexio.server.llm.litellm_client import (
     LiteLLMClient,
     LiteLLMClientError,
     LiteLLMConfig,
+    StructuredOutputParseError,
     _get_embedding_encoding,
     _get_embedding_limit,
     _truncate_for_embedding,
@@ -165,7 +166,7 @@ class TestInit:
     def test_init_with_azure_config(self):
         azure = AzureOpenAIConfig(
             api_key="az-key",
-            endpoint="https://myresource.openai.azure.com/",
+            endpoint="https://myresource.openai.azure.com/",  # type: ignore[arg-type]
             api_version="2024-02-15-preview",
         )
         api_key_config = APIKeyConfig(openai=CommonsOpenAIConfig(azure_config=azure))
@@ -173,7 +174,7 @@ class TestInit:
         client = LiteLLMClient(config)
 
         assert client._api_key == "az-key"
-        assert "myresource" in client._api_base
+        assert client._api_base is not None and "myresource" in client._api_base
         assert client._api_version == "2024-02-15-preview"
 
     def test_init_with_anthropic_config(self):
@@ -215,7 +216,7 @@ class TestInit:
             custom_endpoint=CustomEndpointConfig(
                 model="my-model",
                 api_key="ce-key",
-                api_base="https://custom.api.com/v1",
+                api_base="https://custom.api.com/v1",  # type: ignore[arg-type]
             )
         )
         config = LiteLLMConfig(model="gpt-4o", api_key_config=api_key_config)
@@ -245,7 +246,7 @@ class TestResolveApiKey:
             custom_endpoint=CustomEndpointConfig(
                 model="custom-model",
                 api_key="ce-key",
-                api_base="https://custom.api.com/v1",
+                api_base="https://custom.api.com/v1",  # type: ignore[arg-type]
             ),
             openai=CommonsOpenAIConfig(api_key="sk-openai"),
         )
@@ -261,7 +262,7 @@ class TestResolveApiKey:
             custom_endpoint=CustomEndpointConfig(
                 model="custom-model",
                 api_key="ce-key",
-                api_base="https://custom.api.com/v1",
+                api_base="https://custom.api.com/v1",  # type: ignore[arg-type]
             ),
             openai=CommonsOpenAIConfig(api_key="sk-openai"),
         )
@@ -1035,11 +1036,84 @@ class TestMaybeParseStructuredOutput:
         assert isinstance(result, SampleResponse)
         assert result.answer == "ok"
 
-    def test_unparseable_returns_raw_content(self, client):
-        result = client._maybe_parse_structured_output(
-            "totally not json", SampleResponse, True
+    def test_unparseable_raises_structured_output_parse_error(self, client):
+        with pytest.raises(StructuredOutputParseError):
+            client._maybe_parse_structured_output(
+                "totally not json", SampleResponse, True
+            )
+
+
+# ===================================================================
+# Retry-on-parse-failure tests
+# ===================================================================
+
+
+class TestStructuredOutputRetry:
+    """Tests for retry behaviour when _maybe_parse_structured_output raises."""
+
+    def _make_mock_response(self, content: str) -> MagicMock:
+        """Build a mock litellm.completion response with given content."""
+        choice = MagicMock()
+        choice.message.content = content
+        choice.message.tool_calls = None
+        choice.finish_reason = "stop"
+        resp = MagicMock()
+        resp.choices = [choice]
+        resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        resp.usage.prompt_tokens_details = None
+        resp.usage.cache_creation_input_tokens = None
+        resp.usage.cache_read_input_tokens = None
+        return resp
+
+    def test_structured_output_parse_failure_retries_and_succeeds(self):
+        """Malformed JSON on first attempt, valid on second — retry eventually succeeds."""
+        call_count = 0
+        valid_json = '{"answer": "ok", "score": 42}'
+
+        def fake_completion(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            content = "not valid json {{{{" if call_count == 1 else valid_json
+            return self._make_mock_response(content)
+
+        client = _build_client(
+            LiteLLMConfig(model="gpt-4o-mini", max_retries=3, retry_delay=0)
         )
-        assert result == "totally not json"
+
+        with patch("litellm.completion", side_effect=fake_completion):
+            result = client.generate_chat_response(
+                messages=[{"role": "user", "content": "test"}],
+                response_format=SampleResponse,
+            )
+
+        assert call_count == 2
+        assert isinstance(result, SampleResponse)
+        assert result.answer == "ok"
+        assert result.score == 42
+
+    def test_structured_output_parse_failure_all_retries_exhausted_raises(self):
+        """Every attempt returns malformed content — raises LiteLLMClientError wrapping StructuredOutputParseError after exhaustion."""
+        call_count = 0
+
+        def fake_completion(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            return self._make_mock_response("not valid json at all {{{{")
+
+        client = _build_client(
+            LiteLLMConfig(model="gpt-4o-mini", max_retries=2, retry_delay=0)
+        )
+
+        with (
+            patch("litellm.completion", side_effect=fake_completion),
+            pytest.raises(LiteLLMClientError),
+        ):
+            client.generate_chat_response(
+                messages=[{"role": "user", "content": "test"}],
+                response_format=SampleResponse,
+            )
+
+        assert call_count == 2
 
 
 # ===================================================================
@@ -1276,7 +1350,7 @@ class TestBuildCompletionParams:
             custom_endpoint=CustomEndpointConfig(
                 model="custom-model",
                 api_key="ce-key",
-                api_base="https://custom.api.com/v1",
+                api_base="https://custom.api.com/v1",  # type: ignore[arg-type]
             )
         )
         config = LiteLLMConfig(model="gpt-4o", api_key_config=api_key_config)

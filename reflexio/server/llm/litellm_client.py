@@ -41,14 +41,27 @@ from reflexio.server.llm.providers.local_embedding_provider import (
 from reflexio.server.llm.providers.local_embedding_provider import (
     register_if_enabled as _register_local_embedder,
 )
+from reflexio.server.llm.providers.nomic_embedding_provider import (
+    NomicEmbedder,
+)
+from reflexio.server.llm.providers.nomic_embedding_provider import (
+    is_enabled as _nomic_embedder_enabled,
+)
+from reflexio.server.llm.providers.nomic_embedding_provider import (
+    is_nomic_model as _is_nomic_model,
+)
+from reflexio.server.llm.providers.nomic_embedding_provider import (
+    register_if_enabled as _register_nomic_embedder,
+)
 
 # Suppress LiteLLM's verbose logging
 litellm.suppress_debug_info = True
 
-# Opt-in registration of claude-smart's local providers. Both are
-# no-ops unless the matching env var is set. Safe to call at import.
+# Opt-in registration of claude-smart's local providers. All no-ops
+# unless the matching env var is set. Safe to call at import.
 _register_claude_code()
 _register_local_embedder()
+_register_nomic_embedder()
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -205,8 +218,41 @@ class LiteLLMConfig:
     api_key_config: APIKeyConfig | None = None
 
 
+@dataclass
+class ToolCallingChatResponse:
+    """Response from a chat call that was routed in tool-calling mode.
+
+    Returned instead of ``str | BaseModel`` whenever the caller passes
+    ``tools=...`` to ``generate_chat_response``. Callers inspect
+    ``tool_calls`` to drive a tool loop; ``content`` is set on the
+    terminal (non-tool) turn.
+
+    Args:
+        content: Text content from the model, or None when the model emitted tool calls.
+        tool_calls: List of tool call objects from the model, or None on the terminal turn.
+        finish_reason: The stop reason reported by the provider (e.g. "tool_calls", "stop").
+        usage: Raw usage object from the LLM response (provider-dependent shape), or None.
+        cost_usd: Estimated cost in USD for this call via litellm price table, or None when
+            the provider is not in the table (local ONNX, claude-code CLI, etc.).
+    """
+
+    content: str | None
+    tool_calls: list[Any] | None
+    finish_reason: str | None
+    usage: Any | None = None
+    cost_usd: float | None = None
+
+
 class LiteLLMClientError(Exception):
     """Custom exception for LiteLLM client errors."""
+
+
+class StructuredOutputParseError(Exception):
+    """Raised when a structured-output LLM call returns content that cannot be parsed.
+
+    Caught by the retry loop in ``_make_request`` so a malformed response
+    burns a retry attempt rather than silently returning unparsed content.
+    """
 
 
 class LiteLLMClient:
@@ -368,8 +414,8 @@ class LiteLLMClient:
         system_message: str | None = None,
         images: list[str | bytes | dict] | None = None,
         image_media_type: str | None = None,
-        **kwargs,
-    ) -> str | BaseModel:
+        **kwargs: Any,
+    ) -> str | BaseModel | ToolCallingChatResponse:
         """
         Generate a response using the configured LLM.
 
@@ -415,14 +461,25 @@ class LiteLLMClient:
         self,
         messages: list[dict[str, Any]],
         system_message: str | None = None,
-        **kwargs,
-    ) -> str | BaseModel:
+        *,
+        tools: list[Any] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        model_role: ModelRole | None = None,
+        **kwargs: Any,
+    ) -> str | BaseModel | ToolCallingChatResponse:
         """
         Generate a response from a list of chat messages.
 
         Args:
             messages: List of messages in chat format [{"role": "...", "content": "..."}].
             system_message: Optional system message to prepend.
+            tools: Optional list of tool definitions for tool-calling mode.
+                When provided, the return type is ``ToolCallingChatResponse``.
+            tool_choice: Optional tool choice control ("auto", "none", "required",
+                or a dict specifying a particular tool). Forwarded to the provider.
+            model_role: Optional ``ModelRole`` to override the model selected for
+                this request. The role is resolved via ``resolve_model_name`` using
+                the client's ``api_key_config``.
             **kwargs: Additional parameters including:
                 - response_format: Pydantic BaseModel class for structured output
                 - parse_structured_output: Whether to parse structured output (default True)
@@ -431,7 +488,8 @@ class LiteLLMClient:
 
         Returns:
             Generated response content. Returns string for text responses,
-            or BaseModel instance for Pydantic model responses.
+            ``BaseModel`` instance for Pydantic model responses, or
+            ``ToolCallingChatResponse`` when ``tools`` is provided.
 
         Raises:
             LiteLLMClientError: If the API call fails after all retries,
@@ -456,6 +514,14 @@ class LiteLLMClient:
                 )
             else:
                 final_messages.insert(0, {"role": "system", "content": system_message})
+
+        # Forward tool-calling and model-role kwargs into _make_request
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        if model_role is not None:
+            kwargs["model_role"] = model_role
 
         return self._make_request(final_messages, **kwargs)
 
@@ -506,6 +572,18 @@ class LiteLLMClient:
             LiteLLMClientError: If embedding generation fails.
         """
         embedding_model = model or self._resolve_default_embedding_model()
+
+        # local/nomic-embed-* routes to the sentence-transformers Nomic
+        # provider (137M params, 768d Matryoshka-truncated to 512). Higher
+        # quality than the chromadb MiniLM fallback below; preferred when
+        # the dep is installed.
+        if _is_nomic_model(embedding_model) and _nomic_embedder_enabled():
+            try:
+                return NomicEmbedder.get().embed([text])[0]
+            except Exception as e:
+                raise LiteLLMClientError(
+                    f"Nomic embedding generation failed: {str(e)}"
+                ) from e
 
         # local/* models route through the in-process ONNX embedder — no
         # network call, no litellm API, no tiktoken truncation (the embedder
@@ -569,7 +647,15 @@ class LiteLLMClient:
 
         embedding_model = model or self._resolve_default_embedding_model()
 
-        # See matching short-circuit in get_embedding above.
+        # See matching short-circuits in get_embedding above.
+        if _is_nomic_model(embedding_model) and _nomic_embedder_enabled():
+            try:
+                return NomicEmbedder.get().embed(list(texts))
+            except Exception as e:
+                raise LiteLLMClientError(
+                    f"Nomic batch embedding generation failed: {str(e)}"
+                ) from e
+
         if embedding_model.startswith("local/") and _local_embedder_enabled():
             try:
                 return LocalEmbedder.get().embed(list(texts))
@@ -625,7 +711,24 @@ class LiteLLMClient:
         except (TypeError, ValueError):
             max_retries = max(1, int(self.config.max_retries))
 
+        # Pop tool-calling kwargs before the final params.update(kwargs) so they
+        # don't leak into the params dict twice.
+        tools = kwargs.pop("tools", None)
+        tool_choice = kwargs.pop("tool_choice", None)
+        model_role: ModelRole | None = kwargs.pop("model_role", None)
+
         actual_model = kwargs.pop("model", self.config.model)
+
+        # model_role takes priority over the default model but falls through
+        # to the custom_endpoint override below (highest priority).
+        if model_role is not None:
+            actual_model = resolve_model_name(
+                role=model_role,
+                site_var_value=None,
+                config_override=None,
+                api_key_config=self.config.api_key_config,
+            )
+
         ce = (
             self.config.api_key_config.custom_endpoint
             if self.config.api_key_config
@@ -650,9 +753,10 @@ class LiteLLMClient:
         # Determinism knob: if REFLEXIO_LLM_SEED is set in the environment,
         # inject it as seed + force temperature=0 on non-restricted models so
         # repeated extraction calls produce stable outputs on providers that
-        # honor `seed`. Current-gen reasoning models (gpt-5-*) do not honor
-        # seed or temperature, so the knob is best-effort only on those.
-        seed_env = os.environ.get("REFLEXIO_LLM_SEED") or ""
+        # honor `seed`. Default to "42" so LongMemEval rounds are reproducible
+        # without requiring the env var to be set. Current-gen reasoning models
+        # (gpt-5-*) do not honor seed or temperature; the knob is best-effort.
+        seed_env = os.environ.get("REFLEXIO_LLM_SEED") or "42"
         if seed_env:
             try:
                 params["seed"] = int(seed_env)
@@ -670,6 +774,10 @@ class LiteLLMClient:
             params["top_p"] = self.config.top_p
         if response_format:
             params["response_format"] = response_format
+        if tools is not None:
+            params["tools"] = tools
+        if tool_choice is not None:
+            params["tool_choice"] = tool_choice
 
         if actual_model != self.config.model:
             api_key, api_base, api_version = self._resolve_api_key(actual_model)
@@ -700,8 +808,29 @@ class LiteLLMClient:
 
         return params, response_format, parse_structured_output, max_retries
 
+    def _compute_cost_usd(self, response: Any, model: str | None) -> float | None:
+        """Compute call cost in USD via the litellm price table.
+
+        Falls back to None when the provider is not mapped (local ONNX,
+        claude-code CLI, etc.) rather than failing the request.
+
+        Args:
+            response: Raw LLM response object.
+            model: Fully-qualified model name used for the call.
+
+        Returns:
+            float | None: Cost in USD, or None when unavailable.
+        """
+        try:
+            import litellm
+
+            cost = litellm.completion_cost(completion_response=response, model=model)
+            return float(cost) if cost else None
+        except Exception:
+            return None
+
     def _log_token_usage(self, params: dict[str, Any], response: Any) -> None:
-        """Log token usage with cache statistics from an LLM response.
+        """Log token usage with cache statistics and cost from an LLM response.
 
         Args:
             params: Request parameters (for model name)
@@ -724,13 +853,17 @@ class LiteLLMClient:
                 f", cache_write: {cache_creation or 0}, cache_read: {cache_read or 0}"
             )
 
+        cost = self._compute_cost_usd(response, params.get("model"))
+        cost_suffix = f", cost: ${cost:.6f}" if cost is not None else ""
+
         self.logger.info(
-            "Token usage - model: %s, input: %s, output: %s, total: %s%s",
+            "Token usage - model: %s, input: %s, output: %s, total: %s%s%s",
             params.get("model"),
             usage.prompt_tokens,
             usage.completion_tokens,
             usage.total_tokens,
             cache_info,
+            cost_suffix,
         )
 
     def _handle_retry_or_raise(
@@ -794,7 +927,7 @@ class LiteLLMClient:
 
     def _make_request(
         self, messages: list[dict[str, Any]], **kwargs: Any
-    ) -> str | BaseModel:
+    ) -> str | BaseModel | ToolCallingChatResponse:
         """
         Make a request to the LLM with retry logic.
 
@@ -803,7 +936,8 @@ class LiteLLMClient:
             **kwargs: Additional parameters.
 
         Returns:
-            Response content as string or BaseModel instance.
+            Response content as string, BaseModel instance, or
+            ToolCallingChatResponse when the request was in tool-calling mode.
 
         Raises:
             LiteLLMClientError: If the request fails after all retries.
@@ -825,7 +959,8 @@ class LiteLLMClient:
             )
             try:
                 response = litellm.completion(**params)
-                content = response.choices[0].message.content  # type: ignore[reportAttributeAccessIssue]
+                message = response.choices[0].message  # type: ignore[reportAttributeAccessIssue]
+                content = message.content
                 elapsed_seconds = time.perf_counter() - request_start
 
                 self._log_token_usage(params, response)
@@ -840,6 +975,19 @@ class LiteLLMClient:
                     elapsed_seconds,
                     True,
                 )
+
+                # Tool-calling path: return a structured response instead of
+                # going through _maybe_parse_structured_output.
+                if "tools" in params:
+                    raw_usage = getattr(response, "usage", None)
+                    call_cost = self._compute_cost_usd(response, params.get("model"))
+                    return ToolCallingChatResponse(
+                        content=content,
+                        tool_calls=getattr(message, "tool_calls", None),
+                        finish_reason=response.choices[0].finish_reason,  # type: ignore[reportAttributeAccessIssue]
+                        usage=raw_usage,
+                        cost_usd=call_cost,
+                    )
 
                 return self._maybe_parse_structured_output(
                     content,  # type: ignore[reportArgumentType]
@@ -1056,8 +1204,14 @@ class LiteLLMClient:
                 parsed = json.loads(sanitized)
                 return response_format.model_validate(parsed)
             except Exception as e:
-                self.logger.warning("Failed to parse structured output: %s", e)
-                return content
+                model = self.config.model
+                snippet = (
+                    content[:200] if isinstance(content, str) else repr(content)[:200]
+                )
+                raise StructuredOutputParseError(
+                    f"Structured output parse failed for model={model!r}: {e}. "
+                    f"Content snippet: {snippet!r}"
+                ) from e
 
     def _extract_json_from_string(self, content: str) -> str:
         """
