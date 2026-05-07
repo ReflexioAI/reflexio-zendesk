@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
@@ -44,6 +47,15 @@ from reflexio.server.services.playbook.playbook_service_utils import (
     PlaybookAggregatorRequest,
 )
 from reflexio.server.services.service_utils import format_sessions_to_history_string
+
+# Matches a 4-digit year in 20xx, optionally followed by an ISO month/day.
+# Used by the post-extraction wall-clock sanitizer (L2 — defense against
+# the Codex backend's silent runtime "current_date" injection that the
+# extraction prompt cannot fully suppress).
+_YEAR_RE = re.compile(r"\b(20\d{2})(?:-\d{2}-\d{2})?\b")
+# Slack above session_year_max for legitimate near-future planned events
+# (weddings, trips, due dates). Threshold = session_year_max + this slack.
+_FUTURE_YEAR_SLACK = 2
 
 if TYPE_CHECKING:
     from reflexio.models.api_schema.domain.entities import Interaction
@@ -131,22 +143,16 @@ class AgenticExtractionRunner:
         #   2. UserProfileAgentRec — agent-named-answer axis (extraction_user_profile_agent_rec)
         # The split addresses the agentic-loop variance where a single combined
         # prompt would stochastically crowd out one axis or the other.
+        #
+        # ``config.skip_extraction_axes`` may suppress any subset of axes by
+        # name. Default is an empty set, so all three axes run unchanged.
         profile_configs = list(config.profile_extractor_configs or [])
         playbook_configs = list(config.user_playbook_extractor_configs or [])
-        typed_configs: list[tuple[str, object, object]] = [
-            *[
-                ("UserProfile", cfg, PROFILE_EXTRACTION_TOOLS)
-                for cfg in profile_configs
-            ],
-            *[
-                ("UserProfileAgentRec", cfg, PROFILE_EXTRACTION_TOOLS)
-                for cfg in profile_configs
-            ],
-            *[
-                ("UserPlaybook", cfg, PLAYBOOK_EXTRACTION_TOOLS)
-                for cfg in playbook_configs
-            ],
-        ]
+        typed_configs = self._build_typed_configs(
+            profile_configs=profile_configs,
+            playbook_configs=playbook_configs,
+            skip_axes=set(config.skip_extraction_axes or []),
+        )
 
         # Phase 4 — run all enabled extractor configs IN PARALLEL with
         # commit deferred. Three axes (UserProfile, UserProfileAgentRec,
@@ -202,6 +208,55 @@ class AgenticExtractionRunner:
                 )
                 warnings.append(f"unify_agent failed: {e}")
 
+        # Phase 4b'' — speaker attribution filter. The extraction prompt
+        # tells the LLM to only extract User-role first-person facts and to
+        # tag source_span with the role prefix ("User: ..." or "Assistant: ...").
+        # When the LLM honors the prefix, this filter deterministically drops
+        # any op whose source_span starts with "Assistant:" — preventing the
+        # ~18% measured misattribution rate where Assistant first-person
+        # statements were stored as user facts in legacy LoCoMo storage.
+        try:
+            n_dropped_speaker = self._filter_assistant_attributed_ops(deferred_runs)
+            if n_dropped_speaker:
+                logger.warning(
+                    "speaker_attr_filter dropped=%d (ops attributed to Assistant turns)",
+                    n_dropped_speaker,
+                )
+        except Exception as e:  # noqa: BLE001 — filter is best-effort
+            logger.warning(
+                "speaker_attr_filter failed: %s: %s — proceeding without",
+                type(e).__name__,
+                e,
+            )
+
+        # Phase 4b' — wall-clock sanitizer (L2 defense against Codex
+        # backend's "current_date" injection). Even with prompt rules to
+        # ignore the runtime-injected today, gpt-5/gpt-5-mini occasionally
+        # leak today's wall-clock year into content (~0.7% of profiles in
+        # measured LoCoMo namespaces). Replace any year > session_year+slack
+        # with [date_unknown] in both content and source_span.
+        try:
+            session_year_max = self._compute_session_year_max(publish_request)
+            if session_year_max is not None:
+                threshold = session_year_max + _FUTURE_YEAR_SLACK
+                n_modified = self._sanitize_wallclock_years(
+                    deferred_runs, year_threshold=threshold
+                )
+                if n_modified:
+                    logger.warning(
+                        "wallclock_sanitize ops_modified=%d threshold_year=%d "
+                        "session_year_max=%d",
+                        n_modified,
+                        threshold,
+                        session_year_max,
+                    )
+        except Exception as e:  # noqa: BLE001 — sanitize is best-effort
+            logger.warning(
+                "wallclock_sanitize failed: %s: %s — proceeding without",
+                type(e).__name__,
+                e,
+            )
+
         # Phase 4c — commit each axis's (possibly pruned) plan.
         for run in deferred_runs:
             try:
@@ -233,6 +288,48 @@ class AgenticExtractionRunner:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_typed_configs(
+        *,
+        profile_configs: Sequence[object],
+        playbook_configs: Sequence[object],
+        skip_axes: set[str],
+    ) -> list[tuple[str, object, object]]:
+        """Materialise the (axis, config, tool_registry) triples to run.
+
+        Each axis declared in ``skip_axes`` is dropped from the result; if no
+        axes are skipped, the output matches the historical hardcoded layout
+        (UserProfile then UserProfileAgentRec then UserPlaybook).
+
+        Args:
+            profile_configs (Sequence[object]): Resolved profile extractor configs.
+            playbook_configs (Sequence[object]): Resolved playbook extractor configs.
+            skip_axes (set[str]): Axis names to suppress. Unknown axis names
+                are silently no-ops (the axis simply won't appear in the
+                axis_specs table to filter against), so callers can rename
+                or retire axes without breaking persisted Configs.
+
+        Returns:
+            list[tuple[str, object, object]]: One tuple per (axis, config) pair
+                that survived the filter, in axis-then-config order.
+        """
+        # Each entry: (axis_name, configs_for_this_axis, tools_for_this_axis).
+        axis_specs: list[tuple[str, Sequence[object], object]] = [
+            ("UserProfile", profile_configs, PROFILE_EXTRACTION_TOOLS),
+            ("UserProfileAgentRec", profile_configs, PROFILE_EXTRACTION_TOOLS),
+            ("UserPlaybook", playbook_configs, PLAYBOOK_EXTRACTION_TOOLS),
+        ]
+        typed_configs: list[tuple[str, object, object]] = []
+        for axis_name, configs_for_axis, tools in axis_specs:
+            if axis_name in skip_axes:
+                logger.info(
+                    "Skipping extraction axis %s (config.skip_extraction_axes)",
+                    axis_name,
+                )
+                continue
+            typed_configs.extend((axis_name, cfg, tools) for cfg in configs_for_axis)
+        return typed_configs
 
     def _run_passes_in_parallel(
         self,
@@ -266,10 +363,11 @@ class AgenticExtractionRunner:
                     storage=self.storage,
                     prompt_manager=self.request_context.prompt_manager,
                     registry=registry,  # type: ignore[arg-type]
-                    # max_steps=4 is the locked baseline. r118 tested 8 and
-                    # was net-negative (over-elaboration drops operands).
-                    # 4 keeps tight extraction and lets self-critique recover
-                    # missed operands.
+                    # max_steps=4 (v1.4.11): cost-efficient baseline reverted
+                    # from v1.4.9's 12. v1.4.11 drops the phased pipeline
+                    # narration overhead, so 4 is sufficient for the simpler
+                    # single-loop extraction. Matches the original v1.4.5
+                    # locked baseline.
                     max_steps=4,
                 )
                 # Stash the agent so commit_deferred can reuse the same
@@ -299,9 +397,7 @@ class AgenticExtractionRunner:
                         type(e).__name__,
                         e,
                     )
-                    warnings.append(
-                        f"extraction_agent[{extractor_name}] failed: {e}"
-                    )
+                    warnings.append(f"extraction_agent[{extractor_name}] failed: {e}")
         return deferred, warnings
 
     @staticmethod
@@ -324,6 +420,114 @@ class AgenticExtractionRunner:
                 interactions=list(new_interactions),
             )
         ]
+
+    # Detects "Assistant:" prefix at the start of a source_span (with optional
+    # whitespace, code-fence backticks, or quotes wrapping). The extraction
+    # prompt instructs the LLM to preserve the role prefix verbatim, so any
+    # op whose source_span starts this way describes the Assistant's content,
+    # not the user's, and must not be stored under the user's namespace.
+    _ASSISTANT_PREFIX_RE = re.compile(r'^\s*[`"\']*\s*assistant\s*:', re.IGNORECASE)
+
+    @classmethod
+    def _filter_assistant_attributed_ops(
+        cls,
+        deferred_runs: Sequence[DeferredExtractionRun],
+    ) -> int:
+        """Drop CreateUser{Profile,Playbook}Op whose source_span is from an Assistant turn.
+
+        Mutates each run's ``ctx.plan`` in place by filtering. Delete ops are
+        always preserved (no source_span). Ops with empty / missing source_span
+        are kept (we have no way to attribute, so default to keeping).
+
+        Returns:
+            int: Number of create ops dropped.
+        """
+        n_dropped = 0
+        for run in deferred_runs:
+            kept: list = []
+            for op in run.ctx.plan:
+                # Delete ops have no source_span — always keep
+                span = getattr(op, "source_span", None)
+                if not isinstance(span, str) or not span.strip():
+                    kept.append(op)
+                    continue
+                if cls._ASSISTANT_PREFIX_RE.match(span):
+                    n_dropped += 1
+                    continue
+                kept.append(op)
+            run.ctx.plan = kept
+        return n_dropped
+
+    @staticmethod
+    def _compute_session_year_max(
+        publish_request: PublishUserInteractionRequest,
+    ) -> int | None:
+        """Max year across all interaction timestamps in the publish request.
+
+        Returns the latest UTC year for which any interaction has a
+        ``created_at``, or None if no interaction is timestamped (in which
+        case wall-clock sanitization is skipped — we have no anchor).
+        """
+        timestamps = [
+            i.created_at for i in publish_request.interaction_data_list if i.created_at
+        ]
+        if not timestamps:
+            return None
+        return max(
+            datetime.fromtimestamp(t, tz=UTC).year for t in timestamps
+        )
+
+    @classmethod
+    def _sanitize_wallclock_years(
+        cls,
+        deferred_runs: Sequence[DeferredExtractionRun],
+        *,
+        year_threshold: int,
+    ) -> int:
+        """Replace 4-digit years > ``year_threshold`` with [date_unknown].
+
+        Mutates each run's ``ctx.plan`` in place. Touches both ``content``
+        and ``source_span`` of CreateUserProfileOp / CreateUserPlaybookOp.
+        Delete ops have no content and are unaffected.
+
+        Returns:
+            int: Number of ops whose content or source_span was modified.
+        """
+        n_modified = 0
+        for run in deferred_runs:
+            for op in run.ctx.plan:
+                old_content = getattr(op, "content", None)
+                old_span = getattr(op, "source_span", None)
+                new_content = (
+                    cls._strip_future_years(old_content, year_threshold)
+                    if isinstance(old_content, str)
+                    else old_content
+                )
+                new_span = (
+                    cls._strip_future_years(old_span, year_threshold)
+                    if isinstance(old_span, str)
+                    else old_span
+                )
+                changed = False
+                if new_content != old_content:
+                    op.content = new_content
+                    changed = True
+                if new_span != old_span:
+                    op.source_span = new_span
+                    changed = True
+                if changed:
+                    n_modified += 1
+        return n_modified
+
+    @staticmethod
+    def _strip_future_years(text: str, threshold: int) -> str:
+        """Replace 4-digit years > threshold (and any ISO -MM-DD suffix) with [date_unknown]."""
+
+        def _sub(m: re.Match[str]) -> str:
+            year = int(m.group(1))
+            return "[date_unknown]" if year > threshold else m.group(0)
+
+        return _YEAR_RE.sub(_sub, text)
 
     def _run_aggregation(
         self,

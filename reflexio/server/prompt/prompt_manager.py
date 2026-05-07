@@ -138,6 +138,59 @@ class PromptManager:
         except Exception as e:
             raise ValueError(f"Error rendering prompt {prompt_id}: {e}") from e
 
+    def render_search_prompt(
+        self,
+        *,
+        query: str,
+        max_steps: str,
+        enable_agent_answer: str,
+    ) -> str:
+        """Render the search_agent prompt with all 8 pattern recipes inlined.
+
+        Each pattern recipe (A through H) lives in its own prompt file under
+        ``search_agent/patterns/<letter>/``. The main ``search_agent`` prompt
+        contains placeholders ``<<<PATTERN_A_RECIPE>>>`` … ``<<<PATTERN_H_RECIPE>>>``
+        which this method substitutes by loading each pattern file. The result
+        is byte-equivalent to embedding the recipes inline in the main prompt
+        — the split is purely a file-organization choice that lets each
+        pattern be iterated independently without risking bleed into the
+        others.
+
+        Note: ``query`` is currently unused but kept in the signature for a
+        future conditional-rendering path (load only the dispatched pattern).
+        Stage 1 testing (v1.24.0) confirmed conditional load is
+        accuracy-neutral; the simpler full-load path here is the default.
+
+        Args:
+            query (str): The user question text. Currently unused; reserved
+                for future conditional rendering.
+            max_steps (str): Step budget to substitute into the main template.
+            enable_agent_answer (str): "true" or "false" — toggles answer mode.
+
+        Returns:
+            str: Fully rendered search prompt with all pattern recipes inlined.
+
+        Raises:
+            ValueError: If the main prompt or any pattern file fails to render.
+        """
+        main = self.render_prompt(
+            "search_agent",
+            variables={
+                "query": query,
+                "max_steps": max_steps,
+                "enable_agent_answer": enable_agent_answer,
+            },
+        )
+        for letter in "abcdefgh":
+            placeholder = f"<<<PATTERN_{letter.upper()}_RECIPE>>>"
+            if placeholder not in main:
+                continue
+            recipe = self.render_prompt(
+                f"search_agent/patterns/{letter}", variables={}
+            )
+            main = main.replace(placeholder, recipe)
+        return main
+
     def list_versions(self, prompt_id: str) -> list[str]:
         """
         List all versions of a prompt.
@@ -222,9 +275,19 @@ class PromptManager:
             return None
 
         def _semver_key(p: Path) -> tuple[int, ...]:
-            """Parse 'vX.Y.Z.prompt.md' into a comparable tuple."""
+            """Parse 'vX.Y.Z.prompt.md' into a comparable tuple.
+
+            Strips the leading 'v' before int parsing so versions sort by
+            their numeric semver tuple rather than collapsing to a single
+            fallback key. Without the prefix strip every version evaluates
+            to the (0,) fallback (because ``int('v1')`` raises) and the
+            "latest active" search becomes order-of-glob-dependent.
+            """
             try:
-                return tuple(int(x) for x in p.stem.removesuffix(".prompt").split("."))
+                return tuple(
+                    int(x)
+                    for x in p.stem.removeprefix("v").removesuffix(".prompt").split(".")
+                )
             except ValueError:
                 return (0,)
 
