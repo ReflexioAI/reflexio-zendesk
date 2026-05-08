@@ -701,14 +701,17 @@ class PlaybookAggregator:
         )
         prev_fingerprints: dict = {}  # Populated for incremental mode
 
+        # Deferred-archive flag: full archive is performed AFTER LLM generation,
+        # and only when at least one new playbook was produced. Avoids silently
+        # dropping existing PENDING/APPROVED playbooks when the LLM returns
+        # null (cluster identified as duplicate of existing).
+        pending_full_archive = False
+
         if playbook_aggregator_request.rerun:
-            # Full rerun: archive all non-APPROVED playbooks, regenerate everything
             logger.info("Rerun requested: bypassing cluster change detection")
-            self.storage.archive_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
-                playbook_name, agent_version=self.agent_version
-            )
             changed_clusters = clusters
             full_archive = True
+            pending_full_archive = True
         else:
             # Load previous fingerprints and detect changes
             prev_fingerprints = mgr.get_cluster_fingerprints(
@@ -716,15 +719,12 @@ class PlaybookAggregator:
             )
 
             if not prev_fingerprints:
-                # First run: treat all clusters as changed, archive all existing
                 logger.info(
                     "No previous cluster fingerprints found, treating all clusters as changed"
                 )
-                self.storage.archive_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
-                    playbook_name, agent_version=self.agent_version
-                )
                 changed_clusters = clusters
                 full_archive = True
+                pending_full_archive = True
             else:
                 (
                     changed_clusters,
@@ -782,6 +782,22 @@ class PlaybookAggregator:
                 existing_playbooks,
                 direction_overlap_threshold=playbook_aggregator_config.direction_overlap_threshold,
             )
+
+            # Lazy archive: only full-archive when the LLM produced replacements.
+            # Skipping the archive when new_playbooks is empty preserves existing
+            # PENDING/APPROVED playbooks that the LLM identified as duplicates.
+            if pending_full_archive:
+                if new_playbooks:
+                    self.storage.archive_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
+                        playbook_name, agent_version=self.agent_version
+                    )
+                else:
+                    logger.info(
+                        "Skipping full archive of '%s' (agent_version=%s): LLM produced 0 new playbooks; existing PENDING/APPROVED playbooks preserved",
+                        playbook_name,
+                        self.agent_version,
+                    )
+                    full_archive = False
 
             # Save playbooks (returns playbooks with playbook_id populated)
             saved_playbooks = self.storage.save_agent_playbooks(new_playbooks)  # type: ignore[reportOptionalMemberAccess]

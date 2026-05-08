@@ -166,10 +166,11 @@ if DEBUG_LOG_TO_CONSOLE and DEBUG_LOG_TO_CONSOLE not in ("false", "0", "no"):
         root_logger.addHandler(console_handler)
 
     # File handlers
-    from reflexio.cli.log_format import DEV_LOG_FILE, LLM_IO_LOG_FILE
+    from reflexio.cli.log_format import DEV_LOG_FILE, LLM_IO_LOG_FILE, LOG_DIR
 
-    _log_dir = Path.home() / ".reflexio" / "logs"
-    _log_dir.mkdir(parents=True, exist_ok=True)
+    # LOG_DIR honors REFLEXIO_LOG_DIR; mkdir here so RotatingFileHandler
+    # doesn't crash when the resolved directory doesn't yet exist.
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     # General log file — everything except LLM_PROMPT (those go to llm_io.log)
     file_handler = logging.handlers.RotatingFileHandler(

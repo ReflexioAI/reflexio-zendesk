@@ -53,8 +53,9 @@ def _resolve_log_dir() -> Path:
     a server's lifetime — change requires a restart.
 
     Returns:
-        Path: Resolved log directory. Not created here; the rotating file
-            handlers create it on first write.
+        Path: Resolved log directory. Not created here — callers must
+            ``mkdir(parents=True, exist_ok=True)`` before opening any
+            file handler against ``DEV_LOG_FILE`` / ``LLM_IO_LOG_FILE``.
     """
     base = os.environ.get("REFLEXIO_LOG_DIR")
     if base:
