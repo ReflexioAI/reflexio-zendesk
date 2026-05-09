@@ -1249,6 +1249,35 @@ class ReflexioClient:
             json=config.model_dump(),  # type: ignore[reportAttributeAccessIssue]
         )
 
+    def update_config(self, partial: dict) -> dict:
+        """Apply a partial (PATCH-style) update to the org config.
+
+        Unlike :meth:`set_config`, this does NOT round-trip the payload
+        through ``Config(**...)`` client-side, so partial updates like
+        ``{"extraction_backend": "classic"}`` succeed without needing
+        the caller to also re-send required fields like ``storage_config``.
+        The server fetches the existing config and shallow-merges
+        atomically — there is no client-side read-modify-write race.
+
+        Nested objects (e.g. ``storage_config``, ``llm_config``) are
+        replaced wholesale; deep merging is intentionally not supported.
+
+        Args:
+            partial: Top-level fields to overlay on the existing config.
+                Unknown keys are dropped server-side by Pydantic.
+
+        Returns:
+            dict: ``{"success": bool, "msg": str}`` from the server.
+
+        Raises:
+            TypeError: If *partial* is not a ``dict``.
+        """
+        if not isinstance(partial, dict):
+            raise TypeError(
+                f"update_config requires a dict, got {type(partial).__name__}"
+            )
+        return self._make_request("POST", "/api/update_config", json=partial)
+
     def get_config(self) -> Config:
         """Get configuration for the organization.
 
@@ -1260,6 +1289,37 @@ class ReflexioClient:
             "/api/get_config",
         )
         return Config(**response)
+
+    def invalidate_cache(self, org_id: str | None = None) -> dict:
+        """Explicitly evict the server-side per-org Reflexio cache entry.
+
+        Useful when the running config has been mutated through a
+        channel the server can't observe (sibling-replica writes,
+        direct DB updates, hand-edited config files on backends that
+        don't support cheap version probing). Phase 1 mtime-based
+        auto-invalidation and Phase 3 DB-version probing cover most
+        cases automatically; this is the manual escape hatch.
+
+        Cross-org invalidation is intentionally not supported: the
+        endpoint only ever invalidates the caller's own org. The
+        ``org_id`` argument is a verification token — when provided
+        it must match the token's authenticated org or the server
+        rejects with 403.
+
+        Args:
+            org_id: Optional org_id to verify against the caller's
+                authenticated identity. Omit to let the server
+                resolve it from the auth header.
+
+        Returns:
+            dict: ``{"invalidated": bool, "org_id": str}``. The
+            ``invalidated`` flag is False when nothing was cached for
+            the org (still a successful no-op).
+        """
+        body: dict[str, str] = {}
+        if org_id is not None:
+            body["org_id"] = org_id
+        return self._make_request("POST", "/api/admin/cache/invalidate", json=body)
 
     def get_user_playbooks(
         self,

@@ -8,6 +8,7 @@ from fastapi import (
     BackgroundTasks,
     Depends,
     FastAPI,
+    HTTPException,
     Request,
     status,
 )
@@ -67,6 +68,8 @@ from reflexio.models.api_schema.service_schemas import (
     AddUserPlaybookResponse,
     AddUserProfileRequest,
     AddUserProfileResponse,
+    AdminInvalidateCacheRequest,
+    AdminInvalidateCacheResponse,
     BulkDeleteResponse,
     CancelOperationRequest,
     CancelOperationResponse,
@@ -121,6 +124,7 @@ from reflexio.models.api_schema.ui.converters import (
     to_profile_view,
     to_user_playbook_view,
 )
+from reflexio.models.config_schema import Config
 from reflexio.server.api_endpoints import account_api, publisher_api, retriever_api
 from reflexio.server.cache.reflexio_cache import (
     get_reflexio,
@@ -1111,6 +1115,91 @@ def set_config(
         invalidate_reflexio_cache(org_id=org_id)
 
     return response
+
+
+@core_router.post("/api/update_config")
+def update_config(
+    partial: dict[str, Any],
+    org_id: str = Depends(default_get_org_id),
+) -> SetConfigResponse:
+    """Apply a partial update to the org's config (PATCH semantics).
+
+    Performs a top-level shallow merge of *partial* over the existing
+    config and round-trips through ``Config(**merged)`` so Pydantic
+    validates the result and rejects bogus top-level fields. Nested
+    objects (e.g. ``storage_config``) are replaced wholesale — deep
+    merging is intentionally not supported.
+
+    Unlike :func:`set_config`, callers do not need to re-send the full
+    config (including required fields like ``storage_config``) just to
+    flip a single boolean. The merge happens server-side atomically
+    within the request, eliminating the read-modify-write race a client
+    would otherwise hit.
+
+    Args:
+        partial: Top-level fields to overlay on the existing config.
+        org_id: Organization ID resolved by the auth layer.
+
+    Returns:
+        SetConfigResponse: Success status and message from
+        :meth:`Reflexio.set_config`.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    existing = reflexio.request_context.configurator.get_config().model_dump(
+        mode="python"
+    )
+    merged = {**existing, **partial}
+    # Pydantic validates the merged shape and rejects unknown / malformed
+    # fields here, before storage validation in reflexio.set_config.
+    response = reflexio.set_config(Config(**merged))
+    if response.success:
+        invalidate_reflexio_cache(org_id=org_id)
+    return response
+
+
+@core_router.post("/api/admin/cache/invalidate")
+def admin_invalidate_cache(
+    payload: AdminInvalidateCacheRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> AdminInvalidateCacheResponse:
+    """Explicitly evict the per-org Reflexio cache entry.
+
+    Necessary when the running config has been mutated through a
+    channel the server can't observe — e.g. another replica wrote to
+    the shared DB, or an operator hand-edited a self-host config file
+    on a backend that doesn't support cheap version probing. The
+    file-mtime check (Phase 1) and DB version check (Phase 3) cover
+    most cases automatically; this endpoint is the manual escape hatch.
+
+    Auth uses the same dependency as ``/api/set_config`` — callers
+    can only invalidate their own org's cache. If the request body
+    supplies ``org_id`` it must match the dep-resolved value;
+    cross-org invalidation is intentionally NOT exposed here.
+
+    Args:
+        payload: Optional ``org_id`` (verification only — must match
+            the caller's authenticated org if provided).
+        org_id: Organization ID resolved by the auth layer.
+
+    Returns:
+        AdminInvalidateCacheResponse: ``invalidated`` is True iff an
+        entry was evicted (False is a successful no-op when nothing
+        was cached).
+
+    Raises:
+        HTTPException: 403 when the body's ``org_id`` differs from the
+            caller's authenticated org.
+    """
+    if payload.org_id is not None and payload.org_id != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Cross-org cache invalidation is not supported; "
+                "omit org_id or pass your own."
+            ),
+        )
+    invalidated = invalidate_reflexio_cache(org_id=org_id)
+    return AdminInvalidateCacheResponse(invalidated=invalidated, org_id=org_id)
 
 
 @core_router.get("/api/get_config")

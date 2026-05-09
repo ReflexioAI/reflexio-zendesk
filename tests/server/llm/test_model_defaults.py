@@ -190,9 +190,14 @@ class TestResolveModelName:
         # Generation should use anthropic
         result = resolve_model_name(ModelRole.GENERATION)
         assert result == _PROVIDER_DEFAULTS["anthropic"].generation
-        # Embedding should fail (no embedding-capable provider)
-        with pytest.raises(RuntimeError, match="embedding-capable"):
+        # Embedding falls back to local when chromadb is importable.
+        from reflexio.server.llm.providers import local_embedding_provider as lep
+
+        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
+        assert (
             resolve_model_name(ModelRole.EMBEDDING)
+            == _PROVIDER_DEFAULTS["local"].embedding
+        )
 
     def test_no_keys_raises(self) -> None:
         with pytest.raises(RuntimeError, match="No LLM provider available"):
@@ -227,6 +232,52 @@ class TestResolveModelName:
         result = resolve_model_name(ModelRole.EMBEDDING)
         assert result == _PROVIDER_DEFAULTS["gemini"].embedding
 
+    def test_embedding_fallback_to_local_when_no_cloud(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Anthropic key + chromadb available → fall back to local embedder."""
+        from reflexio.server.llm.providers import local_embedding_provider as lep
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
+        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
+        result = resolve_model_name(ModelRole.EMBEDDING)
+        assert result == _PROVIDER_DEFAULTS["local"].embedding
+
+    def test_embedding_fallback_skipped_when_cloud_available(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cloud embedder beats local fallback when both are available."""
+        from reflexio.server.llm.providers import local_embedding_provider as lep
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
+        result = resolve_model_name(ModelRole.EMBEDDING)
+        assert result == _PROVIDER_DEFAULTS["openai"].embedding
+
+    def test_embedding_explicit_opt_in_beats_cloud(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CLAUDE_SMART_USE_LOCAL_EMBEDDING=1 forces local even with cloud keys."""
+        from reflexio.server.llm.providers import local_embedding_provider as lep
+
+        monkeypatch.setenv("CLAUDE_SMART_USE_LOCAL_EMBEDDING", "1")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
+        result = resolve_model_name(ModelRole.EMBEDDING)
+        assert result == _PROVIDER_DEFAULTS["local"].embedding
+
+    def test_embedding_no_chromadb_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Anthropic only + chromadb missing → RuntimeError with install hint."""
+        from reflexio.server.llm.providers import local_embedding_provider as lep
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
+        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: None)
+        with pytest.raises(RuntimeError, match="chromadb"):
+            resolve_model_name(ModelRole.EMBEDDING)
+
 
 # ---------------------------------------------------------------------------
 # validate_llm_availability
@@ -238,11 +289,25 @@ class TestValidateLlmAvailability:
         with pytest.raises(RuntimeError, match="No LLM provider available"):
             validate_llm_availability()
 
-    def test_no_embedding_provider_raises(
+    def test_no_embedding_provider_falls_back_to_local(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Anthropic key + chromadb importable → local fallback, no raise."""
+        from reflexio.server.llm.providers import local_embedding_provider as lep
+
         monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
-        with pytest.raises(RuntimeError, match="embedding-capable"):
+        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
+        validate_llm_availability()  # should not raise
+
+    def test_no_embedding_provider_no_chromadb_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Anthropic key + chromadb missing → raise with install hint."""
+        from reflexio.server.llm.providers import local_embedding_provider as lep
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
+        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: None)
+        with pytest.raises(RuntimeError, match="chromadb"):
             validate_llm_availability()
 
     def test_openai_only_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -265,6 +330,27 @@ class TestValidateLlmAvailability:
     def test_gemini_only_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GEMINI_API_KEY", "gem-test")
         validate_llm_availability()
+
+    def test_embedding_only_provider_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``providers == ["local"]`` (embedder-only, no LLM key) must raise.
+
+        The local ONNX embedder satisfies the embedding role but has no
+        generation model, so any extraction call would crash inside the
+        role resolver. Failing fast at startup keeps the user out of
+        that footgun.
+        """
+        from reflexio.server.llm.providers import local_embedding_provider as lep
+
+        # No LLM env vars; opt into the local embedder so ``local`` shows
+        # up in ``detect_available_providers`` results.
+        monkeypatch.setenv("CLAUDE_SMART_USE_LOCAL_EMBEDDING", "1")
+        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
+        with pytest.raises(
+            RuntimeError, match="No generation-capable LLM provider available"
+        ):
+            validate_llm_availability()
 
 
 # ---------------------------------------------------------------------------
@@ -355,3 +441,150 @@ class TestAgenticV2Roles:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         name = resolve_model_name(role=ModelRole.SEARCH_AGENT)
         assert name == "gpt-5-mini"
+
+
+class TestMinimaxAgenticRoles:
+    """MiniMax must expose extraction_agent + search_agent so agentic-v2
+    pipelines work for MiniMax-only configurations.
+
+    Surfaced by an e2e run where publish on a MiniMax-only VPS emitted
+    'No provider in [\'minimax\'] supports role=extraction_agent' and
+    silently skipped profile creation.
+    """
+
+    def test_minimax_has_extraction_agent(self):
+        from reflexio.server.llm.model_defaults import _PROVIDER_DEFAULTS
+
+        assert _PROVIDER_DEFAULTS["minimax"].extraction_agent is not None
+        assert _PROVIDER_DEFAULTS["minimax"].extraction_agent.startswith("minimax/")
+
+    def test_minimax_has_search_agent(self):
+        from reflexio.server.llm.model_defaults import _PROVIDER_DEFAULTS
+
+        assert _PROVIDER_DEFAULTS["minimax"].search_agent is not None
+        assert _PROVIDER_DEFAULTS["minimax"].search_agent.startswith("minimax/")
+
+    def test_minimax_only_resolves_extraction_agent(self):
+        """Auto-detect must return a MiniMax model when only MINIMAX_API_KEY
+        is configured and the role is extraction_agent."""
+        from reflexio.server.llm.model_defaults import (
+            ModelRole,
+            _auto_detect_model,
+        )
+
+        result = _auto_detect_model(ModelRole.EXTRACTION_AGENT, providers=["minimax"])
+        assert result == "minimax/MiniMax-M2.7"
+
+    def test_minimax_only_resolves_search_agent(self):
+        """Same for search_agent role."""
+        from reflexio.server.llm.model_defaults import (
+            ModelRole,
+            _auto_detect_model,
+        )
+
+        result = _auto_detect_model(ModelRole.SEARCH_AGENT, providers=["minimax"])
+        assert result == "minimax/MiniMax-M2.7"
+
+
+# ---------------------------------------------------------------------------
+# Regression: MiniMax-only env must NOT silently resolve to OpenAI defaults
+# ---------------------------------------------------------------------------
+
+
+class TestMinimaxOnlyEnvRegression:
+    """Reproduces the e2e regression where a fresh setup-init with only
+    MINIMAX_API_KEY in env saw the extractor pick gpt-5-mini at runtime.
+
+    The contract this class locks in: when the only LLM env var in scope
+    is MINIMAX_API_KEY, every generation-family role (the slots that
+    profile_extractor / playbook_extractor / agent_success_evaluator
+    resolve at construction time) must resolve to ``minimax/MiniMax-M2.7``,
+    not to any OpenAI default. This is the runtime expectation the
+    setup-init wizard documents to MiniMax-only users.
+
+    Failure mode this guards against: a future provider-priority edit
+    that drops MiniMax below OpenAI in ``_PROVIDER_PRIORITY``, or a
+    rename of ``MINIMAX_API_KEY`` in ``_ENV_TO_PROVIDER`` that silently
+    falls through to the empty-key OpenAI default.
+    """
+
+    def test_generation_role_resolves_to_minimax(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``default_generation_model_name`` must be the MiniMax model."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "mm-test")
+        result = resolve_model_name(ModelRole.GENERATION)
+        assert result == "minimax/MiniMax-M2.7", (
+            f"Expected minimax/MiniMax-M2.7, got {result!r}. If this fails, "
+            "MiniMax-only users will hit OpenAI auth errors at extraction time."
+        )
+
+    def test_should_run_role_resolves_to_minimax(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``should_run_model_name`` must also resolve to the MiniMax model."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "mm-test")
+        result = resolve_model_name(ModelRole.SHOULD_RUN)
+        assert result == "minimax/MiniMax-M2.7"
+
+    def test_all_generation_roles_resolve_to_minimax(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every non-embedding role must resolve to a MiniMax model.
+
+        Catches regressions where one of the agentic-v2 roles
+        (``extraction_agent`` / ``search_agent``) gets re-introduced
+        without MiniMax coverage — the exact bug PR #51 fixed.
+        """
+        monkeypatch.setenv("MINIMAX_API_KEY", "mm-test")
+        for role in (
+            ModelRole.GENERATION,
+            ModelRole.EVALUATION,
+            ModelRole.SHOULD_RUN,
+            ModelRole.PRE_RETRIEVAL,
+            ModelRole.EXTRACTION_AGENT,
+            ModelRole.SEARCH_AGENT,
+        ):
+            result = resolve_model_name(role)
+            assert result.startswith("minimax/"), (
+                f"Role {role.value} resolved to {result!r}, expected a "
+                "minimax/ model. MiniMax-only users would hit a "
+                "provider-mismatch error for this role."
+            )
+
+    def test_minimax_with_empty_openai_key_still_resolves_to_minimax(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An empty ``OPENAI_API_KEY=`` placeholder line must NOT promote OpenAI.
+
+        The bundled ``.env.example`` ships with ``OPENAI_API_KEY=`` (no
+        value); ``load_dotenv`` interprets this as
+        ``os.environ['OPENAI_API_KEY'] = ''``. ``detect_available_providers``
+        relies on truthiness, so an empty string must be treated as
+        "key not set" and the OpenAI provider must NOT appear in the
+        priority list.
+        """
+        monkeypatch.setenv("OPENAI_API_KEY", "")
+        monkeypatch.setenv("MINIMAX_API_KEY", "mm-test")
+        providers = detect_available_providers()
+        assert "openai" not in providers, (
+            f"Empty OPENAI_API_KEY must not promote OpenAI; got {providers}"
+        )
+        assert resolve_model_name(ModelRole.GENERATION) == "minimax/MiniMax-M2.7"
+
+    def test_minimax_with_chromadb_resolves_embedding_to_local(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mirror of the e2e Mode A path: MiniMax + chromadb → local embedder.
+
+        MiniMax has no embedding endpoint, so the embedding role must
+        fall through to the local ONNX embedder via Path 3 of
+        ``_auto_detect_model``. This is the configuration the e2e
+        reproducer uses.
+        """
+        from reflexio.server.llm.providers import local_embedding_provider as lep
+
+        monkeypatch.setenv("MINIMAX_API_KEY", "mm-test")
+        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
+        result = resolve_model_name(ModelRole.EMBEDDING)
+        assert result == "local/minilm-l6-v2"
