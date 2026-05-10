@@ -41,6 +41,7 @@ from reflexio.server.services.playbook_optimizer.gepa_adapter import (
 )
 from reflexio.server.services.playbook_optimizer.judge import JudgeOutput
 from reflexio.server.services.playbook_optimizer.models import (
+    CandidateEvaluationOutput,
     ChatMessage,
     JudgeASI,
     ScenarioWindow,
@@ -264,6 +265,159 @@ def test_adapter_calls_assistant_with_same_seed_and_different_content(tmp_path):
     evaluations = storage.list_playbook_optimization_evaluations(job.job_id)
     assert len(evaluations) == 1
     assert evaluations[0].verdict == "candidate"
+
+
+def test_adapter_cache_distinguishes_windows_with_same_playbook_id(tmp_path):
+    storage = _sqlite_storage(tmp_path)
+    job = storage.create_playbook_optimization_job(
+        PlaybookOptimizationJob(target_kind="agent_playbook", target_id=1)
+    )
+    incumbent = AgentPlaybook(
+        agent_playbook_id=1,
+        playbook_name="support",
+        agent_version="v1",
+        content="incumbent content",
+    )
+    assistant = Mock(return_value="assistant response")
+    judge = Mock()
+    judge.judge.side_effect = [
+        JudgeOutput(
+            verdict="candidate",
+            score=0.9,
+            likert=5,
+            rationale="first window",
+            asi=JudgeASI(winning_behaviors=["clearer response"]),
+        ),
+        JudgeOutput(
+            verdict="incumbent",
+            score=0.1,
+            likert=1,
+            rationale="second window",
+            asi=JudgeASI(failure_modes=["missed context"]),
+        ),
+    ]
+    adapter = ReflexioPlaybookGEPAAdapter(
+        storage=storage,
+        job_id=job.job_id,
+        target_kind="agent_playbook",
+        target_id=1,
+        incumbent=incumbent,
+        rollout=MultiTurnRollout(assistant),
+        judge=judge,
+        max_turns=1,
+    )
+    windows = [
+        ScenarioWindow(
+            user_playbook_id=11,
+            source_interaction_ids=[101],
+            interactions=[
+                Interaction(
+                    interaction_id=101,
+                    user_id="u1",
+                    request_id="r1",
+                    role="User",
+                    content="Please summarize this.",
+                )
+            ],
+        ),
+        ScenarioWindow(
+            user_playbook_id=11,
+            source_interaction_ids=[202],
+            interactions=[
+                Interaction(
+                    interaction_id=202,
+                    user_id="u1",
+                    request_id="r2",
+                    role="User",
+                    content="Please expand this.",
+                )
+            ],
+        ),
+    ]
+
+    batch = adapter.evaluate(
+        windows,
+        {PLAYBOOK_CONTENT_COMPONENT: "candidate content"},
+        capture_traces=True,
+    )
+
+    assert batch.scores == [0.9, 0.1]
+    assert assistant.call_count == 4
+    evaluations = storage.list_playbook_optimization_evaluations(job.job_id)
+    assert [evaluation.source_interaction_ids for evaluation in evaluations] == [
+        [101],
+        [202],
+    ]
+    assert [evaluation.verdict for evaluation in evaluations] == [
+        "candidate",
+        "incumbent",
+    ]
+
+
+def test_adapter_does_not_cache_aborted_evaluations(tmp_path):
+    storage = _sqlite_storage(tmp_path)
+    job = storage.create_playbook_optimization_job(
+        PlaybookOptimizationJob(target_kind="agent_playbook", target_id=1)
+    )
+    incumbent = AgentPlaybook(
+        agent_playbook_id=1,
+        playbook_name="support",
+        agent_version="v1",
+        content="incumbent content",
+    )
+    adapter = ReflexioPlaybookGEPAAdapter(
+        storage=storage,
+        job_id=job.job_id,
+        target_kind="agent_playbook",
+        target_id=1,
+        incumbent=incumbent,
+        rollout=MultiTurnRollout(Mock(return_value="assistant response")),
+        judge=Mock(),
+        max_turns=1,
+    )
+    aborted = CandidateEvaluationOutput(
+        verdict="aborted",
+        score=0.0,
+        likert=1,
+        rationale="assistant subprocess timed out",
+    )
+    succeeded = CandidateEvaluationOutput(
+        verdict="candidate",
+        score=0.9,
+        likert=5,
+        rationale="retry succeeded",
+        asi=JudgeASI(winning_behaviors=["clearer response"]),
+    )
+    adapter._evaluate_one = Mock(side_effect=[aborted, succeeded])  # type: ignore[method-assign]
+    window = ScenarioWindow(
+        user_playbook_id=11,
+        source_interaction_ids=[101],
+        interactions=[
+            Interaction(
+                interaction_id=101,
+                user_id="u1",
+                request_id="r1",
+                role="User",
+                content="Please summarize this.",
+            )
+        ],
+    )
+
+    first = adapter.evaluate(
+        [window], {PLAYBOOK_CONTENT_COMPONENT: "candidate content"}
+    )
+    second = adapter.evaluate(
+        [window], {PLAYBOOK_CONTENT_COMPONENT: "candidate content"}
+    )
+
+    assert first.outputs[0].verdict == "aborted"
+    assert second.outputs[0].verdict == "candidate"
+    assert adapter._evaluate_one.call_count == 2
+    evaluations = storage.list_playbook_optimization_evaluations(job.job_id)
+    assert [evaluation.verdict for evaluation in evaluations] == [
+        "aborted",
+        "candidate",
+    ]
 
 
 def test_optimizer_skips_approved_agent_playbooks(tmp_path):
