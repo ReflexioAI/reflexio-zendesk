@@ -9,6 +9,7 @@ backends later.
 from __future__ import annotations
 
 import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -95,6 +96,61 @@ class TestConfigStorageContract:
         storage = LocalFileConfigStorage(org_id="brand-new-org", base_dir=str(tmp_path))
         # Don't trigger load_config (which creates the file). Probe directly.
         assert storage.get_version() is None
+
+    def test_save_config_writes_atomically(self, tmp_path) -> None:
+        """save_config writes via a per-write unique temp file and renames into place.
+
+        This is the multi-worker safety property the F2 audit remediation
+        enforces: ``LocalFileConfigStorage._save_config_to_local_dir``
+        must write to a unique ``config_<org>.json.<pid>.<ns>.tmp`` then
+        atomically rename over the final path. Three assertions:
+
+        1. After a successful save, no ``.tmp`` sidecar is left behind
+           in the directory (catches both legacy shared names and any
+           new per-write names).
+        2. The persisted config round-trips through ``load_config``.
+        3. The tmp filename pattern is unique per-write (a glob for
+           ``config_*.json.*.tmp`` returns nothing once the rename is done).
+
+        We don't simulate a crash here — a true "leave the previous good
+        file intact on crash" test would require process-kill plumbing.
+        The leak-check is a cheap proxy that fails loudly if someone
+        reverts to a non-atomic ``open("w")`` write or a shared tmp name.
+        """
+        storage = LocalFileConfigStorage(org_id="atomic-org", base_dir=str(tmp_path))
+        cfg = storage.get_default_config()
+        cfg.window_size = 7
+        storage.save_config(cfg)
+
+        final = Path(storage.config_file)
+        assert final.exists(), "config file should be written"
+        leaked = list(final.parent.glob(f"{final.name}*.tmp"))
+        assert not leaked, f"atomic write should not leak a .tmp sidecar: {leaked}"
+
+        loaded = storage.load_config()
+        assert loaded.window_size == 7
+
+    def test_save_config_propagates_write_failure(self, tmp_path, monkeypatch) -> None:
+        """save_config must raise on OSError; callers must not see a false success.
+
+        The pre-fix implementation caught Exception, printed a traceback,
+        and returned normally — masking write failures from operators and
+        leaving in-memory state diverged from disk. Verify the rewrite
+        re-raises.
+        """
+        storage = LocalFileConfigStorage(org_id="raises-org", base_dir=str(tmp_path))
+        cfg = storage.get_default_config()
+
+        def boom(self: Path, *args, **kwargs) -> int:
+            raise OSError("simulated disk failure")
+
+        monkeypatch.setattr(Path, "write_text", boom)
+
+        with pytest.raises(OSError, match="simulated disk failure"):
+            storage.save_config(cfg)
+
+        leaked = list(Path(tmp_path).rglob(f"{Path(storage.config_file).name}*.tmp"))
+        assert not leaked, f"tmp file should be cleaned up on failure: {leaked}"
 
     def test_get_version_changes_after_save(
         self, config_storage: ConfigStorage
