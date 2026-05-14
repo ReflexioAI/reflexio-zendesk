@@ -50,6 +50,7 @@ from reflexio.server.llm.model_defaults import ModelRole, resolve_model_name
 from reflexio.server.services.storage.error import StorageError
 from reflexio.server.services.storage.storage_base import BaseStorage
 from reflexio.server.site_var.site_var_manager import SiteVarManager
+from ._stall_state import init_stall_state_table
 
 logger = logging.getLogger(__name__)
 
@@ -615,6 +616,7 @@ class SQLiteStorageBase(BaseStorage):
         self._migrate_expanded_terms()
         self._migrate_agentic_signals()
         self._migrate_agent_playbook_source_windows()
+        init_stall_state_table(self.conn)
         return True
 
     def _try_load_sqlite_vec(self) -> bool:
