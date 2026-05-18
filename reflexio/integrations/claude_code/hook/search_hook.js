@@ -42,6 +42,17 @@ function readEnvVar(key) {
 const SKIP_PATTERNS =
 	/^(yes|no|ok|okay|sure|thanks|thank you|yep|nope|right|correct|got it|done|good|great|fine|lgtm|y|n|k|ty|thx|ack|np)$/i;
 
+function isInternalInvocation() {
+	if (
+		process.env.CLAUDE_SMART_INTERNAL === "1" ||
+		process.env.REFLEXIO_INTERNAL === "1"
+	) {
+		return true;
+	}
+	const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
+	return Boolean(entrypoint && entrypoint !== "cli");
+}
+
 async function main() {
 	const input = readFileSync("/dev/stdin", "utf-8").trim();
 	if (!input) {
@@ -56,6 +67,9 @@ async function main() {
 	}
 
 	const prompt = event.prompt || "";
+	if (isInternalInvocation()) {
+		process.exit(0);
+	}
 
 	// Skip short messages and common non-task responses
 	if (prompt.length < MIN_PROMPT_LENGTH || SKIP_PATTERNS.test(prompt.trim())) {

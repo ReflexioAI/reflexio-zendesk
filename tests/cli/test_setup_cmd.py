@@ -332,6 +332,40 @@ class TestInstallClaudeCodeIntegration:
         assert "SessionStart" in settings["hooks"]
         assert "UserPromptSubmit" in settings["hooks"]
 
+    def test_install_preserves_claude_smart_hooks(self, tmp_path: Path) -> None:
+        """Standalone setup must not overwrite claude-smart plugin hooks."""
+        settings_path = tmp_path / ".claude" / "settings.json"
+        settings_path.parent.mkdir(parents=True)
+        smart_command = (
+            'bash "$HOME/.claude/plugins/marketplaces/reflexioai/plugin/'
+            'scripts/hook_entry.sh" claude-code session-start'
+        )
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [
+                            {"hooks": [{"type": "command", "command": smart_command}]}
+                        ]
+                    }
+                }
+            )
+            + "\n"
+        )
+
+        _install_claude_code_integration(
+            tmp_path, location=InstallLocation.CURRENT_PROJECT
+        )
+
+        settings = json.loads(settings_path.read_text())
+        commands = [
+            hook["command"]
+            for entry in settings["hooks"]["SessionStart"]
+            for hook in entry["hooks"]
+        ]
+        assert smart_command in commands
+        assert any("session_start_hook.sh" in command for command in commands)
+
     def test_normal_mode_no_session_end_hook(self, tmp_path: Path) -> None:
         """Normal mode does not install the Stop hook."""
         _install_claude_code_integration(
@@ -382,6 +416,36 @@ class TestInstallClaudeCodeIntegration:
         assert not (claude_dir / "commands" / "reflexio-extract").exists()
         settings = json.loads((claude_dir / "settings.json").read_text())
         assert "Stop" not in settings.get("hooks", {})
+
+    def test_normal_reinstall_preserves_non_reflexio_stop_hooks(
+        self, tmp_path: Path
+    ) -> None:
+        """Normal reinstall only removes the standalone Reflexio Stop hook."""
+        _install_claude_code_integration(
+            tmp_path, expert=True, location=InstallLocation.CURRENT_PROJECT
+        )
+        settings_path = tmp_path / ".claude" / "settings.json"
+        settings = json.loads(settings_path.read_text())
+        smart_command = (
+            'bash "$HOME/.claude/plugins/marketplaces/reflexioai/plugin/'
+            'scripts/hook_entry.sh" claude-code stop'
+        )
+        settings["hooks"]["Stop"].append(
+            {"hooks": [{"type": "command", "command": smart_command}]}
+        )
+        settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+
+        _install_claude_code_integration(
+            tmp_path, expert=False, location=InstallLocation.CURRENT_PROJECT
+        )
+
+        settings = json.loads(settings_path.read_text())
+        commands = [
+            hook["command"]
+            for entry in settings["hooks"]["Stop"]
+            for hook in entry["hooks"]
+        ]
+        assert commands == [smart_command]
 
     def test_idempotent_install(self, tmp_path: Path) -> None:
         """Running install twice doesn't corrupt files or duplicate hooks."""

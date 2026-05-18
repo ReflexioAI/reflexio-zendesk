@@ -903,10 +903,25 @@ def _upsert_hook(hooks: dict, event_name: str, hook_command: str) -> None:
     }
     for existing in event_hooks:
         inner = existing.get("hooks", [])
-        if any("reflexio" in h.get("command", "") for h in inner):
+        if any(_is_legacy_reflexio_hook_command(h.get("command", "")) for h in inner):
             existing["hooks"] = hook_entry["hooks"]
             return
     event_hooks.append(hook_entry)
+
+
+_LEGACY_REFLEXIO_HOOK_FILES = (
+    "reflexio/integrations/claude_code/hook/handler.js",
+    "reflexio/integrations/claude_code/hook/search_hook.js",
+    "reflexio/integrations/claude_code/hook/session_start_hook.sh",
+    "integrations/claude_code/hook/handler.js",
+    "integrations/claude_code/hook/search_hook.js",
+    "integrations/claude_code/hook/session_start_hook.sh",
+)
+
+
+def _is_legacy_reflexio_hook_command(command: str) -> bool:
+    normalized = command.replace("\\", "/")
+    return any(marker in normalized for marker in _LEGACY_REFLEXIO_HOOK_FILES)
 
 
 def _merge_hook_config(
@@ -957,7 +972,8 @@ def _merge_hook_config(
             entry
             for entry in stop_hooks
             if not any(
-                "reflexio" in h.get("command", "") for h in entry.get("hooks", [])
+                _is_legacy_reflexio_hook_command(h.get("command", ""))
+                for h in entry.get("hooks", [])
             )
         ]
         if cleaned:
@@ -992,7 +1008,8 @@ def _remove_hook_config(settings_path: Path) -> None:
             entry
             for entry in event_hooks
             if not any(
-                "reflexio" in h.get("command", "") for h in entry.get("hooks", [])
+                _is_legacy_reflexio_hook_command(h.get("command", ""))
+                for h in entry.get("hooks", [])
             )
         ]
         if not hooks[event_name]:

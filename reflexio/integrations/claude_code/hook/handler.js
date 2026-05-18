@@ -26,6 +26,17 @@ const MAX_INTERACTIONS = 200;
 const MAX_CONTENT_LENGTH = 10_000;
 const LOG_DIR = join(homedir(), ".reflexio", "logs");
 
+function isInternalInvocation() {
+	if (
+		process.env.CLAUDE_SMART_INTERNAL === "1" ||
+		process.env.REFLEXIO_INTERNAL === "1"
+	) {
+		return true;
+	}
+	const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
+	return Boolean(entrypoint && entrypoint !== "cli");
+}
+
 /**
  * Read a variable from ~/.reflexio/.env when it is not set in process.env.
  * Returns the raw string value (with surrounding quotes stripped), or empty
@@ -62,6 +73,10 @@ async function main() {
 
 	const sessionId = event.session_id;
 	const transcriptPath = event.transcript_path;
+	if (isInternalInvocation()) {
+		output({});
+		return;
+	}
 
 	if (!transcriptPath || !existsSync(transcriptPath)) {
 		console.error(

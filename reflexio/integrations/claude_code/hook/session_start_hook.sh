@@ -26,6 +26,17 @@ SERVER_URL="${REFLEXIO_URL:-http://127.0.0.1:8081}"
 cat > /dev/null
 echo '{}'
 
+# Internal/headless Claude invocations (for example Reflexio's own
+# claude-code provider calling `claude -p`) also fire global Claude Code hooks.
+# They are not user sessions and must not recursively start backend/search/
+# publish flows.
+if [ "${CLAUDE_SMART_INTERNAL:-}" = "1" ] || [ "${REFLEXIO_INTERNAL:-}" = "1" ]; then
+    exit 0
+fi
+if [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ] && [ "${CLAUDE_CODE_ENTRYPOINT:-}" != "cli" ]; then
+    exit 0
+fi
+
 # 2. If a recent flag file exists, another start is in progress — exit
 if [ -f "$STARTING_FLAG" ]; then
     # Clean up stale flags (older than STALE_AGE_MIN minutes)
