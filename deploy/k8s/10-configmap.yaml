@@ -7,6 +7,8 @@ data:
   BACKEND_PORT: "8081"
   LOCAL_STORAGE_PATH: /data/reflexio
   REFLEXIO_LOG_DIR: /data/reflexio
-  REFLEXIO_STORAGE: sqlite
+  REFLEXIO_STORAGE: postgres
+  REFLEXIO_POSTGRES_SCHEMA: public
+  REFLEXIO_POSTGRES_POOL_SIZE: "5"
   IS_TEST_ENV: "false"
   DEBUG_LOG_TO_CONSOLE: "false"

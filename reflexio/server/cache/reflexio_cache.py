@@ -93,6 +93,18 @@ def _probe_version_safe(reflexio: Reflexio) -> _ProbeResult:
         return _PROBE_FAILED
 
 
+def _close_reflexio_storage(reflexio: Reflexio) -> None:
+    storage = getattr(getattr(reflexio, "request_context", None), "storage", None)
+    close = getattr(storage, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:  # noqa: BLE001 - cache eviction must not fail request
+            logger.warning(
+                "Failed to close storage for org %s: %s", reflexio.org_id, exc
+            )
+
+
 def get_reflexio(org_id: str, storage_base_dir: str | None = None) -> Reflexio:
     """Get or create a cached Reflexio instance.
 
@@ -138,6 +150,7 @@ def get_reflexio(org_id: str, storage_base_dir: str | None = None) -> Reflexio:
             existing = _reflexio_cache.get(cache_key)
             if existing is not None and existing.cached_version == cached_version:
                 del _reflexio_cache[cache_key]
+                _close_reflexio_storage(existing.reflexio)
 
     # Cache miss (or just-evicted stale entry) - create a new instance
     # outside the lock to avoid blocking concurrent requests for other orgs.
@@ -183,7 +196,8 @@ def invalidate_reflexio_cache(org_id: str, storage_base_dir: str | None = None) 
     cache_key: CacheKey = (org_id, storage_base_dir)
     with _reflexio_cache_lock:
         if cache_key in _reflexio_cache:
-            del _reflexio_cache[cache_key]
+            entry = _reflexio_cache.pop(cache_key)
+            _close_reflexio_storage(entry.reflexio)
             return True
         return False
 
@@ -191,7 +205,10 @@ def invalidate_reflexio_cache(org_id: str, storage_base_dir: str | None = None) 
 def clear_reflexio_cache() -> None:
     """Clear entire cache (for testing/admin)."""
     with _reflexio_cache_lock:
+        entries = list(_reflexio_cache.values())
         _reflexio_cache.clear()
+    for entry in entries:
+        _close_reflexio_storage(entry.reflexio)
 
 
 def get_cache_stats() -> dict:

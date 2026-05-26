@@ -35,6 +35,7 @@ dependencies = [
     "cachetools>=6.2.4",
     "colorlog>=6.10.1",
     "httpx>=0.28.1",
+    "psycopg2-binary>=2.9.9",
     "pydantic[email]>=2.13.0",
     "nltk>=3.9.3",
     "json-repair>=0.30.0",

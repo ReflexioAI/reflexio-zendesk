@@ -34,4 +34,4 @@ USER reflexio
 
 EXPOSE 8081
 
-CMD ["uv", "run", "reflexio", "services", "start", "--only", "backend", "--no-reload", "--workers", "1", "--storage", "sqlite"]
+CMD ["uv", "run", "reflexio", "services", "start", "--only", "backend", "--no-reload", "--workers", "1"]

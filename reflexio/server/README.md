@@ -436,9 +436,10 @@ Pre-computed embeddings passed to storage methods via `query_embedding` paramete
 
 | File | Purpose |
 |------|---------|
-| `storage_base.py` | BaseStorage abstract class |
-| `local_json_storage.py` | Local file-based for testing |
-| `sqlite_storage.py` | SQLite-based storage for local/self-hosted deployments |
+| `storage_base/` | BaseStorage abstract class and shared interfaces |
+| `disk_storage/` | Local file-based storage for testing and simple file persistence |
+| `sqlite_storage/` | SQLite-based storage for local/self-hosted deployments |
+| `postgres_storage/` | Native Postgres + pgvector storage for Docker/local networked deployments |
 
 **Pattern**: **NEVER import storage implementations directly** - Always use `request_context.storage`
 
@@ -465,6 +466,7 @@ Pre-computed embeddings passed to storage methods via `query_embedding` paramete
 Key files:
 - `configurator.py`: DefaultConfigurator - loads YAML config, creates storage
 - `local_file_config_storage.py`: Local file-based config storage
+- `postgres_env.py`: Shared Postgres environment lookup (`POSTGRES_DB_URL` with `REFLEXIO_POSTGRES_DB_URL` compatibility)
 **Config Storage Priority** (in `DefaultConfigurator`):
 1. **Local** - If `base_dir` is explicitly provided (testing)
 2. **Local File** - Default fallback

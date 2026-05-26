@@ -154,10 +154,14 @@ def save_storage_to_config(
                     "Keeping existing storage config."
                 )
         case "postgres":
-            db_url = os.environ.get("REFLEXIO_POSTGRES_DB_URL", "")
+            from reflexio.server.services.configurator.postgres_env import (
+                postgres_db_url_from_env,
+                postgres_pool_size_from_env,
+            )
+
+            db_url = postgres_db_url_from_env()
             schema = os.environ.get("REFLEXIO_POSTGRES_SCHEMA", "").strip()
-            pool_size_raw = os.environ.get("REFLEXIO_POSTGRES_POOL_SIZE", "").strip()
-            pool_size = int(pool_size_raw) if pool_size_raw.isdigit() else 5
+            pool_size = postgres_pool_size_from_env()
             if db_url:
                 config.storage_config = StorageConfigPostgres(
                     db_url=db_url,
@@ -166,8 +170,9 @@ def save_storage_to_config(
                 )
             else:
                 logger.warning(
-                    "Postgres storage requested but REFLEXIO_POSTGRES_DB_URL "
-                    "is missing. Keeping existing storage config."
+                    "Postgres storage requested but POSTGRES_DB_URL or "
+                    "REFLEXIO_POSTGRES_DB_URL is missing. Keeping existing "
+                    "storage config."
                 )
         case "disk":
             env_dir = os.environ.get("LOCAL_STORAGE_PATH", "").strip()

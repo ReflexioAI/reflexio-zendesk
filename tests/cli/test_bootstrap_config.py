@@ -138,6 +138,46 @@ class TestSaveAndLoadStorage:
         result = load_storage_from_config(org_id="test-org", base_dir=str(tmp_path))
         assert result == "supabase"
 
+    def test_round_trip_postgres_with_postgres_db_url(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from reflexio.models.config_schema import StorageConfigPostgres
+        from reflexio.server.services.configurator.local_file_config_storage import (
+            LocalFileConfigStorage,
+        )
+
+        monkeypatch.setenv("POSTGRES_DB_URL", "postgresql://db")
+        monkeypatch.delenv("REFLEXIO_POSTGRES_DB_URL", raising=False)
+
+        save_storage_to_config("postgres", org_id="test-org", base_dir=str(tmp_path))
+
+        storage_obj = LocalFileConfigStorage("test-org", base_dir=str(tmp_path))
+        config = storage_obj.load_config()
+        assert isinstance(config.storage_config, StorageConfigPostgres)
+        assert config.storage_config.db_url == "postgresql://db"
+        assert (
+            load_storage_from_config(org_id="test-org", base_dir=str(tmp_path))
+            == "postgres"
+        )
+
+    def test_round_trip_postgres_prefers_reflexio_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from reflexio.models.config_schema import StorageConfigPostgres
+        from reflexio.server.services.configurator.local_file_config_storage import (
+            LocalFileConfigStorage,
+        )
+
+        monkeypatch.setenv("POSTGRES_DB_URL", "postgresql://db")
+        monkeypatch.setenv("REFLEXIO_POSTGRES_DB_URL", "postgresql://explicit")
+
+        save_storage_to_config("postgres", org_id="test-org", base_dir=str(tmp_path))
+
+        storage_obj = LocalFileConfigStorage("test-org", base_dir=str(tmp_path))
+        config = storage_obj.load_config()
+        assert isinstance(config.storage_config, StorageConfigPostgres)
+        assert config.storage_config.db_url == "postgresql://explicit"
+
     def test_supabase_without_creds_preserves_existing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -169,12 +209,10 @@ class TestSaveAndLoadStorage:
         storage_obj = LocalFileConfigStorage("test-org", base_dir=str(tmp_path))
         config = Config(
             storage_config=StorageConfigSQLite(),
-            profile_extractor_configs=[
-                ProfileExtractorConfig(
-                    extractor_name="custom_extractor",
-                    extraction_definition_prompt="Custom prompt for testing",
-                ),
-            ],
+            profile_extractor_config=ProfileExtractorConfig(
+                extractor_name="custom_extractor",
+                extraction_definition_prompt="Custom prompt for testing",
+            ),
             agent_context_prompt="test context",
         )
         storage_obj.save_config(config)

@@ -4,13 +4,33 @@ services:
       context: .
       dockerfile: Dockerfile
     image: reflexio-zendesk:local
+    command:
+      [
+        "uv",
+        "run",
+        "reflexio",
+        "services",
+        "start",
+        "--only",
+        "backend",
+        "--no-reload",
+        "--workers",
+        "1",
+        "--storage",
+        "postgres",
+      ]
     ports:
       - "8081:8081"
     environment:
       BACKEND_PORT: "8081"
       LOCAL_STORAGE_PATH: /data/reflexio
       REFLEXIO_LOG_DIR: /data/reflexio
-      REFLEXIO_STORAGE: sqlite
+      REFLEXIO_STORAGE: postgres
+      POSTGRES_DB_URL: ${POSTGRES_DB_URL:?Set POSTGRES_DB_URL to your Postgres connection URL}
+      REFLEXIO_POSTGRES_SCHEMA: ${REFLEXIO_POSTGRES_SCHEMA:-public}
+      REFLEXIO_POSTGRES_POOL_SIZE: ${REFLEXIO_POSTGRES_POOL_SIZE:-5}
+      REFLEXIO_EMBEDDING_PROVIDER: ${REFLEXIO_EMBEDDING_PROVIDER:-}
+      CLAUDE_SMART_USE_LOCAL_EMBEDDING: ${CLAUDE_SMART_USE_LOCAL_EMBEDDING:-}
       IS_TEST_ENV: "false"
       DEBUG_LOG_TO_CONSOLE: "false"
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}

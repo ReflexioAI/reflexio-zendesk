@@ -8,6 +8,7 @@ from typing import Any
 from reflexio.models.config_schema import (
     StorageConfig,
     StorageConfigDisk,
+    StorageConfigPostgres,
     StorageConfigSQLite,
 )
 from reflexio.server.services.configurator.base_configurator import BaseConfigurator
@@ -16,6 +17,7 @@ from reflexio.server.services.configurator.local_file_config_storage import (
     LocalFileConfigStorage,
 )
 from reflexio.server.services.storage.disk_storage import DiskStorage
+from reflexio.server.services.storage.postgres_storage import PostgresStorage
 from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
 from reflexio.server.services.storage.storage_base import BaseStorage
 
@@ -63,16 +65,37 @@ def _create_disk_storage(
     )
 
 
+def _create_postgres_storage(
+    configurator: BaseConfigurator, config: StorageConfigPostgres
+) -> BaseStorage:
+    logger.info("Using Postgres storage for org %s", configurator.org_id)
+    full_config = configurator.get_config()
+    api_key_config = full_config.api_key_config if full_config else None
+    llm_config = full_config.llm_config if full_config else None
+    enable_document_expansion = (
+        full_config.enable_document_expansion if full_config else False
+    )
+    return PostgresStorage(
+        org_id=configurator.org_id,
+        config=config,
+        api_key_config=api_key_config,
+        llm_config=llm_config,
+        enable_document_expansion=enable_document_expansion,
+    )
+
+
 class DefaultConfigurator(BaseConfigurator):
     """OS configurator with LocalJson config storage and Local+SQLite data storage."""
 
     _STORAGE_FACTORIES: dict[type[StorageConfig], Callable[..., BaseStorage]] = {
         StorageConfigSQLite: _create_sqlite_storage,
+        StorageConfigPostgres: _create_postgres_storage,
         StorageConfigDisk: _create_disk_storage,
     }
 
     _STORAGE_READINESS_CHECKS: dict[type[StorageConfig], Callable[[Any], bool]] = {
         StorageConfigSQLite: lambda _: True,  # db_path defaults via env var if None
+        StorageConfigPostgres: lambda c: bool(c.db_url),
         StorageConfigDisk: lambda c: bool(c.dir_path),
     }
 

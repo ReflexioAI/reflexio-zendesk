@@ -12,9 +12,14 @@ from reflexio.models.config_schema import (
     PlaybookConfig,
     ProfileExtractorConfig,
     StorageConfigDisk,
+    StorageConfigPostgres,
     StorageConfigSQLite,
 )
 from reflexio.server.services.configurator.config_storage import ConfigStorage
+from reflexio.server.services.configurator.postgres_env import (
+    postgres_db_url_from_env,
+    postgres_pool_size_from_env,
+)
 
 
 class LocalFileConfigStorage(ConfigStorage):
@@ -40,11 +45,23 @@ class LocalFileConfigStorage(ConfigStorage):
             self.base_dir = str(reflexio_home() / "configs")
             self.config_file = str(Path(self.base_dir) / f"config_{org_id}.json")
 
-    def _default_storage_config(self) -> StorageConfigSQLite | StorageConfigDisk:
+    def _default_storage_config(
+        self,
+    ) -> StorageConfigSQLite | StorageConfigDisk | StorageConfigPostgres:
         """Select default storage config based on REFLEXIO_STORAGE env var."""
         backend = os.environ.get("REFLEXIO_STORAGE", "sqlite").lower()
         if backend == "disk":
             return StorageConfigDisk(dir_path=self.base_dir)
+        if backend == "postgres":
+            db_url = postgres_db_url_from_env()
+            schema = os.environ.get("REFLEXIO_POSTGRES_SCHEMA", "").strip()
+            pool_size = postgres_pool_size_from_env()
+            if db_url:
+                return StorageConfigPostgres(
+                    db_url=db_url,
+                    schema=schema or None,
+                    pool_size=pool_size,
+                )
         return StorageConfigSQLite()
 
     def get_default_config(self) -> Config:
