@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reflexio-backend-config
+  namespace: reflexio
+data:
+  BACKEND_PORT: "8081"
+  LOCAL_STORAGE_PATH: /data/reflexio
+  REFLEXIO_LOG_DIR: /data/reflexio
+  REFLEXIO_STORAGE: sqlite
+  IS_TEST_ENV: "false"
+  DEBUG_LOG_TO_CONSOLE: "false"

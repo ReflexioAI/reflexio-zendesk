@@ -127,6 +127,11 @@ Once running, open **[http://localhost:8082](http://localhost:8082)** to interac
   <img src="docs/images/doc_website.png" width="800px" alt="Reflexio Doc Website">
 </p>
 
+### Docker and Kubernetes
+
+For backend-only container smoke tests and Kubernetes manifests, see
+[deploy/k8s/README.md](deploy/k8s/README.md).
+
 ### Try it in 30 seconds (CLI)
 
 Reflexio ships a first-class CLI — the fastest way to see the loop end-to-end with no code. Publish a real multi-turn conversation where the user **corrects** the agent (that's the signal Reflexio learns from), then search for what was extracted:

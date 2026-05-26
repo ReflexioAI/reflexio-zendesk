@@ -1,0 +1,42 @@
+services:
+  reflexio-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: reflexio-zendesk:local
+    ports:
+      - "8081:8081"
+    environment:
+      BACKEND_PORT: "8081"
+      LOCAL_STORAGE_PATH: /data/reflexio
+      REFLEXIO_LOG_DIR: /data/reflexio
+      REFLEXIO_STORAGE: sqlite
+      IS_TEST_ENV: "false"
+      DEBUG_LOG_TO_CONSOLE: "false"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      ZAI_API_KEY: ${ZAI_API_KEY:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+    volumes:
+      - reflexio-data:/data/reflexio
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  reflexio-data:
