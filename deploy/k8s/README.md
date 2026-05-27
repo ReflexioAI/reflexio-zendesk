@@ -164,6 +164,71 @@ If `REFLEXIO_POSTGRES_SEARCH_BACKEND=opensearch` is set but
 `REFLEXIO_OPENSEARCH_ENDPOINT` is missing, backend startup fails loudly. If
 `REFLEXIO_POSTGRES_SEARCH_BACKEND=postgres`, OpenSearch config is ignored.
 
+#### OpenSearch setup steps
+
+1. Create or choose an AWS OpenSearch domain that the backend pod can reach.
+   Use the domain HTTPS endpoint without a trailing slash, for example
+   `https://search-domain.us-west-2.es.amazonaws.com`.
+2. Grant the backend pod credentials access to the OpenSearch domain. Prefer
+   your cluster's AWS workload identity mechanism, such as IRSA on EKS. If you
+   are not using workload identity, provide standard AWS credentials through
+   your secret management flow instead.
+3. In `deploy/k8s/10-configmap.yaml`, keep Postgres as the source of truth and
+   select OpenSearch for query search:
+
+```yaml
+data:
+  REFLEXIO_STORAGE: postgres
+  REFLEXIO_POSTGRES_SEARCH_BACKEND: opensearch
+  REFLEXIO_OPENSEARCH_AUTH: aws_sigv4
+  REFLEXIO_OPENSEARCH_REGION: us-west-2
+  REFLEXIO_OPENSEARCH_SERVICE: es
+  REFLEXIO_OPENSEARCH_INDEX_PREFIX: reflexio
+  REFLEXIO_OPENSEARCH_SYNC_ON_STARTUP: "true"
+```
+
+4. If you use OpenSearch Serverless instead of a managed OpenSearch Service
+   domain, set:
+
+```yaml
+data:
+  REFLEXIO_OPENSEARCH_SERVICE: aoss
+```
+
+5. Put the OpenSearch endpoint in the Kubernetes secret together with
+   `POSTGRES_DB_URL` and provider keys:
+
+```bash
+kubectl -n reflexio create secret generic reflexio-backend-secrets \
+  --from-literal=POSTGRES_DB_URL='postgresql://reflexio:reflexio@postgres.example.com:5432/reflexio' \
+  --from-literal=REFLEXIO_OPENSEARCH_ENDPOINT='https://search-domain.us-west-2.es.amazonaws.com' \
+  --from-literal=OPENAI_API_KEY='sk-...' \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+6. Apply the manifests and wait for rollout:
+
+```bash
+kubectl apply -k deploy/k8s
+kubectl -n reflexio rollout status deploy/reflexio-backend
+```
+
+7. Confirm the pod has the expected non-secret OpenSearch settings:
+
+```bash
+kubectl -n reflexio exec deploy/reflexio-backend -- sh -lc \
+  'printenv REFLEXIO_POSTGRES_SEARCH_BACKEND REFLEXIO_OPENSEARCH_AUTH REFLEXIO_OPENSEARCH_REGION REFLEXIO_OPENSEARCH_SERVICE REFLEXIO_OPENSEARCH_INDEX_PREFIX REFLEXIO_OPENSEARCH_SYNC_ON_STARTUP; test -n "$REFLEXIO_OPENSEARCH_ENDPOINT" && echo REFLEXIO_OPENSEARCH_ENDPOINT=set'
+```
+
+8. Check the backend logs for OpenSearch startup or credential errors:
+
+```bash
+kubectl -n reflexio logs deploy/reflexio-backend --tail=200
+```
+
+The application creates and updates its own OpenSearch indexes. You do not
+need to pre-create indexes for a new deployment.
+
 ### 4. Configure secrets
 
 Create `reflexio-backend-secrets` with `POSTGRES_DB_URL` and provider keys.
@@ -321,7 +386,7 @@ The first backend startup against a fresh database may take longer because it
 creates extensions, creates Reflexio tables/functions, and records app
 migrations. Later restarts skip already-applied migrations.
 
-### 6. Update or remove
+### 8. Update or remove
 
 After changing manifests or a pushed image tag:
 
