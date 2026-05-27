@@ -218,3 +218,4 @@ docs/integrations/*
 
 # Planning artifacts
 plan.md
+.agents/
