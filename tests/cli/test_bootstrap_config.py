@@ -178,6 +178,27 @@ class TestSaveAndLoadStorage:
         assert isinstance(config.storage_config, StorageConfigPostgres)
         assert config.storage_config.db_url == "postgresql://explicit"
 
+    def test_round_trip_postgres_search_backend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from reflexio.models.config_schema import (
+            PostgresSearchBackend,
+            StorageConfigPostgres,
+        )
+        from reflexio.server.services.configurator.local_file_config_storage import (
+            LocalFileConfigStorage,
+        )
+
+        monkeypatch.setenv("POSTGRES_DB_URL", "postgresql://db")
+        monkeypatch.setenv("REFLEXIO_POSTGRES_SEARCH_BACKEND", "opensearch")
+
+        save_storage_to_config("postgres", org_id="test-org", base_dir=str(tmp_path))
+
+        storage_obj = LocalFileConfigStorage("test-org", base_dir=str(tmp_path))
+        config = storage_obj.load_config()
+        assert isinstance(config.storage_config, StorageConfigPostgres)
+        assert config.storage_config.search_backend == PostgresSearchBackend.OPENSEARCH
+
     def test_supabase_without_creds_preserves_existing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

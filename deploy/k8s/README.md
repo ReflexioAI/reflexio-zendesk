@@ -47,6 +47,27 @@ until docker exec reflexio-postgres pg_isready -U reflexio -d reflexio; do sleep
 Reflexio app migrations run from the backend on first Postgres storage
 creation. The setup SQL only prepares database prerequisites.
 
+For local OpenSearch-backed search verification without an AWS OpenSearch
+account, start the test-only OpenSearch profile and point the backend at the
+Compose service name:
+
+```bash
+docker compose --profile opensearch up -d opensearch
+export POSTGRES_DB_URL=postgresql://reflexio:reflexio@host.docker.internal:55433/reflexio
+OPENAI_API_KEY=dummy \
+  REFLEXIO_EMBEDDING_PROVIDER=inprocess \
+  CLAUDE_SMART_USE_LOCAL_EMBEDDING=1 \
+  REFLEXIO_POSTGRES_SEARCH_BACKEND=opensearch \
+  REFLEXIO_OPENSEARCH_ENDPOINT=http://opensearch:9200 \
+  REFLEXIO_OPENSEARCH_AUTH=none \
+  docker compose --profile opensearch up -d --no-build reflexio-backend
+curl -fsS http://localhost:19200/_cluster/health
+```
+
+`REFLEXIO_OPENSEARCH_AUTH=none` is only for this local Docker path. AWS
+deployments should leave the default `aws_sigv4` auth mode and provide
+credentials through IAM role or the standard AWS environment variables.
+
 ## Kubernetes deployment
 
 ### Prerequisites
@@ -89,7 +110,7 @@ docker push registry.example.com/reflexio-zendesk:latest
 # then set image: registry.example.com/reflexio-zendesk:latest
 ```
 
-### 2. Configure the namespace and secret
+### 2. Configure the namespace
 
 Create the namespace first:
 
@@ -97,11 +118,63 @@ Create the namespace first:
 kubectl apply -f deploy/k8s/00-namespace.yaml
 ```
 
+### 3. Choose the Postgres search backend
+
+`REFLEXIO_STORAGE=postgres` controls the primary data store. Query search for
+that Postgres store is controlled separately by
+`REFLEXIO_POSTGRES_SEARCH_BACKEND`:
+
+| Value | Search engine | Required setup |
+| --- | --- | --- |
+| `postgres` | Built-in Postgres RPC/pgvector search | Postgres with pgvector only |
+| `opensearch` | AWS OpenSearch sidecar search | Postgres plus OpenSearch endpoint/credentials |
+
+Use `postgres` when you want the simplest deployment or do not have OpenSearch
+yet. Profiles, interactions, user playbooks, and agent playbooks are searched
+through the Postgres functions created by the app migrations.
+
+```yaml
+data:
+  REFLEXIO_STORAGE: postgres
+  REFLEXIO_POSTGRES_SEARCH_BACKEND: postgres
+```
+
+Use `opensearch` when you want Postgres as the source of truth but OpenSearch
+to execute query search. Startup creates OpenSearch indexes and, when
+`REFLEXIO_OPENSEARCH_SYNC_ON_STARTUP=true`, syncs existing Postgres rows before
+serving search. Write/update/delete paths then keep OpenSearch in sync.
+
+```yaml
+data:
+  REFLEXIO_STORAGE: postgres
+  REFLEXIO_POSTGRES_SEARCH_BACKEND: opensearch
+  REFLEXIO_OPENSEARCH_AUTH: aws_sigv4
+  REFLEXIO_OPENSEARCH_REGION: us-west-2
+  REFLEXIO_OPENSEARCH_SERVICE: es
+  REFLEXIO_OPENSEARCH_INDEX_PREFIX: reflexio
+  REFLEXIO_OPENSEARCH_SYNC_ON_STARTUP: "true"
+```
+
+For AWS OpenSearch Service, keep `REFLEXIO_OPENSEARCH_AUTH=aws_sigv4` and
+grant the pod credentials permission to access the domain, either through your
+cluster's workload identity mechanism or standard AWS environment variables.
+Use `REFLEXIO_OPENSEARCH_SERVICE=aoss` only for OpenSearch Serverless.
+
+If `REFLEXIO_POSTGRES_SEARCH_BACKEND=opensearch` is set but
+`REFLEXIO_OPENSEARCH_ENDPOINT` is missing, backend startup fails loudly. If
+`REFLEXIO_POSTGRES_SEARCH_BACKEND=postgres`, OpenSearch config is ignored.
+
+### 4. Configure secrets
+
 Create `reflexio-backend-secrets` with `POSTGRES_DB_URL` and provider keys.
-The example secret is intentionally not included in `kustomization.yaml`, so
-`kubectl apply -k deploy/k8s` will not apply placeholder secrets.
+Add `REFLEXIO_OPENSEARCH_ENDPOINT` only when using
+`REFLEXIO_POSTGRES_SEARCH_BACKEND=opensearch`. The example secret is
+intentionally not included in `kustomization.yaml`, so `kubectl apply -k
+deploy/k8s` will not apply placeholder secrets.
 
 Use `kubectl create secret`:
+
+Postgres search:
 
 ```bash
 kubectl -n reflexio create secret generic reflexio-backend-secrets \
@@ -110,25 +183,64 @@ kubectl -n reflexio create secret generic reflexio-backend-secrets \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
+OpenSearch search:
+
+```bash
+kubectl -n reflexio create secret generic reflexio-backend-secrets \
+  --from-literal=POSTGRES_DB_URL='postgresql://reflexio:reflexio@postgres.example.com:5432/reflexio' \
+  --from-literal=REFLEXIO_OPENSEARCH_ENDPOINT='https://search-domain.us-west-2.es.amazonaws.com' \
+  --from-literal=OPENAI_API_KEY='sk-...' \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
 Or copy and edit the checked-in template:
 
 ```bash
 cp deploy/k8s/11-secret.example.yaml /tmp/reflexio-secret.yaml
-# Edit /tmp/reflexio-secret.yaml with the real POSTGRES_DB_URL and keys, then:
+# Edit /tmp/reflexio-secret.yaml with the real POSTGRES_DB_URL, provider keys,
+# and REFLEXIO_OPENSEARCH_ENDPOINT only if using OpenSearch search. Then:
 kubectl apply -f /tmp/reflexio-secret.yaml
 ```
 
 Do not commit a filled secret file.
 
-### 3. Review ConfigMap, storage, and ingress
+### 5. Review ConfigMap, storage, and ingress
 
 `deploy/k8s/10-configmap.yaml` sets the non-secret runtime config:
 
 - `REFLEXIO_STORAGE=postgres`
 - `REFLEXIO_POSTGRES_SCHEMA=public`
 - `REFLEXIO_POSTGRES_POOL_SIZE=5`
+- `REFLEXIO_POSTGRES_SEARCH_BACKEND=opensearch`
+- `REFLEXIO_OPENSEARCH_AUTH=aws_sigv4`
+- `REFLEXIO_OPENSEARCH_REGION=us-west-2`
+- `REFLEXIO_OPENSEARCH_SERVICE=es`
+- `REFLEXIO_OPENSEARCH_INDEX_PREFIX=reflexio`
 - `LOCAL_STORAGE_PATH=/data/reflexio`
 - `REFLEXIO_LOG_DIR=/data/reflexio`
+
+For Postgres search, set:
+
+```yaml
+  REFLEXIO_POSTGRES_SEARCH_BACKEND: postgres
+```
+
+The OpenSearch entries may remain in the ConfigMap, but they are ignored while
+the search backend is `postgres`.
+
+For OpenSearch search, set:
+
+```yaml
+  REFLEXIO_POSTGRES_SEARCH_BACKEND: opensearch
+  REFLEXIO_OPENSEARCH_AUTH: aws_sigv4
+  REFLEXIO_OPENSEARCH_REGION: us-west-2
+  REFLEXIO_OPENSEARCH_SERVICE: es
+  REFLEXIO_OPENSEARCH_INDEX_PREFIX: reflexio
+  REFLEXIO_OPENSEARCH_SYNC_ON_STARTUP: "true"
+```
+
+Also put the endpoint in `reflexio-backend-secrets` as
+`REFLEXIO_OPENSEARCH_ENDPOINT`.
 
 If you want in-process local embeddings for a development cluster, add these to
 the ConfigMap before applying:
@@ -146,7 +258,7 @@ cluster if needed.
 `ingressClassName`, and `tls.secretName`, or remove `50-ingress.yaml` from
 `deploy/k8s/kustomization.yaml` and use port-forwarding only.
 
-### 4. Apply and wait for rollout
+### 6. Apply and wait for rollout
 
 Render the manifests first to catch YAML/Kustomize mistakes:
 
@@ -169,7 +281,7 @@ kubectl -n reflexio describe pod -l app.kubernetes.io/name=reflexio-backend
 kubectl -n reflexio logs deploy/reflexio-backend --tail=200
 ```
 
-### 5. Smoke test
+### 7. Smoke test
 
 For a local check without ingress, port-forward the service:
 
@@ -194,7 +306,7 @@ Confirm the backend is using Postgres:
 
 ```bash
 kubectl -n reflexio exec deploy/reflexio-backend -- sh -lc \
-  'printenv REFLEXIO_STORAGE REFLEXIO_POSTGRES_SCHEMA REFLEXIO_POSTGRES_POOL_SIZE; test -n "$POSTGRES_DB_URL" && echo POSTGRES_DB_URL=set'
+  'printenv REFLEXIO_STORAGE REFLEXIO_POSTGRES_SCHEMA REFLEXIO_POSTGRES_POOL_SIZE REFLEXIO_POSTGRES_SEARCH_BACKEND; test -n "$POSTGRES_DB_URL" && echo POSTGRES_DB_URL=set'
 ```
 
 Then inspect your Postgres database from a machine that can reach it:

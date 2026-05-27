@@ -20,6 +20,9 @@ from reflexio.models.api_schema.service_schemas import (
 from reflexio.server.llm.providers.embedding_service_provider import (
     EmbeddingUnavailableError,
 )
+from reflexio.server.services.storage.postgres_storage._opensearch import (
+    status_filter_terms,
+)
 from reflexio.server.services.storage.postgres_storage._profile_converters import (
     interaction_to_data,
     response_list_to_interactions,
@@ -55,6 +58,7 @@ class ProfileMixin(SchemaScopedClient):
     search_mode: Any
     vector_weight: float
     fts_weight: float
+    _opensearch: Any
 
     def _record_profile_event(
         self,
@@ -167,7 +171,11 @@ class ProfileMixin(SchemaScopedClient):
                     profile.expanded_terms = exp_future.result(timeout=15)
             else:
                 profile.embedding = self._get_embedding(embedding_text)
-            self._table("profiles").upsert(user_profile_to_data(profile)).execute()
+            response = (
+                self._table("profiles").upsert(user_profile_to_data(profile)).execute()
+            )
+            if self._opensearch:
+                self._opensearch.index_rows("profiles", _rows(response))
             self._record_profile_event(
                 event_name="profile_created",
                 outcome="created",
@@ -200,9 +208,14 @@ class ProfileMixin(SchemaScopedClient):
             "\n".join([new_profile.content, str(new_profile.custom_features)])
         )
         new_profile.embedding = embedding
-        self._table("profiles").update(user_profile_to_data(new_profile)).eq(
-            "profile_id", profile_id
-        ).execute()
+        response = (
+            self._table("profiles")
+            .update(user_profile_to_data(new_profile))
+            .eq("profile_id", profile_id)
+            .execute()
+        )
+        if self._opensearch:
+            self._opensearch.index_rows("profiles", _rows(response))
         self._record_profile_event(
             event_name="profile_updated",
             outcome="updated",
@@ -223,6 +236,10 @@ class ProfileMixin(SchemaScopedClient):
         )
         if not response.data:
             return
+        if self._opensearch:
+            self._opensearch.delete_ids(
+                "profiles", [row.get("profile_id") for row in _rows(response)]
+            )
         self._record_profile_event(
             event_name="profile_deleted",
             outcome="deleted",
@@ -233,11 +250,17 @@ class ProfileMixin(SchemaScopedClient):
     @handle_exceptions
     def delete_all_profiles_for_user(self, user_id: str) -> None:
         self._table("profiles").delete().eq("user_id", user_id).execute()
+        if self._opensearch:
+            self._opensearch.delete_by_filter(
+                "profiles", [{"term": {"user_id": user_id}}]
+            )
 
     @handle_exceptions
     def delete_all_profiles(self) -> None:
         """Delete all profiles across all users."""
         self._delete_all_text_keyed("profiles", "profile_id")
+        if self._opensearch:
+            self._opensearch.delete_by_filter("profiles", [])
 
     @handle_exceptions
     def delete_profiles_by_ids(self, profile_ids: list[str]) -> int:
@@ -247,6 +270,10 @@ class ProfileMixin(SchemaScopedClient):
         response = (
             self._table("profiles").delete().in_("profile_id", profile_ids).execute()
         )
+        if self._opensearch:
+            self._opensearch.delete_ids(
+                "profiles", [row.get("profile_id") for row in _rows(response)]
+            )
         return len(_rows(response))
 
     @handle_exceptions
@@ -302,6 +329,8 @@ class ProfileMixin(SchemaScopedClient):
             .is_("status", "null")
             .execute()
         )
+        if self._opensearch:
+            self._opensearch.index_rows("profiles", _rows(response))
         return len(_rows(response)) > 0
 
     @handle_exceptions
@@ -346,6 +375,8 @@ class ProfileMixin(SchemaScopedClient):
 
         # Execute the update
         response = query.execute()
+        if self._opensearch:
+            self._opensearch.index_rows("profiles", _rows(response))
 
         # Count the number of rows updated
         updated_count = len(response.data) if response.data else 0
@@ -373,6 +404,10 @@ class ProfileMixin(SchemaScopedClient):
 
         # Execute the delete
         response = query.execute()
+        if self._opensearch:
+            self._opensearch.delete_ids(
+                "profiles", [row.get("profile_id") for row in _rows(response)]
+            )
 
         # Count the number of rows deleted
         deleted_count = len(response.data) if response.data else 0
@@ -438,7 +473,13 @@ class ProfileMixin(SchemaScopedClient):
             f"{interaction.content}\n{interaction.user_action_description}"
         )
         interaction.embedding = embedding
-        self._table("interactions").upsert(interaction_to_data(interaction)).execute()
+        response = (
+            self._table("interactions")
+            .upsert(interaction_to_data(interaction))
+            .execute()
+        )
+        if self._opensearch:
+            self._opensearch.index_rows("interactions", _rows(response))
 
     @handle_exceptions
     def add_user_interactions_bulk(
@@ -487,22 +528,38 @@ class ProfileMixin(SchemaScopedClient):
 
         # Bulk upsert all interactions
         data_list = [interaction_to_data(interaction) for interaction in interactions]
-        self._table("interactions").upsert(data_list).execute()
+        response = self._table("interactions").upsert(data_list).execute()
+        if self._opensearch:
+            self._opensearch.index_rows("interactions", _rows(response))
 
     @handle_exceptions
     def delete_user_interaction(self, request: DeleteUserInteractionRequest) -> None:
-        self._table("interactions").delete().eq("user_id", request.user_id).eq(
-            "interaction_id", request.interaction_id
-        ).execute()
+        response = (
+            self._table("interactions")
+            .delete()
+            .eq("user_id", request.user_id)
+            .eq("interaction_id", request.interaction_id)
+            .execute()
+        )
+        if self._opensearch:
+            self._opensearch.delete_ids(
+                "interactions", [row.get("interaction_id") for row in _rows(response)]
+            )
 
     @handle_exceptions
     def delete_all_interactions_for_user(self, user_id: str) -> None:
         self._table("interactions").delete().eq("user_id", user_id).execute()
+        if self._opensearch:
+            self._opensearch.delete_by_filter(
+                "interactions", [{"term": {"user_id": user_id}}]
+            )
 
     @handle_exceptions
     def delete_all_interactions(self) -> None:
         """Delete all interactions across all users."""
         self._table("interactions").delete().gte("interaction_id", 0).execute()
+        if self._opensearch:
+            self._opensearch.delete_by_filter("interactions", [])
 
     @handle_exceptions
     def count_all_interactions(self) -> int:
@@ -582,6 +639,51 @@ class ProfileMixin(SchemaScopedClient):
 
         effective_mode = search_interaction_request.search_mode or self.search_mode
         query_text = search_interaction_request.query
+        if self._opensearch:
+            filters: list[dict[str, Any]] = [
+                {"term": {"user_id": search_interaction_request.user_id}}
+            ]
+            if search_interaction_request.request_id:
+                filters.append(
+                    {"term": {"request_id": search_interaction_request.request_id}}
+                )
+            if search_interaction_request.start_time:
+                filters.append(
+                    {
+                        "range": {
+                            "created_at": {
+                                "gte": int(
+                                    search_interaction_request.start_time.timestamp()
+                                )
+                            }
+                        }
+                    }
+                )
+            if search_interaction_request.end_time:
+                filters.append(
+                    {
+                        "range": {
+                            "created_at": {
+                                "lte": int(
+                                    search_interaction_request.end_time.timestamp()
+                                )
+                            }
+                        }
+                    }
+                )
+            ids = self._opensearch.search_ids(
+                entity="interactions",
+                query_text=query_text,
+                query_embedding=query_embedding or self._get_embedding(query_text),
+                search_mode=effective_mode,
+                top_k=search_interaction_request.most_recent_k
+                or search_interaction_request.top_k
+                or 10,
+                threshold=0.1,
+                filters=filters,
+            )
+            interactions = cast(Any, self).get_interactions_by_ids(ids)
+            return _order_by_ids(interactions, ids, "interaction_id")
         response = self._rpc(
             "hybrid_match_interactions",
             {
@@ -627,6 +729,47 @@ class ProfileMixin(SchemaScopedClient):
 
         effective_mode = search_user_profile_request.search_mode or self.search_mode
         query_text = search_user_profile_request.query
+        if self._opensearch:
+            filters = [
+                {"term": {"user_id": search_user_profile_request.user_id}},
+                {"range": {"expiration_timestamp": {"gte": current_timestamp}}},
+            ]
+            terms = status_filter_terms(status_filter)
+            if terms is not None:
+                filters.append({"terms": {"status": terms}})
+            if search_user_profile_request.source:
+                filters.append({"term": {"source": search_user_profile_request.source}})
+            if search_user_profile_request.extractor_name:
+                filters.append(
+                    {
+                        "term": {
+                            "extractor_names": search_user_profile_request.extractor_name
+                        }
+                    }
+                )
+            ids = self._opensearch.search_ids(
+                entity="profiles",
+                query_text=query_text,
+                query_embedding=query_embedding or self._get_embedding(query_text),
+                search_mode=effective_mode,
+                top_k=search_user_profile_request.top_k or 10,
+                threshold=search_user_profile_request.threshold or 0.7,
+                filters=filters,
+            )
+            profiles = self.get_profiles_by_ids(
+                search_user_profile_request.user_id,
+                [str(profile_id) for profile_id in ids],
+                status_filter=list(status_filter),
+            )
+            ordered_profiles = _order_by_ids(profiles, ids, "profile_id")
+            if search_user_profile_request.custom_feature:
+                custom_feature = search_user_profile_request.custom_feature.lower()
+                ordered_profiles = [
+                    profile
+                    for profile in ordered_profiles
+                    if custom_feature in str(profile.custom_features).lower()
+                ]
+            return ordered_profiles
         response = self._rpc(
             "hybrid_match_profiles",
             {
@@ -687,3 +830,8 @@ class ProfileMixin(SchemaScopedClient):
             filtered_profiles.append(profile)
 
         return filtered_profiles
+
+
+def _order_by_ids(items: list[Any], ids: Sequence[Any], id_attr: str) -> list[Any]:
+    by_id = {str(getattr(item, id_attr)): item for item in items}
+    return [by_id[str(item_id)] for item_id in ids if str(item_id) in by_id]

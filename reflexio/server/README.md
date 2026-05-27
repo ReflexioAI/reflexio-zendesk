@@ -439,7 +439,8 @@ Pre-computed embeddings passed to storage methods via `query_embedding` paramete
 | `storage_base/` | BaseStorage abstract class and shared interfaces |
 | `disk_storage/` | Local file-based storage for testing and simple file persistence |
 | `sqlite_storage/` | SQLite-based storage for local/self-hosted deployments |
-| `postgres_storage/` | Native Postgres + pgvector storage for Docker/local networked deployments |
+| `postgres_storage/` | Native Postgres storage for Docker/local networked deployments; supports pgvector search or OpenSearch sidecar search |
+| `postgres_storage/_opensearch.py` | OpenSearch sidecar indexing/search adapter for Postgres storage (`REFLEXIO_POSTGRES_SEARCH_BACKEND=opensearch`) |
 
 **Pattern**: **NEVER import storage implementations directly** - Always use `request_context.storage`
 
@@ -454,7 +455,7 @@ Pre-computed embeddings passed to storage methods via `query_embedding` paramete
   - `restore_archived_feedbacks_by_ids(feedback_ids)` - Restore archived agent playbooks by ID
   - `delete_feedbacks_by_ids(feedback_ids)` - Delete agent playbooks by ID
   - `delete_raw_feedbacks_by_ids(raw_feedback_ids)` - Delete user playbooks by ID
-- Vector search via LiteLLMClient embeddings
+- Vector/text search via LiteLLMClient embeddings; Postgres storage chooses pgvector RPC search or OpenSearch search with `REFLEXIO_POSTGRES_SEARCH_BACKEND=postgres|opensearch`
 - Operation state: `get_operation_state()`, `upsert_operation_state()`, `get_operation_state_with_new_request_interaction()`, `try_acquire_in_progress_lock()`
 - All operation state interactions are managed through `OperationStateManager` (in `operation_state_utils.py`)
 - Profile status: `Status` enum (CURRENT=None, PENDING, ARCHIVED)
@@ -466,7 +467,7 @@ Pre-computed embeddings passed to storage methods via `query_embedding` paramete
 Key files:
 - `configurator.py`: DefaultConfigurator - loads YAML config, creates storage
 - `local_file_config_storage.py`: Local file-based config storage
-- `postgres_env.py`: Shared Postgres environment lookup (`POSTGRES_DB_URL` with `REFLEXIO_POSTGRES_DB_URL` compatibility)
+- `postgres_env.py`: Shared Postgres environment lookup (`POSTGRES_DB_URL` with `REFLEXIO_POSTGRES_DB_URL` compatibility) and `REFLEXIO_POSTGRES_SEARCH_BACKEND`
 **Config Storage Priority** (in `DefaultConfigurator`):
 1. **Local** - If `base_dir` is explicitly provided (testing)
 2. **Local File** - Default fallback

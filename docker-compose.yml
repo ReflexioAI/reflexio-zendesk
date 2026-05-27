@@ -29,6 +29,13 @@ services:
       POSTGRES_DB_URL: ${POSTGRES_DB_URL:?Set POSTGRES_DB_URL to your Postgres connection URL}
       REFLEXIO_POSTGRES_SCHEMA: ${REFLEXIO_POSTGRES_SCHEMA:-public}
       REFLEXIO_POSTGRES_POOL_SIZE: ${REFLEXIO_POSTGRES_POOL_SIZE:-5}
+      REFLEXIO_POSTGRES_SEARCH_BACKEND: ${REFLEXIO_POSTGRES_SEARCH_BACKEND:-postgres}
+      REFLEXIO_OPENSEARCH_ENDPOINT: ${REFLEXIO_OPENSEARCH_ENDPOINT:-}
+      REFLEXIO_OPENSEARCH_AUTH: ${REFLEXIO_OPENSEARCH_AUTH:-aws_sigv4}
+      REFLEXIO_OPENSEARCH_REGION: ${REFLEXIO_OPENSEARCH_REGION:-}
+      REFLEXIO_OPENSEARCH_SERVICE: ${REFLEXIO_OPENSEARCH_SERVICE:-es}
+      REFLEXIO_OPENSEARCH_INDEX_PREFIX: ${REFLEXIO_OPENSEARCH_INDEX_PREFIX:-reflexio}
+      REFLEXIO_OPENSEARCH_SYNC_ON_STARTUP: ${REFLEXIO_OPENSEARCH_SYNC_ON_STARTUP:-true}
       REFLEXIO_EMBEDDING_PROVIDER: ${REFLEXIO_EMBEDDING_PROVIDER:-}
       CLAUDE_SMART_USE_LOCAL_EMBEDDING: ${CLAUDE_SMART_USE_LOCAL_EMBEDDING:-}
       IS_TEST_ENV: "false"
@@ -56,6 +63,28 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 30s
+
+  opensearch:
+    image: opensearchproject/opensearch:latest
+    profiles:
+      - opensearch
+    ports:
+      - "19200:9200"
+      - "19600:9600"
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
       start_period: 30s
 
 volumes:

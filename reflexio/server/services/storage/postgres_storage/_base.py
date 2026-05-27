@@ -24,6 +24,7 @@ from reflexio.models.config_schema import (
     EMBEDDING_DIMENSIONS,
     APIKeyConfig,
     LLMConfig,
+    PostgresSearchBackend,
     SearchMode,
     StorageConfigPostgres,
 )
@@ -39,6 +40,10 @@ from reflexio.server.services.storage.postgres_storage._migration_utils import (
 from reflexio.server.services.storage.postgres_storage._migration_utils import (
     execute_migration,
     execute_postgres_prerequisites,
+)
+from reflexio.server.services.storage.postgres_storage._opensearch import (
+    PostgresOpenSearch,
+    opensearch_config_from_env,
 )
 from reflexio.server.services.storage.postgres_storage._timestamp_utils import (
     _parse_iso_timestamp,
@@ -226,8 +231,10 @@ class PostgresStorageBase(RetentionMixin, BaseStorage):
         self.db_url = config.db_url
         self.schema_name = config.schema_name or "public"
         self.pool_size = max(1, config.pool_size)
+        self.search_backend = config.search_backend
         self._interaction_columns = _INTERACTION_COLUMNS
         self._table_columns_cache: dict[str, set[str]] = {}
+        self._opensearch: PostgresOpenSearch | None = None
 
         if not self.db_url:
             raise StorageError(f"Postgres Storage for org {org_id} missing db_url")
@@ -271,6 +278,7 @@ class PostgresStorageBase(RetentionMixin, BaseStorage):
         )
         self.llm_client = LiteLLMClient(litellm_config)
         self._ensure_migrated()
+        self._ensure_opensearch()
 
     def close(self) -> None:
         self.pool.closeall()
@@ -284,6 +292,22 @@ class PostgresStorageBase(RetentionMixin, BaseStorage):
                 return
             self.migrate()
             _MIGRATED_TARGETS.add(target)
+
+    def _ensure_opensearch(self) -> None:
+        if self.search_backend != PostgresSearchBackend.OPENSEARCH:
+            return
+        config = opensearch_config_from_env()
+        if config is None:
+            raise StorageError(
+                message=(
+                    "REFLEXIO_OPENSEARCH_ENDPOINT is required when Postgres "
+                    "search_backend is 'opensearch'"
+                )
+            )
+        self._opensearch = PostgresOpenSearch(self, config)
+        self._opensearch.ensure_indexes()
+        if config.sync_on_startup:
+            self._opensearch.sync_all()
 
     def _current_timestamp(self) -> str:
         return datetime.now(UTC).isoformat()

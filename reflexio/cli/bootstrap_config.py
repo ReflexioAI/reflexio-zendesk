@@ -157,16 +157,19 @@ def save_storage_to_config(
             from reflexio.server.services.configurator.postgres_env import (
                 postgres_db_url_from_env,
                 postgres_pool_size_from_env,
+                postgres_search_backend_from_env,
             )
 
             db_url = postgres_db_url_from_env()
             schema = os.environ.get("REFLEXIO_POSTGRES_SCHEMA", "").strip()
             pool_size = postgres_pool_size_from_env()
+            search_backend = postgres_search_backend_from_env()
             if db_url:
                 config.storage_config = StorageConfigPostgres(
                     db_url=db_url,
                     schema=schema or None,
                     pool_size=pool_size,
+                    search_backend=search_backend,
                 )
             else:
                 logger.warning(

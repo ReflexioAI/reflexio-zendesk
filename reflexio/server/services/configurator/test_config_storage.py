@@ -8,6 +8,8 @@ import tempfile
 
 from reflexio.models.config_schema import (
     Config,
+    PostgresSearchBackend,
+    StorageConfigPostgres,
     StorageConfigSQLite,
 )
 from reflexio.server.services.configurator.local_file_config_storage import (
@@ -94,7 +96,7 @@ def test_load_config():
         storage_config=StorageConfigSQLite(
             db_path="/tmp/test.db",
         ),
-        profile_extractor_configs=[],
+        profile_extractor_config=None,
     )
 
     json_config = new_config.model_dump_json()
@@ -104,6 +106,20 @@ def test_load_config():
     assert config.storage_config.db_path == "/tmp/test.db"
 
     print("  Load config tests passed!")
+
+
+def test_postgres_default_config_reads_search_backend(monkeypatch):
+    """Test that Postgres default config includes the search backend flag."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        monkeypatch.setenv("REFLEXIO_STORAGE", "postgres")
+        monkeypatch.setenv("POSTGRES_DB_URL", "postgresql://db")
+        monkeypatch.setenv("REFLEXIO_POSTGRES_SEARCH_BACKEND", "opensearch")
+
+        storage = LocalFileConfigStorage(org_id="test_org_pg", base_dir=temp_dir)
+        config = storage.get_default_config()
+
+        assert isinstance(config.storage_config, StorageConfigPostgres)
+        assert config.storage_config.search_backend == PostgresSearchBackend.OPENSEARCH
 
 
 if __name__ == "__main__":

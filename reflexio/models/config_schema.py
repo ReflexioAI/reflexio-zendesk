@@ -136,6 +136,13 @@ class SearchMode(StrEnum):
     HYBRID = "hybrid"
 
 
+class PostgresSearchBackend(StrEnum):
+    """Search engine used by native Postgres storage query paths."""
+
+    POSTGRES = "postgres"
+    OPENSEARCH = "opensearch"
+
+
 @dataclass
 class SearchOptions:
     """Engine-level search parameters that are pre-computed or not part of the API request."""
@@ -176,6 +183,7 @@ class StorageConfigPostgres(BaseModel):
     db_url: NonEmptyStr
     schema_name: str | None = Field(default=None, alias="schema")
     pool_size: int = Field(default=5, ge=1)
+    search_backend: PostgresSearchBackend = PostgresSearchBackend.POSTGRES
 
 
 class StorageConfigManagedSupabase(BaseModel):
