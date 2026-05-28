@@ -1,9 +1,13 @@
 """Request CRUD methods for SQLite storage."""
 
+import json
 import sqlite3
 from typing import Any
 
-from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
+from reflexio.models.api_schema.internal_schema import (
+    RequestInteractionDataModel,
+    SessionDescriptor,
+)
 from reflexio.models.api_schema.service_schemas import (
     Request,
 )
@@ -35,8 +39,8 @@ class RequestMixin:
         created_at_iso = _epoch_to_iso(request.created_at)
         self._execute(
             """INSERT OR REPLACE INTO requests
-               (request_id, user_id, created_at, source, agent_version, session_id)
-               VALUES (?,?,?,?,?,?)""",
+               (request_id, user_id, created_at, source, agent_version, session_id, metadata)
+               VALUES (?,?,?,?,?,?,?)""",
             (
                 request.request_id,
                 request.user_id,
@@ -44,6 +48,7 @@ class RequestMixin:
                 request.source,
                 request.agent_version,
                 request.session_id,
+                json.dumps(request.metadata, sort_keys=True),
             ),
         )
 
@@ -232,3 +237,27 @@ class RequestMixin:
             (user_id, session_id),
         )
         return [_row_to_request(r) for r in rows]
+
+    @SQLiteStorageBase.handle_exceptions
+    def get_session_ids_in_window(
+        self, from_ts: int, to_ts: int
+    ) -> list[SessionDescriptor]:
+        from_iso = _epoch_to_iso(from_ts)
+        to_iso = _epoch_to_iso(to_ts)
+        rows = self._fetchall(
+            """SELECT DISTINCT user_id, session_id, agent_version, source
+               FROM requests
+               WHERE session_id IS NOT NULL
+                 AND created_at BETWEEN ? AND ?
+               ORDER BY session_id, user_id, agent_version""",
+            (from_iso, to_iso),
+        )
+        return [
+            SessionDescriptor(
+                user_id=r["user_id"],
+                session_id=r["session_id"],
+                agent_version=r["agent_version"],
+                source=r["source"],
+            )
+            for r in rows
+        ]

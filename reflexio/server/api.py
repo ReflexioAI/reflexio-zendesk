@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -19,6 +20,22 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from reflexio.models.api_schema.braintrust_schema import (
+    BraintrustStatusResponse,
+    ConnectBraintrustRequest,
+    ConnectBraintrustResponse,
+    SelectProjectsRequest,
+    SelectProjectsResponse,
+    SyncBraintrustResponse,
+)
+from reflexio.models.api_schema.eval_overview_schema import (
+    GetEvaluationOverviewRequest,
+    GetEvaluationOverviewResponse,
+    RegenerateFailure,
+    RegenerateRequest,
+    RegenerateStartResponse,
+    RegenerateStatusResponse,
+)
 from reflexio.models.api_schema.retriever_schema import (
     GetAgentPlaybooksRequest,
     GetAgentPlaybooksViewResponse,
@@ -141,6 +158,10 @@ from reflexio.server.cache.reflexio_cache import (
     invalidate_reflexio_cache,
 )
 from reflexio.server.correlation import correlation_id_var, generate_correlation_id
+from reflexio.server.services.agent_success_evaluation.regen_jobs import (
+    REGEN_JOBS,
+    run_regen,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1543,6 +1564,274 @@ def get_playbook_application_stats(
     """
     reflexio = get_reflexio(org_id=org_id)
     return reflexio.get_playbook_application_stats(request)
+
+
+# ============================================================================
+# Braintrust connector (Plan C-backend)
+# ============================================================================
+
+
+@core_router.post(
+    "/api/braintrust/connect",
+    response_model=ConnectBraintrustResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("10/minute")
+def braintrust_connect(
+    request: Request,
+    payload: ConnectBraintrustRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> ConnectBraintrustResponse:
+    """Step 1: validate the Braintrust API key and list workspaces/projects.
+
+    Persists nothing — call `/api/braintrust/select_projects` to commit.
+
+    Args:
+        request (Request): The HTTP request object for rate limiting.
+        payload (ConnectBraintrustRequest): Customer's Braintrust API key.
+        org_id (str): Resolved by auth dependency.
+
+    Returns:
+        ConnectBraintrustResponse: Workspaces tree on success; `success=False`
+            with a message when the key is rejected.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.braintrust_connect(payload)
+
+
+@core_router.post(
+    "/api/braintrust/select_projects",
+    response_model=SelectProjectsResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("10/minute")
+def braintrust_select_projects(
+    request: Request,
+    payload: SelectProjectsRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> SelectProjectsResponse:
+    """Step 2: commit the Braintrust connection with selected projects.
+
+    The API key is encrypted at rest. Subsequent syncs use the persisted
+    connection until the customer calls DELETE /api/braintrust/connection.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.braintrust_select_projects(payload)
+
+
+@core_router.get(
+    "/api/braintrust/status",
+    response_model=BraintrustStatusResponse,
+    response_model_exclude_none=True,
+)
+def braintrust_status(
+    org_id: str = Depends(default_get_org_id),
+) -> BraintrustStatusResponse:
+    """Return Braintrust connection state. Never echoes the API key."""
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.braintrust_status()
+
+
+@core_router.delete("/api/braintrust/connection")
+@limiter.limit("10/minute")
+def braintrust_disconnect(
+    request: Request,
+    org_id: str = Depends(default_get_org_id),
+) -> dict:
+    """Delete the persisted Braintrust connection for the org.
+
+    Args:
+        org_id (str): Resolved by auth dependency.
+
+    Returns:
+        dict: ``{"success": True}`` on completion.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    reflexio.braintrust_disconnect()
+    return {"success": True}
+
+
+@core_router.post(
+    "/api/braintrust/sync",
+    response_model=SyncBraintrustResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("10/minute")
+def braintrust_sync(
+    request: Request,
+    org_id: str = Depends(default_get_org_id),
+) -> SyncBraintrustResponse:
+    """Trigger a one-shot sync of Braintrust scorer outputs.
+
+    Scheduled (cron) sync is a follow-up; for now the endpoint exists so
+    operators can drive a manual import.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.braintrust_sync()
+
+
+@core_router.post(
+    "/api/get_evaluation_overview",
+    response_model=GetEvaluationOverviewResponse,
+    response_model_exclude_none=True,
+)
+def get_evaluation_overview(
+    request: GetEvaluationOverviewRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> GetEvaluationOverviewResponse:
+    """Return the redesigned /evaluations page payload.
+
+    Aggregates hero state, four context tiles with deltas, top rule
+    attribution, and a corrections-per-session distribution into a single
+    response shaped exactly as the frontend renders it.
+
+    Args:
+        request (GetEvaluationOverviewRequest): Window + bucket granularity.
+        org_id (str): Organization ID resolved by the auth dependency.
+
+    Returns:
+        GetEvaluationOverviewResponse: Full overview payload.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.get_evaluation_overview(request)
+
+
+# ---------------------------------------------------------------------------
+# /api/evaluations/regenerate — replay the LLM judge over a window
+# ---------------------------------------------------------------------------
+
+
+@core_router.post(
+    "/api/evaluations/regenerate",
+    response_model=RegenerateStartResponse,
+    response_model_exclude_none=True,
+)
+def start_regenerate(
+    payload: RegenerateRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> RegenerateStartResponse:
+    """Start a regenerate job for one evaluator over a time window.
+
+    Args:
+        payload (RegenerateRequest): Evaluator name + window bounds.
+        org_id (str): Organization ID resolved by the auth dependency.
+
+    Returns:
+        RegenerateStartResponse: ``job_id`` to poll/cancel and ``total``
+            tuples queued.
+
+    Raises:
+        HTTPException: 400 when ``evaluation_name`` is not configured for
+            the org. 409 when a regenerate for the same (org, evaluator)
+            is already running. 503 when storage is not configured.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    config = reflexio.request_context.configurator.get_config()
+    known = (
+        {c.evaluation_name for c in (config.agent_success_configs or [])}
+        if config is not None
+        else set()
+    )
+    if payload.evaluation_name not in known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown evaluation_name '{payload.evaluation_name}'",
+        )
+
+    storage = reflexio.request_context.storage
+    if storage is None:
+        raise HTTPException(status_code=503, detail="Storage not configured")
+    descriptors = storage.get_session_ids_in_window(
+        from_ts=payload.from_ts, to_ts=payload.to_ts
+    )
+    try:
+        job = REGEN_JOBS.create(
+            org_id=org_id,
+            evaluation_name=payload.evaluation_name,
+            from_ts=payload.from_ts,
+            to_ts=payload.to_ts,
+            total=len(descriptors),
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    threading.Thread(
+        target=run_regen,
+        kwargs={
+            "job": job,
+            "request_context": reflexio.request_context,
+            "llm_client": reflexio.llm_client,
+        },
+        daemon=True,
+    ).start()
+    return RegenerateStartResponse(job_id=job.job_id, total=job.total)
+
+
+@core_router.get(
+    "/api/evaluations/regenerate/{job_id}",
+    response_model=RegenerateStatusResponse,
+    response_model_exclude_none=True,
+)
+def get_regenerate_status(
+    job_id: str,
+    org_id: str = Depends(default_get_org_id),
+) -> RegenerateStatusResponse:
+    """Poll the status of a regenerate job.
+
+    Args:
+        job_id (str): Opaque handle returned by POST /api/evaluations/regenerate.
+        org_id (str): Organization ID resolved by the auth dependency.
+
+    Returns:
+        RegenerateStatusResponse: Counters, status, and failure list.
+
+    Raises:
+        HTTPException: 404 when ``job_id`` is unknown or belongs to a
+            different org.
+    """
+    job = REGEN_JOBS.get(job_id)
+    if job is None or job.org_id != org_id:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    return RegenerateStatusResponse(
+        job_id=job.job_id,
+        status=job.status,
+        total=job.total,
+        completed=job.completed,
+        failed=job.failed,
+        failures=[
+            RegenerateFailure(session_id=f.session_id, reason=f.reason)
+            for f in job.failures
+        ],
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+    )
+
+
+@core_router.delete("/api/evaluations/regenerate/{job_id}")
+def cancel_regenerate(
+    job_id: str,
+    org_id: str = Depends(default_get_org_id),
+) -> dict[str, str]:
+    """Request cancellation of a running regenerate job.
+
+    Sets the worker's cancel event; the worker checks the flag between
+    sessions and transitions to ``"cancelled"`` on its next iteration.
+
+    Args:
+        job_id (str): Opaque handle returned by POST /api/evaluations/regenerate.
+        org_id (str): Organization ID resolved by the auth dependency.
+
+    Returns:
+        dict[str, str]: ``{"status": "cancelled"}`` on successful flag set.
+
+    Raises:
+        HTTPException: 404 when ``job_id`` is unknown or belongs to a
+            different org.
+    """
+    job = REGEN_JOBS.get(job_id)
+    if job is None or job.org_id != org_id:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    REGEN_JOBS.cancel(job_id)
+    return {"status": "cancelled"}
 
 
 @core_router.post(

@@ -1,6 +1,9 @@
 import logging
 
-from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
+from reflexio.models.api_schema.internal_schema import (
+    RequestInteractionDataModel,
+    SessionDescriptor,
+)
 from reflexio.models.api_schema.service_schemas import (
     Interaction,
     Request,
@@ -214,3 +217,27 @@ class RequestMixin:
             user_ids.add(req.user_id)
 
         return sorted(user_ids)
+
+    def get_session_ids_in_window(
+        self, from_ts: int, to_ts: int
+    ) -> list[SessionDescriptor]:
+        with self._lock:
+            all_requests = self._list_entities(self._requests_dir(), Request)
+
+        seen: dict[tuple[str, str, str, str], SessionDescriptor] = {}
+        for req in all_requests:
+            if req.session_id is None:
+                continue
+            if not (from_ts <= req.created_at <= to_ts):
+                continue
+            key = (req.user_id, req.session_id, req.agent_version, req.source)
+            if key not in seen:
+                seen[key] = SessionDescriptor(
+                    user_id=req.user_id,
+                    session_id=req.session_id,
+                    agent_version=req.agent_version,
+                    source=req.source,
+                )
+        return sorted(
+            seen.values(), key=lambda d: (d.session_id, d.user_id, d.agent_version)
+        )

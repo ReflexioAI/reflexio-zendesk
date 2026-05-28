@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -21,11 +21,11 @@ from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
 @pytest.fixture()
 def storage():
     """A real SQLiteStorage instance in a temporary directory."""
-    with tempfile.TemporaryDirectory() as tmp:
-        with patch.object(SQLiteStorage, "_get_embedding", return_value=[0.0] * 512):
-            yield SQLiteStorage(
-                org_id="test-stall-client", db_path=f"{tmp}/reflexio.db"
-            )
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        patch.object(SQLiteStorage, "_get_embedding", return_value=[0.0] * 512),
+    ):
+        yield SQLiteStorage(org_id="test-stall-client", db_path=f"{tmp}/reflexio.db")
 
 
 @pytest.fixture()
@@ -81,7 +81,7 @@ def test_get_stall_state_when_clean(client_with_server, storage):
 def test_get_stall_state_when_stalled(client_with_server, storage):
     storage.upsert_stall_state(
         reason="billing_error",
-        stalled_at=datetime.now(timezone.utc),
+        stalled_at=datetime.now(UTC),
         reset_estimate=None,
         error_message="x",
     )
@@ -93,7 +93,7 @@ def test_get_stall_state_when_stalled(client_with_server, storage):
 def test_mark_stall_notified_flips_flag(client_with_server, storage):
     storage.upsert_stall_state(
         reason="auth_error",
-        stalled_at=datetime.now(timezone.utc),
+        stalled_at=datetime.now(UTC),
         reset_estimate=None,
         error_message="x",
     )
