@@ -188,8 +188,8 @@ class RegenerateRequest(BaseModel):
 
     Args:
         evaluation_name (NonEmptyStr): Name of the evaluator to replay.
-            Must match one of the ``agent_success_configs[*].evaluation_name``
-            entries in the caller's config.
+            Must match the ``agent_success_config.evaluation_name`` entry in
+            the caller's config.
         from_ts (int): Inclusive lower bound of the window (Unix seconds).
         to_ts (int): Inclusive upper bound of the window (Unix seconds).
             Must be strictly greater than ``from_ts``.
