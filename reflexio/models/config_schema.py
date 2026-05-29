@@ -733,6 +733,33 @@ class Config(BaseModel):
             "deduplicates internally."
         ),
     )
+    eval_sample_n_per_stratum: int = Field(
+        default=200,
+        gt=0,
+        description=(
+            "F3: stratified-sample cap per (day × group) stratum in the regen "
+            "pipeline. Strata with fewer items are kept whole. Predictable cost "
+            "regardless of traffic volume."
+        ),
+    )
+    eval_concurrency_limit: int = Field(
+        default=10,
+        gt=0,
+        description=(
+            "F3: max simultaneous LLM judge calls in flight per regen job, "
+            "enforced via a ThreadPoolExecutor. Bound to respect provider "
+            "rate limits."
+        ),
+    )
+    shadow_comparison_judge_prompt_version: NonEmptyStr = Field(
+        default="v1.0.0",
+        description=(
+            "F1: pinned judge prompt version for per-turn shadow comparison. "
+            "Verdicts are stored with the version that produced them; the "
+            "dashboard filters to this org's current pinned version so a "
+            "future rubric bump doesn't silently mix epochs into the headline."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

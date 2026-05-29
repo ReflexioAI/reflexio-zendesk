@@ -24,6 +24,7 @@ from ._operations import OperationMixin
 from ._playbook import PlaybookMixin
 from ._profiles import ProfileMixin
 from ._requests import RequestMixin
+from ._shadow_verdicts import ShadowVerdictsMixin
 from ._share_links import ShareLinkMixin
 from ._stall_state import StallStateMixin
 
@@ -37,6 +38,7 @@ class BaseStorage(
     ExtrasMixin,
     ShareLinkMixin,
     StallStateMixin,
+    ShadowVerdictsMixin,
     BaseStorageCore,
 ):
     """Base class for storage."""
@@ -132,6 +134,7 @@ __all__ = [
     "PriorAnswerMatch",
     "RunToolDependencyKind",
     "RunToolDependencyRecord",
+    "ShadowVerdictsMixin",
     "ShareLinkMixin",
     "StallStateMixin",
     "build_pending_tool_call_dedup_key",

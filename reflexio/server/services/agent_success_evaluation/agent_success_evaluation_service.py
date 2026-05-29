@@ -95,6 +95,11 @@ class AgentSuccessEvaluationService(
         (set by run_group_evaluation in regenerate mode), return None when
         the configured evaluator's name does not match.
 
+        When the active service_config carries an evaluation_name_filter
+        (set by run_group_evaluation in regenerate mode), skip every config
+        whose evaluation_name does not match — so the regenerate flow only
+        re-runs the targeted evaluator instead of every configured rubric.
+
         Returns:
             AgentSuccessConfig | None: Configured evaluator, or None when disabled
             or filtered out.

@@ -12,6 +12,7 @@ from ._operations import OperationMixin
 from ._playbook import PlaybookMixin
 from ._profiles import ProfileMixin
 from ._requests import RequestMixin
+from ._shadow_verdicts import ShadowVerdictsMixin as SQLiteShadowVerdictsMixin
 from ._share_links import SQLiteShareLinkMixin
 from ._stall_state import (
     SQLiteStallStateMixin,
@@ -34,6 +35,7 @@ class SQLiteStorage(
     ExtrasMixin,
     SQLiteShareLinkMixin,
     SQLiteStallStateMixin,
+    SQLiteShadowVerdictsMixin,
     SQLiteStorageBase,
 ):
     """SQLite-based storage with FTS5 and hybrid search."""
