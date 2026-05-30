@@ -202,11 +202,18 @@ class PlaybookAggregator:
         """
         Extract a direction key from a user playbook for similarity grouping.
 
+        Returns the raw content used for token-overlap comparison. Polarity is
+        intentionally NOT encoded into this key — embedding it as a prefix
+        token (e.g. ``positive::ask clarifying questions``) does not actually
+        prevent cross-polarity grouping because ``_token_overlap`` splits on
+        whitespace and the prefix is only one token out of many. Polarity is
+        gated explicitly in ``_group_playbooks_by_direction``.
+
         Args:
             fb: A user playbook item
 
         Returns:
-            str: Content as the direction key for grouping
+            str: Content used as the direction key for grouping
         """
         return fb.content or ""
 
@@ -240,11 +247,14 @@ class PlaybookAggregator:
         threshold: float = 0.6,
     ) -> list[list[UserPlaybook]]:
         """
-        Group playbooks by similarity of their content.
+        Group playbooks by similarity of their content, gated by polarity.
 
-        Uses greedy single-linkage: each playbook is assigned to the first existing group
-        that has any member with sufficient token overlap. Groups are returned sorted by
-        size descending (largest first).
+        Uses greedy single-linkage: each playbook is assigned to the first existing
+        group that has any member with sufficient token overlap AND the same polarity.
+        Polarity is gated explicitly (not encoded into the comparison string) because
+        ``_token_overlap`` is token-set based and a single prefix token cannot mask
+        same-content cross-polarity matches at typical thresholds. Groups are returned
+        sorted by size descending (largest first).
 
         Args:
             cluster_playbooks: List of raw playbooks to group
@@ -260,7 +270,8 @@ class PlaybookAggregator:
             matched = False
             for group in groups:
                 if any(
-                    PlaybookAggregator._token_overlap(
+                    fb.polarity == group_fb.polarity
+                    and PlaybookAggregator._token_overlap(
                         key,
                         PlaybookAggregator._get_direction_key(group_fb),
                         threshold,

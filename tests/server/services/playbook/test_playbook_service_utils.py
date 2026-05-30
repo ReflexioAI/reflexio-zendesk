@@ -211,8 +211,8 @@ class TestFormatStructuredFieldsForDisplay:
         assert "missing_tool" in result
         assert "No real-time data API available" in result
 
-    def test_all_fields_none_returns_empty(self):
-        """Test that all-None fields returns empty string."""
+    def test_all_fields_none_returns_empty_string(self):
+        """All-None structured fields produce no fallback content."""
         structured = StructuredPlaybookContent()
         result = format_structured_fields_for_display(structured)
         assert result == ""
@@ -454,7 +454,7 @@ class TestEnsurePlaybookContentEdgeCases:
     """Additional edge cases for ensure_playbook_content."""
 
     def test_returns_empty_string_when_both_empty(self):
-        """When both playbook content and structured fields are empty, returns empty string."""
+        """When playbook content is missing and no structured fields are set, fallback content is empty."""
         result = ensure_playbook_content(None, StructuredPlaybookContent())
         assert result == ""
 

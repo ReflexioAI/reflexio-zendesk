@@ -35,6 +35,11 @@ class StructuredPlaybookContent(BaseModel):
 
     Field order matters for autoregressive conditioning: rationale is generated
     first, then trigger, then content is synthesized last as a summary.
+
+    The extraction schema intentionally does not ask the model to emit a
+    polarity label. The extractor writes action rules or avoidance rules, and
+    the service derives the internal :class:`UserPlaybook` polarity from that
+    wording before storage.
     """
 
     rationale: str | None = Field(
@@ -65,7 +70,6 @@ class StructuredPlaybookContent(BaseModel):
         default=None,
         description="The extraction perspective or reader role that surfaced this entry",
     )
-
     model_config = ConfigDict(
         extra="allow",
         json_schema_extra={"additionalProperties": False},

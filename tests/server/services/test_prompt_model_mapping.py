@@ -11,6 +11,7 @@ preventing silent mock drift.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -29,82 +30,105 @@ _PROMPT_BANK_DIR = (
 # holds the expected mock response for this prompt's structured output.
 # None means the prompt does not produce structured output relevant to mocking.
 PROMPT_VERSION_MAP: dict[str, tuple[str, str | None]] = {
-    "playbook_extraction_main": ("v1.0.0", "playbook_extraction"),
+    "playbook_extraction_main": ("v1.1.0", "playbook_extraction"),
     "playbook_extraction_context": ("v4.1.0", None),
     "playbook_should_generate": ("v3.0.0", "boolean_evaluation"),
     "playbook_should_generate_expert": ("v1.0.0", "boolean_evaluation"),
     "playbook_extraction_context_expert": ("v3.1.0", None),
-    "playbook_extraction_main_expert": ("v1.0.0", "playbook_extraction"),
+    "playbook_extraction_main_expert": ("v1.1.0", "playbook_extraction"),
     "playbook_aggregation": ("v2.1.0", "playbook_aggregation"),
-    "playbook_deduplication": ("v2.0.0", "playbook_deduplication"),
-    "playbook_optimizer_judge": ("v1.0.0", None),
+    "playbook_consolidation": ("v2.0.0", "playbook_consolidation"),
+    "playbook_optimizer_judge": ("v1.1.0", None),
     "profile_update_main": ("v1.0.0", "profile_extraction"),
     "profile_update_instruction_start": ("v1.1.0", None),
     "profile_should_generate": ("v1.0.0", "boolean_evaluation"),
     "profile_should_generate_override": ("v1.0.0", "boolean_evaluation"),
     "profile_deduplication": ("v1.0.0", "profile_deduplication"),
     "agent_success_evaluation": ("v1.0.0", "agent_success_evaluation"),
-    # F1 cleanup: the session-level shadow comparison branch was retracted.
-    # The prompt directories remain on disk (marked active: false in their
-    # frontmatter) as historical records, but they no longer drive any
-    # production code path, so they are mapped without a registry key.
-    "agent_success_evaluation_with_comparison": ("v1.0.0", None),
+    "agent_success_evaluation_with_comparison": (
+        "v1.0.0",
+        "agent_success_evaluation_comparison",
+    ),
     "shadow_content_evaluation": ("v1.0.0", None),
-    "memory_reflection": ("v1.0.0", None),
+    "memory_reflection": ("v1.1.0", None),
     "query_reformulation": ("v1.0.0", None),
     "document_expansion": ("v1.0.0", None),
-    # Agentic extraction pipeline — three parallel axes + unify + self-critique
-    "extraction_user_profile": ("v1.4.11", None),
-    "extraction_user_profile_agent_rec": ("v1.1.3", None),
-    "extraction_user_playbook": ("v1.0.0", None),
-    "extraction_unify": ("v1.1.3", None),
-    "extraction_self_critique": ("v1.0.0", None),
-    # Agentic search pipeline — single-loop agent with cross-encoder + LLM rerank
-    "search_agent": ("v1.25.0", None),
-    # Per-pattern recipes loaded by render_search_prompt. Each can be iterated
-    # independently without bleeding into the others.
-    "search_agent/patterns/a": ("v1.0.0", None),
-    "search_agent/patterns/b": ("v1.0.0", None),
-    "search_agent/patterns/c": ("v1.0.0", None),
-    "search_agent/patterns/d": ("v1.0.0", None),
-    "search_agent/patterns/e": ("v1.0.0", None),
-    "search_agent/patterns/f": ("v1.0.0", None),
-    "search_agent/patterns/g": ("v1.0.0", None),
-    "search_agent/patterns/h": ("v1.0.0", None),
     "compress_session_for_query": ("v1.3.0", None),
     "rerank_relevance": ("v1.1.0", None),
     # Answer-LLM system prompt for memory-grounded user questions
     "answer_synthesis": ("v1.5.2", None),
-    # F1 — per-turn shadow comparison judge. Produces structured
-    # ShadowComparisonOutput; the mock dispatch lives in the integration
-    # tests rather than the global heuristic mock, so no registry key.
-    "shadow_comparison": ("v1.0.0", None),
 }
 
 
+_ACTIVE_FLAG_RE = re.compile(r"(?m)^active:\s*(true|false)\s*$")
+
+
+def _is_active(path: Path) -> bool:
+    """Return True if the prompt file's frontmatter declares ``active: true``.
+
+    Parses just the leading ``active:`` line from the frontmatter so we don't
+    pull in YAML. Defaults to False when the flag is missing or the file is
+    unreadable — only files explicitly marked active count toward the trip-wire.
+
+    Args:
+        path (Path): Path to a ``v*.prompt.md`` file.
+
+    Returns:
+        bool: True iff the file's frontmatter contains ``active: true``.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    match = _ACTIVE_FLAG_RE.search(raw)
+    return bool(match) and match.group(1) == "true"
+
+
 def _get_latest_prompt_version(prompt_id: str) -> str:
-    """Scan prompt_bank/<prompt_id>/ for the latest v*.prompt.md file.
+    """Scan prompt_bank/<prompt_id>/ for the latest ACTIVE v*.prompt.md file.
 
     Sorted by semver tuple, not lexically — without this v1.10.0 would
     sort BEFORE v1.9.0 and the trip-wire would lock to a stale version.
+
+    Files with ``active: false`` (typically ``-deprecated`` historical
+    records) are filtered out so the trip-wire pins the version the runtime
+    prompt manager will actually load. Without this filter, two siblings
+    like ``v1.0.0.prompt.md`` (active) and ``v1.0.0-deprecated.prompt.md``
+    (inactive) tie on semver key and the trip-wire becomes
+    order-of-glob-dependent; worse, a later-numbered deprecated file (e.g.
+    ``v2.0.0-deprecated``) would beat the real active ``v1.0.0``.
+
+    Files with a non-numeric suffix (e.g. ``v2.0.0-deprecated.prompt.md``)
+    that remain active are preserved verbatim by ``stem.split(".prompt")[0]``
+    so the trip-wire can pin an intermediate state where the only active
+    file in a directory is a deprecated placeholder awaiting a fresh prompt
+    in a follow-up task.
     """
     prompt_dir = _PROMPT_BANK_DIR / prompt_id
     if not prompt_dir.is_dir():
         pytest.fail(f"Prompt directory not found: {prompt_dir}")
 
     def _semver_key(p: Path) -> tuple[int, ...]:
+        stem = p.stem.removeprefix("v").removesuffix(".prompt")
+        # Strip non-semver suffix (e.g. "-deprecated") so semver ordering still works.
+        semver_part = stem.split("-", 1)[0]
         try:
-            return tuple(
-                int(x)
-                for x in p.stem.removeprefix("v").removesuffix(".prompt").split(".")
-            )
+            return tuple(int(x) for x in semver_part.split("."))
         except ValueError:
             return (0,)
 
-    versions = sorted(prompt_dir.glob("v*.prompt.md"), key=_semver_key)
-    if not versions:
+    all_versions = list(prompt_dir.glob("v*.prompt.md"))
+    if not all_versions:
         pytest.fail(f"No version files found in {prompt_dir}")
-    return versions[-1].stem.split(".prompt")[0]
+    active_versions = sorted(
+        (p for p in all_versions if _is_active(p)), key=_semver_key
+    )
+    if not active_versions:
+        pytest.fail(
+            f"No active version files found in {prompt_dir} "
+            f"(all {len(all_versions)} files have active: false)"
+        )
+    return active_versions[-1].stem.split(".prompt")[0]
 
 
 class TestPromptVersionMapping:

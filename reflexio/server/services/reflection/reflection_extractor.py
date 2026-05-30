@@ -86,6 +86,7 @@ class ReflectionExtractor:
         window_interactions: list[Interaction],
         cited_profiles: list[UserProfile],
         cited_user_playbooks: list[UserPlaybook],
+        horizon_by_key: dict[tuple[str, str], bool] | None = None,
     ) -> ReflectionOutput:
         """Render the prompt, call the LLM, return parsed output.
 
@@ -96,6 +97,12 @@ class ReflectionExtractor:
         if not cited_profiles and not cited_user_playbooks:
             return ReflectionOutput()
 
+        per_citation_context = _build_per_citation_context(
+            cited_profiles=cited_profiles,
+            cited_user_playbooks=cited_user_playbooks,
+            horizon_by_key=horizon_by_key or {},
+        )
+
         rendered = self.request_context.prompt_manager.render_prompt(
             REFLECTION_PROMPT_ID,
             {
@@ -103,6 +110,7 @@ class ReflectionExtractor:
                 "window_interactions_json": _interactions_to_json(window_interactions),
                 "cited_profiles_json": _profiles_to_json(cited_profiles),
                 "cited_user_playbooks_json": _playbooks_to_json(cited_user_playbooks),
+                "per_citation_context_json": per_citation_context,
             },
         )
         messages = [{"role": "user", "content": rendered}]
@@ -169,6 +177,17 @@ def _profiles_to_json(profiles: list[UserProfile]) -> str:
 
 
 def _playbooks_to_json(playbooks: list[UserPlaybook]) -> str:
+    """Serialize cited playbooks for the reflection prompt.
+
+    Includes ``polarity`` so the reflection model has the current
+    framing context when reasoning about whether a flip is warranted.
+
+    Args:
+        playbooks (list[UserPlaybook]): The cited playbooks to serialize.
+
+    Returns:
+        str: JSON array string with one object per cited playbook.
+    """
     payload = [
         {
             "user_playbook_id": p.user_playbook_id,
@@ -176,8 +195,53 @@ def _playbooks_to_json(playbooks: list[UserPlaybook]) -> str:
             "content": p.content,
             "trigger": p.trigger,
             "rationale": p.rationale,
+            "polarity": p.polarity,
             "source": p.source,
         }
         for p in playbooks
     ]
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _build_per_citation_context(
+    *,
+    cited_profiles: list[UserProfile],
+    cited_user_playbooks: list[UserPlaybook],
+    horizon_by_key: dict[tuple[str, str], bool],
+) -> str:
+    """Serialize per-citation horizon flags into a JSON string for the prompt.
+
+    For each cited profile/playbook, emits an object with target_kind,
+    target_id, and has_full_horizon. ``has_full_horizon`` defaults to
+    True when the citation key isn't in ``horizon_by_key`` (defensive
+    fallback — the caller normally populates the dict from
+    _filter_citations_by_horizon).
+
+    Args:
+        cited_profiles (list[UserProfile]): Profile citations to include.
+        cited_user_playbooks (list[UserPlaybook]): Playbook citations to include.
+        horizon_by_key (dict[tuple[str, str], bool]): Maps (kind, id) to
+            has_full_horizon flag.
+
+    Returns:
+        str: JSON array string with per-citation horizon context.
+    """
+    payload: list[dict[str, Any]] = [
+        {
+            "target_kind": "profile",
+            "target_id": p.profile_id,
+            "has_full_horizon": horizon_by_key.get(("profile", p.profile_id), True),
+        }
+        for p in cited_profiles
+    ]
+    payload.extend(
+        {
+            "target_kind": "playbook",
+            "target_id": str(pb.user_playbook_id),
+            "has_full_horizon": horizon_by_key.get(
+                ("playbook", str(pb.user_playbook_id)), True
+            ),
+        }
+        for pb in cited_user_playbooks
+    )
     return json.dumps(payload, ensure_ascii=False, indent=2)

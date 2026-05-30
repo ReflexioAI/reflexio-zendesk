@@ -460,6 +460,7 @@ def _row_to_user_playbook(
         source_span=d.get("source_span"),
         notes=d.get("notes"),
         reader_angle=d.get("reader_angle"),
+        polarity=d.get("polarity") or "positive",
     )
 
 
@@ -667,6 +668,7 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         self._migrate_agent_playbook_source_windows()
         self._migrate_request_metadata()
         self._migrate_shadow_comparison_verdicts()
+        self._migrate_user_playbook_polarity()
         init_stall_state_table(self.conn)
         return True
 
@@ -1158,6 +1160,26 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                     logger.info("Added %s column to %s", col, table)
         self.conn.commit()
 
+    def _migrate_user_playbook_polarity(self) -> None:
+        """Add the ``polarity`` column to ``user_playbooks`` if missing.
+
+        Backfill-safe: existing rows default to ``'positive'``. Required for
+        databases created before per-rule polarity was introduced.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(user_playbooks)").fetchall()
+        }
+        if not cols:
+            return
+        if "polarity" not in cols:
+            self.conn.execute(
+                "ALTER TABLE user_playbooks "
+                "ADD COLUMN polarity TEXT NOT NULL DEFAULT 'positive'"
+            )
+            logger.info("Added polarity column to user_playbooks")
+        self.conn.commit()
+
     def _migrate_agent_playbook_source_windows(self) -> None:
         """Add source window snapshots to existing agent source mappings."""
         cols = {
@@ -1622,7 +1644,8 @@ CREATE TABLE IF NOT EXISTS user_playbooks (
     expanded_terms TEXT,
     source_span TEXT,
     notes TEXT,
-    reader_angle TEXT
+    reader_angle TEXT,
+    polarity TEXT NOT NULL DEFAULT 'positive'
 );
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_playbook_name ON user_playbooks(playbook_name);
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_agent_version ON user_playbooks(agent_version);

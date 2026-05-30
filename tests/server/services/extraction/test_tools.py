@@ -118,6 +118,45 @@ def test_search_user_playbooks_populates_known_ids(seeded_storage, ctx):
     assert hit_ids.issubset(ctx.known_ids)
 
 
+def test_search_user_playbooks_projection_omits_internal_polarity(seeded_storage, ctx):
+    """The LLM-facing projection keeps polarity as an internal derived field."""
+    result = _handle_search_user_playbooks(
+        SearchUserPlaybooksArgs(query="code examples", top_k=10),
+        seeded_storage,
+        ctx,
+    )
+    hits = result["hits"]
+    assert hits, "expected at least one hit from seeded storage"
+    for hit in hits:
+        assert "polarity" not in hit, f"projection leaked polarity: {hit}"
+
+
+def test_project_user_playbook_keeps_legacy_rows_without_polarity():
+    """Legacy rows without a polarity attribute remain projectable."""
+    from types import SimpleNamespace
+
+    from reflexio.server.services.extraction.tools import (
+        _project_user_playbook_for_llm,
+    )
+
+    legacy_pb = SimpleNamespace(
+        user_playbook_id=42,
+        trigger="t",
+        content="c",
+        rationale="r",
+        created_at=123,
+        # No `polarity` attribute — simulates a legacy row.
+    )
+    projection = _project_user_playbook_for_llm(legacy_pb)
+    assert projection == {
+        "id": "42",
+        "trigger": "t",
+        "content": "c",
+        "rationale": "r",
+        "last_modified": 123,
+    }
+
+
 def test_search_agent_playbooks_bumps_search_count(seeded_storage, ctx):
     result = _handle_search_agent_playbooks(
         SearchAgentPlaybooksArgs(query="x", top_k=10), seeded_storage, ctx
@@ -376,85 +415,19 @@ def test_read_session_text_truncates_per_session_at_cap():
     assert len(text) < 16100
 
 
-# --- Mutating handlers ---
+# --- apply_plan_op ---
+#
+# The create/delete/finish tool handlers and their arg-models were removed when
+# extraction unified on the always-on ``finish_extraction`` loop — the model now
+# emits its full plan in a single ``finish_extraction`` payload that the loop
+# materialises into plan ops. ``apply_plan_op`` (the storage-write side that
+# applies those ops) survives and is still covered below.
 
 from reflexio.server.services.extraction.plan import (
-    CreateUserPlaybookOp,
     CreateUserProfileOp,
-    DeleteUserPlaybookOp,
     DeleteUserProfileOp,
 )
-from reflexio.server.services.extraction.tools import (
-    CreateUserPlaybookArgs,
-    CreateUserProfileArgs,
-    DeleteUserPlaybookArgs,
-    DeleteUserProfileArgs,
-    _handle_create_user_playbook,
-    _handle_create_user_profile,
-    _handle_delete_user_playbook,
-    _handle_delete_user_profile,
-    apply_plan_op,
-)
-
-
-def test_create_user_profile_appends_plan_no_storage_write(seeded_storage, ctx):
-    result = _handle_create_user_profile(
-        CreateUserProfileArgs(
-            content="user prefers dark mode", ttl="infinity", source_span="I use dark"
-        ),
-        seeded_storage,
-        ctx,
-    )
-    assert "tentative_id" in result
-    assert "op_idx" in result
-    assert len(ctx.plan) == 1
-    assert isinstance(ctx.plan[0], CreateUserProfileOp)
-    # Storage unchanged — was 1 seeded profile, still 1
-    assert len(seeded_storage.get_user_profile("u_1")) == 1
-
-
-def test_create_user_profile_adds_tentative_id_to_known_ids(seeded_storage, ctx):
-    r = _handle_create_user_profile(
-        CreateUserProfileArgs(content="x", ttl="infinity", source_span="y"),
-        seeded_storage,
-        ctx,
-    )
-    tid = r["tentative_id"]
-    assert tid in ctx.known_ids  # self-correction via delete becomes possible
-
-
-def test_delete_user_profile_appends_plan(seeded_storage, ctx):
-    ctx.known_ids.add("p_10")
-    result = _handle_delete_user_profile(
-        DeleteUserProfileArgs(id="p_10"), seeded_storage, ctx
-    )
-    assert len(ctx.plan) == 1
-    assert isinstance(ctx.plan[0], DeleteUserProfileOp)
-    assert result["op_idx"] == 0
-    # Storage unchanged
-    assert len(seeded_storage.get_user_profile("u_1")) == 1
-
-
-def test_create_user_playbook_appends_plan(seeded_storage, ctx):
-    _handle_create_user_playbook(
-        CreateUserPlaybookArgs(
-            trigger="on review",
-            content="suggest refactor",
-            source_span="evidence",
-        ),
-        seeded_storage,
-        ctx,
-    )
-    assert isinstance(ctx.plan[0], CreateUserPlaybookOp)
-
-
-def test_delete_user_playbook_appends_plan(seeded_storage, ctx):
-    ctx.known_ids.add("pb_5")
-    _handle_delete_user_playbook(DeleteUserPlaybookArgs(id="pb_5"), seeded_storage, ctx)
-    assert isinstance(ctx.plan[0], DeleteUserPlaybookOp)
-
-
-# --- apply_plan_op ---
+from reflexio.server.services.extraction.tools import apply_plan_op
 
 
 def test_apply_plan_op_create_user_profile_calls_add(seeded_storage, ctx):
@@ -523,74 +496,32 @@ def test_apply_plan_op_create_profile_infinity_ttl_uses_sentinel(tmp_path):
 # ====================================================================
 # Registry tests
 # ====================================================================
-
-from reflexio.server.services.extraction.tools import (
-    EXTRACTION_TOOLS,
-    PLAYBOOK_EXTRACTION_TOOLS,
-    PROFILE_EXTRACTION_TOOLS,
-    SEARCH_TOOLS,
-)
+#
+# The create/delete/finish tool banks (EXTRACTION_TOOLS,
+# PROFILE_EXTRACTION_TOOLS, PLAYBOOK_EXTRACTION_TOOLS, SEARCH_TOOLS) were removed
+# in the extraction/search unification. The read-only tool surface that survives
+# is exposed via ``_READ_TOOLS``; the loop registers ``finish_extraction`` itself.
 
 
-def test_extraction_registry_has_all_tools():
-    specs = {t["function"]["name"] for t in EXTRACTION_TOOLS.openai_specs()}
-    # EXTRACTION_TOOLS is the backward-compat union of all four create/delete tools
-    # plus the full read surface (including agent-playbook and session-excerpt tools).
-    assert specs == {
+def test_read_tools_are_read_only():
+    """``_READ_TOOLS`` exposes only read/search handlers — no mutations."""
+    from reflexio.server.services.extraction.tools import _READ_TOOLS
+
+    names = {t.name for t in _READ_TOOLS}
+    assert "create_user_profile" not in names
+    assert "delete_user_profile" not in names
+    assert "create_user_playbook" not in names
+    assert "delete_user_playbook" not in names
+    # Core read surface is present.
+    assert {
         "search_user_profiles",
         "get_user_profile",
-        "create_user_profile",
-        "delete_user_profile",
-        "search_user_playbooks",
-        "get_user_playbook",
-        "create_user_playbook",
-        "delete_user_playbook",
-        "search_agent_playbooks",
-        "get_agent_playbook",
-        "read_session_text",
-        "finish",
-    }
-
-
-def test_profile_extraction_registry_excludes_playbook_mutations():
-    """PROFILE_EXTRACTION_TOOLS must not expose create/delete_user_playbook."""
-    specs = {t["function"]["name"] for t in PROFILE_EXTRACTION_TOOLS.openai_specs()}
-    assert "create_user_profile" in specs
-    assert "delete_user_profile" in specs
-    assert "create_user_playbook" not in specs
-    assert "delete_user_playbook" not in specs
-    assert "finish" in specs
-
-
-def test_playbook_extraction_registry_excludes_profile_mutations():
-    """PLAYBOOK_EXTRACTION_TOOLS must not expose create/delete_user_profile."""
-    specs = {t["function"]["name"] for t in PLAYBOOK_EXTRACTION_TOOLS.openai_specs()}
-    assert "create_user_playbook" in specs
-    assert "delete_user_playbook" in specs
-    assert "create_user_profile" not in specs
-    assert "delete_user_profile" not in specs
-    assert "finish" in specs
-
-
-def test_search_registry_is_read_only():
-    specs = {t["function"]["name"] for t in SEARCH_TOOLS.openai_specs()}
-    # ``rerank_user_profiles`` was removed from the agent palette — search now
-    # does internal rerank via the ``rerank``/``llm_rerank`` flags on
-    # ``search_user_profiles``.
-    assert specs == {
-        "search_user_profiles",
-        "get_user_profile",
-        "storage_stats",
         "search_user_playbooks",
         "get_user_playbook",
         "search_agent_playbooks",
         "get_agent_playbook",
         "read_session_text",
-        "finish",
-    }
-    # No mutations allowed in search
-    assert "create_user_profile" not in specs
-    assert "delete_user_profile" not in specs
+    } <= names
 
 
 # ====================================================================

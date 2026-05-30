@@ -36,6 +36,9 @@ from reflexio.server.services.playbook.playbook_service_utils import (
     format_expert_comparison_pairs,
     has_expert_content,
 )
+from reflexio.server.services.polarity_utils import (
+    warn_if_polarity_content_mismatch,
+)
 from reflexio.server.services.service_utils import (
     extract_interactions_from_request_interaction_data_models,
     format_sessions_to_history_string,
@@ -264,8 +267,8 @@ class PlaybookGenerationService(
         from reflexio.server.site_var.feature_flags import is_deduplicator_enabled
 
         if is_deduplicator_enabled(self.org_id):
-            from reflexio.server.services.playbook.playbook_deduplicator import (
-                PlaybookDeduplicator,
+            from reflexio.server.services.playbook.playbook_consolidator import (
+                PlaybookConsolidator,
             )
 
             playbook_config = self._configured_playbook_config()
@@ -273,12 +276,12 @@ class PlaybookGenerationService(
                 playbook_config.deduplication_config if playbook_config else None
             )
 
-            deduplicator = PlaybookDeduplicator(
+            consolidator = PlaybookConsolidator(
                 request_context=self.request_context,
                 llm_client=self.client,
                 dedup_config=dedup_config,
             )
-            deduplicated_playbooks, existing_ids_to_delete = deduplicator.deduplicate(
+            deduplicated_playbooks, existing_ids_to_delete = consolidator.deduplicate(
                 [all_playbooks],
                 self.service_config.request_id,  # type: ignore[reportOptionalMemberAccess]
                 self.service_config.agent_version,  # type: ignore[reportOptionalMemberAccess]
@@ -295,6 +298,7 @@ class PlaybookGenerationService(
         for playbook in all_playbooks:
             playbook.status = Status.PENDING if self.output_pending_status else None
             playbook.source = self.service_config.source  # type: ignore[reportOptionalMemberAccess]
+            warn_if_polarity_content_mismatch(playbook)
 
         logger.info("All user playbook entries: %s", all_playbooks)
 
