@@ -17,15 +17,21 @@ import pytest
 
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.models.api_schema.service_schemas import (
-    BlockingIssue,
-    BlockingIssueKind,
     Interaction,
     Request,
     UserPlaybook,
 )
-from reflexio.models.config_schema import PlaybookConfig
+from reflexio.models.config_schema import (
+    Config,
+    PendingToolCallConfig,
+    PlaybookConfig,
+    StorageConfigSQLite,
+)
 from reflexio.server.api_endpoints.request_context import RequestContext
-from reflexio.server.llm.litellm_client import LiteLLMClient
+from reflexio.server.llm.litellm_client import LiteLLMClient, LiteLLMConfig
+from reflexio.server.services.extraction.resumable_agent import (
+    FINISH_EXTRACTION_TOOL_NAME,
+)
 from reflexio.server.services.playbook.playbook_extractor import PlaybookExtractor
 from reflexio.server.services.playbook.playbook_generation_service import (
     PlaybookGenerationServiceConfig,
@@ -34,6 +40,8 @@ from reflexio.server.services.playbook.playbook_service_utils import (
     StructuredPlaybookContent,
     StructuredPlaybookList,
 )
+from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
+from reflexio.server.services.storage.storage_base import AgentRunStatus
 
 # ===============================
 # Fixtures
@@ -61,6 +69,14 @@ def request_context(temp_storage_dir):
     context = RequestContext(org_id="test_org", storage_base_dir=temp_storage_dir)
     context.storage = MagicMock()
     return context
+
+
+@pytest.fixture
+def sqlite_storage(temp_storage_dir):
+    with patch.object(SQLiteStorage, "_get_embedding", return_value=[0.0] * 512):
+        yield SQLiteStorage(
+            org_id="test_org", db_path=f"{temp_storage_dir}/reflexio.db"
+        )
 
 
 @pytest.fixture
@@ -469,7 +485,7 @@ class TestRun:
         with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "true"}):
             result = extractor.run()
 
-        assert result is not None
+        assert isinstance(result, list)
         assert len(result) > 0
         assert all(isinstance(f, UserPlaybook) for f in result)
 
@@ -502,6 +518,7 @@ class TestRun:
         with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "true"}):
             result = extractor.run()
 
+        assert isinstance(result, list)
         assert len(result) == 1
         assert result[0].source_interaction_ids == [1, 2, 3]
 
@@ -568,48 +585,156 @@ class TestRun:
             request_context.storage.upsert_operation_state.assert_called()
 
 
+class TestResumableAgentPath:
+    """Tests for the config-gated resumable playbook extraction path."""
+
+    def test_generates_playbook_and_finalizes_agent_run(
+        self,
+        monkeypatch,
+        request_context,
+        sqlite_storage,
+        extractor_config,
+        service_config,
+        sample_request_interaction_models,
+        tool_call_completion,
+    ):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+        request_context.storage = sqlite_storage
+        request_context.configurator.get_config = MagicMock(
+            return_value=Config(
+                storage_config=StorageConfigSQLite(),
+                pending_tool_call_config=PendingToolCallConfig(enabled=True),
+            )
+        )
+        request_context.prompt_manager = MagicMock()
+        request_context.prompt_manager.render_prompt.side_effect = (
+            lambda prompt_id, variables: f"{prompt_id}: {variables}"
+        )
+
+        make_tc, _make_stop = tool_call_completion
+        response = make_tc(
+            FINISH_EXTRACTION_TOOL_NAME,
+            {
+                "playbooks": [
+                    {
+                        "trigger": "User asks about deployments",
+                        "content": "Prefer ECS deployment guidance.",
+                        "rationale": "The workspace uses AWS ECS.",
+                    }
+                ]
+            },
+        )
+        extractor = PlaybookExtractor(
+            request_context=request_context,
+            llm_client=LiteLLMClient(LiteLLMConfig(model="claude-sonnet-4-6")),
+            extractor_config=extractor_config,
+            service_config=service_config,
+            agent_context="Test agent",
+        )
+
+        with (
+            patch("litellm.completion", side_effect=[response]),
+            patch(
+                "reflexio.server.services.extraction.resumable_agent.is_resumable_extraction_agent_feature_enabled",
+                return_value=True,
+            ),
+            patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}),
+        ):
+            playbooks = extractor.extract_playbook_entries(
+                sample_request_interaction_models
+            )
+
+        assert len(playbooks) == 1
+        assert playbooks[0].content == "Prefer ECS deployment guidance."
+        assert playbooks[0].source_interaction_ids == [1, 2, 3]
+        row = sqlite_storage.conn.execute("SELECT id FROM _agent_runs").fetchone()
+        assert row is not None
+        run = sqlite_storage.get_agent_run(row["id"])
+        assert run is not None
+        assert run.status == AgentRunStatus.AGENT_COMPLETED
+        assert run.binding.org_id == "test_org"
+        assert run.binding.user_id is None
+        assert run.binding.extractor_kind == "playbook"
+        assert run.binding.source_interaction_ids == [1, 2, 3]
+
+
 # ===============================
 # Test: Structured AgentPlaybook Extraction
 # ===============================
 
 
 class TestStructuredPlaybookExtraction:
-    """Tests for structured playbook extraction with JSON output."""
+    """Structured playbook extraction now routes through the always-on
+    ``finish_extraction`` tool loop. The model emits its playbooks in the
+    ``finish_extraction`` tool-call payload; the loop reads ``resp.tool_calls``
+    and the extractor materialises ``result.output`` into ``UserPlaybook``
+    entries. A degenerate loop that produces no usable finish_extraction output
+    leaves ``result.output is None`` and the extractor returns ``[]``.
+    """
 
-    def test_extracts_structured_playbook_with_all_fields(
-        self,
-        request_context,
-        mock_llm_client,
-        extractor_config,
-        service_config,
-        sample_request_interaction_models,
+    def _make_extractor(
+        self, request_context, sqlite_storage, extractor_config, service_config
     ):
-        """Test that structured playbook with all fields is correctly extracted."""
-        extractor = PlaybookExtractor(
+        request_context.storage = sqlite_storage
+        request_context.configurator.get_config = MagicMock(
+            return_value=Config(
+                storage_config=StorageConfigSQLite(),
+                pending_tool_call_config=PendingToolCallConfig(enabled=True),
+            )
+        )
+        request_context.prompt_manager = MagicMock()
+        request_context.prompt_manager.render_prompt.side_effect = (
+            lambda prompt_id, variables: f"{prompt_id}: {variables}"
+        )
+        request_context.prompt_manager.get_active_version.return_value = "1.2.0"
+        return PlaybookExtractor(
             request_context=request_context,
-            llm_client=mock_llm_client,
+            llm_client=LiteLLMClient(LiteLLMConfig(model="claude-sonnet-4-6")),
             extractor_config=extractor_config,
             service_config=service_config,
             agent_context="Test agent",
         )
 
-        # Mock LLM response with flat fields (new schema)
-        mock_llm_client.generate_chat_response.return_value = StructuredPlaybookList(
-            playbooks=[
-                StructuredPlaybookContent(
-                    trigger="assisting technical users",
-                    content="ask for CLI preference before proceeding",
-                )
-            ]
+    def test_extracts_structured_playbook_with_all_fields(
+        self,
+        monkeypatch,
+        request_context,
+        sqlite_storage,
+        extractor_config,
+        service_config,
+        sample_request_interaction_models,
+        tool_call_completion,
+    ):
+        """A finish_extraction payload with a fully-specified playbook is
+        materialised into a UserPlaybook entry."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+        extractor = self._make_extractor(
+            request_context, sqlite_storage, extractor_config, service_config
         )
 
-        # Mock prompt manager
-        request_context.prompt_manager = MagicMock()
-        request_context.prompt_manager.render_prompt.return_value = "mock prompt"
-        request_context.prompt_manager.get_active_version.return_value = "1.2.0"
+        make_tc, _make_stop = tool_call_completion
+        response = make_tc(
+            FINISH_EXTRACTION_TOOL_NAME,
+            {
+                "playbooks": [
+                    {
+                        "trigger": "assisting technical users",
+                        "content": "ask for CLI preference before proceeding",
+                    }
+                ]
+            },
+        )
 
-        # Disable mock mode to use the mocked LLM response
-        with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
+        with (
+            patch("litellm.completion", side_effect=[response]),
+            patch(
+                "reflexio.server.services.extraction.resumable_agent.is_resumable_extraction_agent_feature_enabled",
+                return_value=True,
+            ),
+            patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}),
+        ):
             result = extractor.extract_playbook_entries(
                 sample_request_interaction_models
             )
@@ -621,38 +746,42 @@ class TestStructuredPlaybookExtraction:
 
     def test_extracts_structured_playbook_with_only_do_action(
         self,
+        monkeypatch,
         request_context,
-        mock_llm_client,
+        sqlite_storage,
         extractor_config,
         service_config,
         sample_request_interaction_models,
+        tool_call_completion,
     ):
-        """Test that structured playbook with only do_action is correctly extracted."""
-        extractor = PlaybookExtractor(
-            request_context=request_context,
-            llm_client=mock_llm_client,
-            extractor_config=extractor_config,
-            service_config=service_config,
-            agent_context="Test agent",
+        """A trigger+content playbook is materialised correctly."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+        extractor = self._make_extractor(
+            request_context, sqlite_storage, extractor_config, service_config
         )
 
-        # Mock LLM response with trigger + content
-        mock_llm_client.generate_chat_response.return_value = StructuredPlaybookList(
-            playbooks=[
-                StructuredPlaybookContent(
-                    trigger="user asks for help",
-                    content="provide step-by-step instructions",
-                )
-            ]
+        make_tc, _make_stop = tool_call_completion
+        response = make_tc(
+            FINISH_EXTRACTION_TOOL_NAME,
+            {
+                "playbooks": [
+                    {
+                        "trigger": "user asks for help",
+                        "content": "provide step-by-step instructions",
+                    }
+                ]
+            },
         )
 
-        # Mock prompt manager
-        request_context.prompt_manager = MagicMock()
-        request_context.prompt_manager.render_prompt.return_value = "mock prompt"
-        request_context.prompt_manager.get_active_version.return_value = "1.2.0"
-
-        # Disable mock mode to use the mocked LLM response
-        with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
+        with (
+            patch("litellm.completion", side_effect=[response]),
+            patch(
+                "reflexio.server.services.extraction.resumable_agent.is_resumable_extraction_agent_feature_enabled",
+                return_value=True,
+            ),
+            patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}),
+        ):
             result = extractor.extract_playbook_entries(
                 sample_request_interaction_models
             )
@@ -661,68 +790,71 @@ class TestStructuredPlaybookExtraction:
         assert result[0].content == "provide step-by-step instructions"
         assert result[0].trigger == "user asks for help"
 
-    def test_returns_empty_when_playbook_is_null(
+    def test_returns_empty_when_no_playbooks_emitted(
         self,
+        monkeypatch,
         request_context,
-        mock_llm_client,
+        sqlite_storage,
         extractor_config,
         service_config,
         sample_request_interaction_models,
+        tool_call_completion,
     ):
-        """Test that empty list is returned when playbook is null."""
-        extractor = PlaybookExtractor(
-            request_context=request_context,
-            llm_client=mock_llm_client,
-            extractor_config=extractor_config,
-            service_config=service_config,
-            agent_context="Test agent",
+        """A finish_extraction payload with an empty playbook list yields []."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+        extractor = self._make_extractor(
+            request_context, sqlite_storage, extractor_config, service_config
         )
 
-        # Mock LLM response with no playbook (empty list)
-        mock_llm_client.generate_chat_response.return_value = StructuredPlaybookList(
-            playbooks=[]
-        )
+        make_tc, _make_stop = tool_call_completion
+        response = make_tc(FINISH_EXTRACTION_TOOL_NAME, {"playbooks": []})
 
-        # Mock prompt manager
-        request_context.prompt_manager = MagicMock()
-        request_context.prompt_manager.render_prompt.return_value = "mock prompt"
-        request_context.prompt_manager.get_active_version.return_value = "1.2.0"
-
-        # Disable mock mode to use the mocked LLM response
-        with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
+        with (
+            patch("litellm.completion", side_effect=[response]),
+            patch(
+                "reflexio.server.services.extraction.resumable_agent.is_resumable_extraction_agent_feature_enabled",
+                return_value=True,
+            ),
+            patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}),
+        ):
             result = extractor.extract_playbook_entries(
                 sample_request_interaction_models
             )
 
         assert result == []
 
-    def test_returns_empty_on_invalid_response_format(
+    def test_returns_empty_on_degenerate_loop(
         self,
+        monkeypatch,
         request_context,
-        mock_llm_client,
+        sqlite_storage,
         extractor_config,
         service_config,
         sample_request_interaction_models,
+        tool_call_completion,
     ):
-        """Test that empty list is returned when response format is invalid."""
-        extractor = PlaybookExtractor(
-            request_context=request_context,
-            llm_client=mock_llm_client,
-            extractor_config=extractor_config,
-            service_config=service_config,
-            agent_context="Test agent",
+        """A degenerate loop where the model never emits usable finish_extraction
+        output leaves ``result.output is None`` and the extractor returns []."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+        extractor = self._make_extractor(
+            request_context, sqlite_storage, extractor_config, service_config
         )
 
-        # Mock LLM response with invalid format (string instead of dict)
-        mock_llm_client.generate_chat_response.return_value = "invalid response"
+        # Model stops with plain text and never calls finish_extraction, so the
+        # loop terminates with no structured output.
+        _make_tc, make_stop = tool_call_completion
+        response = make_stop()
 
-        # Mock prompt manager
-        request_context.prompt_manager = MagicMock()
-        request_context.prompt_manager.render_prompt.return_value = "mock prompt"
-        request_context.prompt_manager.get_active_version.return_value = "1.2.0"
-
-        # Disable mock mode to use the mocked LLM response
-        with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
+        with (
+            patch("litellm.completion", side_effect=[response]),
+            patch(
+                "reflexio.server.services.extraction.resumable_agent.is_resumable_extraction_agent_feature_enabled",
+                return_value=True,
+            ),
+            patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}),
+        ):
             result = extractor.extract_playbook_entries(
                 sample_request_interaction_models
             )
@@ -966,120 +1098,6 @@ class TestBuildUserPlaybook:
 
 
 # ===============================
-# Test: Blocking Issue Round-Trip
-# ===============================
-
-
-class TestBlockingIssueRoundTrip:
-    """Tests for blocking_issue field in structured playbook extraction."""
-
-    def test_build_user_playbook_with_blocking_issue(
-        self,
-        request_context,
-        mock_llm_client,
-        extractor_config,
-        service_config,
-    ):
-        """Test that _build_user_playbook correctly populates blocking_issue on UserPlaybook."""
-        extractor = PlaybookExtractor(
-            request_context=request_context,
-            llm_client=mock_llm_client,
-            extractor_config=extractor_config,
-            service_config=service_config,
-            agent_context="Test agent",
-        )
-
-        entry = StructuredPlaybookContent(
-            trigger="user asks to delete shared files",
-            content="inform user that file deletion requires admin approval",
-            blocking_issue=BlockingIssue(
-                kind=BlockingIssueKind.PERMISSION_DENIED,
-                details="Agent lacks admin-level file deletion permissions on shared drives",
-            ),
-        )
-
-        result = extractor._build_user_playbook(entry, source_interaction_ids=[])
-
-        assert result is not None
-        assert result.blocking_issue is not None
-        assert result.blocking_issue.kind == BlockingIssueKind.PERMISSION_DENIED
-        assert "admin-level file deletion" in result.blocking_issue.details
-
-    def test_build_user_playbook_without_blocking_issue(
-        self,
-        request_context,
-        mock_llm_client,
-        extractor_config,
-        service_config,
-    ):
-        """Test that _build_user_playbook works correctly when blocking_issue is None."""
-        extractor = PlaybookExtractor(
-            request_context=request_context,
-            llm_client=mock_llm_client,
-            extractor_config=extractor_config,
-            service_config=service_config,
-            agent_context="Test agent",
-        )
-
-        entry = StructuredPlaybookContent(
-            trigger="processing external data",
-            content="validate inputs",
-        )
-
-        result = extractor._build_user_playbook(entry, source_interaction_ids=[])
-
-        assert result is not None
-        assert result.blocking_issue is None
-
-    def test_extracts_playbook_with_blocking_issue_end_to_end(
-        self,
-        request_context,
-        mock_llm_client,
-        extractor_config,
-        service_config,
-        sample_request_interaction_models,
-    ):
-        """Test end-to-end extraction with blocking_issue included in LLM response."""
-        extractor = PlaybookExtractor(
-            request_context=request_context,
-            llm_client=mock_llm_client,
-            extractor_config=extractor_config,
-            service_config=service_config,
-            agent_context="Test agent",
-        )
-
-        mock_llm_client.generate_chat_response.return_value = StructuredPlaybookList(
-            playbooks=[
-                StructuredPlaybookContent(
-                    trigger="user requests direct database access",
-                    content="suggest using the API endpoint instead",
-                    blocking_issue=BlockingIssue(
-                        kind=BlockingIssueKind.MISSING_TOOL,
-                        details="No direct database query tool available",
-                    ),
-                )
-            ]
-        )
-
-        request_context.prompt_manager = MagicMock()
-        request_context.prompt_manager.render_prompt.return_value = "mock prompt"
-        request_context.prompt_manager.get_active_version.return_value = "2.0.0"
-
-        with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
-            result = extractor.extract_playbook_entries(
-                sample_request_interaction_models
-            )
-
-        assert len(result) == 1
-        assert result[0].blocking_issue is not None
-        assert result[0].blocking_issue.kind == BlockingIssueKind.MISSING_TOOL
-        assert (
-            result[0].blocking_issue.details
-            == "No direct database query tool available"
-        )
-
-
-# ===============================
 # Test: Rationale Field Round-Trip
 # ===============================
 
@@ -1089,36 +1107,60 @@ class TestRationaleRoundTrip:
 
     def test_extraction_preserves_rationale(
         self,
+        monkeypatch,
         request_context,
-        mock_llm_client,
+        sqlite_storage,
         extractor_config,
         service_config,
         sample_request_interaction_models,
+        tool_call_completion,
     ):
-        """Test that rationale flows from LLM response through to UserPlaybook top-level fields."""
+        """Rationale flows from the finish_extraction payload through to the
+        UserPlaybook top-level fields."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+        request_context.storage = sqlite_storage
+        request_context.configurator.get_config = MagicMock(
+            return_value=Config(
+                storage_config=StorageConfigSQLite(),
+                pending_tool_call_config=PendingToolCallConfig(enabled=True),
+            )
+        )
+        request_context.prompt_manager = MagicMock()
+        request_context.prompt_manager.render_prompt.side_effect = (
+            lambda prompt_id, variables: f"{prompt_id}: {variables}"
+        )
+        request_context.prompt_manager.get_active_version.return_value = "1.2.0"
         extractor = PlaybookExtractor(
             request_context=request_context,
-            llm_client=mock_llm_client,
+            llm_client=LiteLLMClient(LiteLLMConfig(model="claude-sonnet-4-6")),
             extractor_config=extractor_config,
             service_config=service_config,
             agent_context="Test agent",
         )
 
-        mock_llm_client.generate_chat_response.return_value = StructuredPlaybookList(
-            playbooks=[
-                StructuredPlaybookContent(
-                    rationale="Users need to understand the approach before seeing code",
-                    trigger="User asks for debugging help",
-                    content="Outline strategy before writing code",
-                )
-            ]
+        make_tc, _make_stop = tool_call_completion
+        response = make_tc(
+            FINISH_EXTRACTION_TOOL_NAME,
+            {
+                "playbooks": [
+                    {
+                        "rationale": "Users need to understand the approach before seeing code",
+                        "trigger": "User asks for debugging help",
+                        "content": "Outline strategy before writing code",
+                    }
+                ]
+            },
         )
 
-        request_context.prompt_manager = MagicMock()
-        request_context.prompt_manager.render_prompt.return_value = "mock prompt"
-        request_context.prompt_manager.get_active_version.return_value = "1.2.0"
-
-        with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
+        with (
+            patch("litellm.completion", side_effect=[response]),
+            patch(
+                "reflexio.server.services.extraction.resumable_agent.is_resumable_extraction_agent_feature_enabled",
+                return_value=True,
+            ),
+            patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}),
+        ):
             result = extractor.extract_playbook_entries(
                 sample_request_interaction_models
             )
@@ -1240,35 +1282,59 @@ class TestPlaybookContentExtraction:
 
     def test_end_to_end_with_playbook_content(
         self,
+        monkeypatch,
         request_context,
-        mock_llm_client,
+        sqlite_storage,
         extractor_config,
         service_config,
         sample_request_interaction_models,
+        tool_call_completion,
     ):
-        """Test end-to-end extraction where LLM returns playbook content + structured fields."""
+        """End-to-end extraction (through the finish_extraction loop) where the
+        finish payload carries playbook content + structured fields."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+        request_context.storage = sqlite_storage
+        request_context.configurator.get_config = MagicMock(
+            return_value=Config(
+                storage_config=StorageConfigSQLite(),
+                pending_tool_call_config=PendingToolCallConfig(enabled=True),
+            )
+        )
+        request_context.prompt_manager = MagicMock()
+        request_context.prompt_manager.render_prompt.side_effect = (
+            lambda prompt_id, variables: f"{prompt_id}: {variables}"
+        )
+        request_context.prompt_manager.get_active_version.return_value = "3.0.0"
         extractor = PlaybookExtractor(
             request_context=request_context,
-            llm_client=mock_llm_client,
+            llm_client=LiteLLMClient(LiteLLMConfig(model="claude-sonnet-4-6")),
             extractor_config=extractor_config,
             service_config=service_config,
             agent_context="Test agent",
         )
 
-        mock_llm_client.generate_chat_response.return_value = StructuredPlaybookList(
-            playbooks=[
-                StructuredPlaybookContent(
-                    content="Agent should limit apologies and focus on clear, concise responses during billing inquiries.",
-                    trigger="User reports a billing concern",
-                )
-            ]
+        make_tc, _make_stop = tool_call_completion
+        response = make_tc(
+            FINISH_EXTRACTION_TOOL_NAME,
+            {
+                "playbooks": [
+                    {
+                        "content": "Agent should limit apologies and focus on clear, concise responses during billing inquiries.",
+                        "trigger": "User reports a billing concern",
+                    }
+                ]
+            },
         )
 
-        request_context.prompt_manager = MagicMock()
-        request_context.prompt_manager.render_prompt.return_value = "mock prompt"
-        request_context.prompt_manager.get_active_version.return_value = "3.0.0"
-
-        with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
+        with (
+            patch("litellm.completion", side_effect=[response]),
+            patch(
+                "reflexio.server.services.extraction.resumable_agent.is_resumable_extraction_agent_feature_enabled",
+                return_value=True,
+            ),
+            patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}),
+        ):
             result = extractor.extract_playbook_entries(
                 sample_request_interaction_models
             )

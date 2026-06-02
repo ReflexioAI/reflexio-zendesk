@@ -20,6 +20,7 @@ from psycopg2 import sql
 from reflexio.models.api_schema.retriever_schema import SearchUserProfileRequest
 from reflexio.models.api_schema.service_schemas import (
     NEVER_EXPIRES_TIMESTAMP,
+    Interaction,
     ProfileTimeToLive,
     Request,
     UserProfile,
@@ -132,3 +133,48 @@ def test_postgres_opensearch_profile_search_round_trip(
     )
 
     assert [item.profile_id for item in results] == [profile.profile_id]
+
+
+@skip_in_precommit
+def test_postgres_opensearch_delete_all_requests_clears_interaction_index(
+    postgres_opensearch_storage: PostgresStorage,
+) -> None:
+    run_id = uuid.uuid4().hex[:8]
+    user_id = f"os-delete-user-{run_id}"
+    request_id = f"os-delete-request-{run_id}"
+    now = int(time.time())
+
+    postgres_opensearch_storage.add_request(
+        Request(
+            request_id=request_id,
+            user_id=user_id,
+            created_at=now,
+            source="docker-opensearch-delete-e2e",
+            agent_version="codex",
+            session_id=f"session-{run_id}",
+        )
+    )
+    postgres_opensearch_storage.add_user_interaction(
+        user_id,
+        Interaction(
+            interaction_id=101,
+            user_id=user_id,
+            request_id=request_id,
+            created_at=now,
+            role="User",
+            content="Delete all requests should also clear OpenSearch interactions.",
+        ),
+    )
+
+    assert postgres_opensearch_storage._opensearch is not None
+    index = postgres_opensearch_storage._opensearch.index_name("interactions")
+    assert (
+        postgres_opensearch_storage._opensearch.client.count(index=index)["count"] == 1
+    )
+
+    postgres_opensearch_storage.delete_all_requests()
+
+    assert postgres_opensearch_storage.get_user_interaction(user_id) == []
+    assert (
+        postgres_opensearch_storage._opensearch.client.count(index=index)["count"] == 0
+    )

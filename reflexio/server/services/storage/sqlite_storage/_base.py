@@ -409,6 +409,16 @@ def _row_to_interaction(row: sqlite3.Row) -> Interaction:
 
 def _row_to_request(row: sqlite3.Row) -> Request:
     d = dict(row)
+    metadata_raw = d.get("metadata") or "{}"
+    try:
+        parsed = _json_loads(metadata_raw)
+        metadata = parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        logger.warning(
+            "Malformed metadata JSON for request %s; defaulting to empty dict",
+            d.get("request_id"),
+        )
+        metadata = {}
     return Request(
         request_id=d["request_id"],
         user_id=d["user_id"],
@@ -416,6 +426,7 @@ def _row_to_request(row: sqlite3.Row) -> Request:
         source=d.get("source") or "",
         agent_version=d.get("agent_version") or "",
         session_id=d.get("session_id"),
+        metadata=metadata,
     )
 
 
@@ -449,6 +460,7 @@ def _row_to_user_playbook(
         source_span=d.get("source_span"),
         notes=d.get("notes"),
         reader_angle=d.get("reader_angle"),
+        polarity=d.get("polarity") or "positive",
     )
 
 
@@ -649,9 +661,14 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             self._create_vec_tables()
             self._migrate_vec_tables()
         # Run after DDL so tables exist on fresh databases
+        self._migrate_agent_runs_schema()
+        self._migrate_pending_tool_calls_schema()
         self._migrate_expanded_terms()
         self._migrate_agentic_signals()
         self._migrate_agent_playbook_source_windows()
+        self._migrate_request_metadata()
+        self._migrate_shadow_comparison_verdicts()
+        self._migrate_user_playbook_polarity()
         init_stall_state_table(self.conn)
         return True
 
@@ -1093,6 +1110,38 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                 logger.info("Added expanded_terms column to %s", table)
         self.conn.commit()
 
+    def _migrate_agent_runs_schema(self) -> None:
+        """Add resumable-agent run columns if missing from existing SQLite DBs."""
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(_agent_runs)").fetchall()
+        }
+        if not cols:
+            return
+        if "max_steps_remaining" not in cols:
+            self.conn.execute(
+                "ALTER TABLE _agent_runs ADD COLUMN max_steps_remaining INTEGER"
+            )
+            logger.info("Added max_steps_remaining column to _agent_runs")
+        self.conn.commit()
+
+    def _migrate_pending_tool_calls_schema(self) -> None:
+        """Add pending-tool-call columns if missing from existing SQLite DBs."""
+        cols = {
+            row["name"]
+            for row in self.conn.execute(
+                "PRAGMA table_info(_pending_tool_calls)"
+            ).fetchall()
+        }
+        if not cols:
+            return
+        if "superseded_by" not in cols:
+            self.conn.execute(
+                "ALTER TABLE _pending_tool_calls ADD COLUMN superseded_by TEXT"
+            )
+            logger.info("Added superseded_by column to _pending_tool_calls")
+        self.conn.commit()
+
     def _migrate_agentic_signals(self) -> None:
         """Add source_span/notes/reader_angle columns if missing.
 
@@ -1109,6 +1158,26 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                 if col not in cols:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")  # noqa: S608
                     logger.info("Added %s column to %s", col, table)
+        self.conn.commit()
+
+    def _migrate_user_playbook_polarity(self) -> None:
+        """Add the ``polarity`` column to ``user_playbooks`` if missing.
+
+        Backfill-safe: existing rows default to ``'positive'``. Required for
+        databases created before per-rule polarity was introduced.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(user_playbooks)").fetchall()
+        }
+        if not cols:
+            return
+        if "polarity" not in cols:
+            self.conn.execute(
+                "ALTER TABLE user_playbooks "
+                "ADD COLUMN polarity TEXT NOT NULL DEFAULT 'positive'"
+            )
+            logger.info("Added polarity column to user_playbooks")
         self.conn.commit()
 
     def _migrate_agent_playbook_source_windows(self) -> None:
@@ -1135,6 +1204,65 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             "ON agent_playbook_source_user_playbooks(user_playbook_id)"
         )
         self.conn.commit()
+
+    def _migrate_request_metadata(self) -> None:
+        """Add metadata column to requests for databases created before F2.
+
+        The column stores a JSON-encoded dict per request (see Request.metadata
+        in the Pydantic model). Backfill-safe: existing rows pick up the
+        ``'{}'`` default and round-trip as an empty dict.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(requests)").fetchall()
+        }
+        if not cols:
+            return
+        if "metadata" not in cols:
+            self.conn.execute(
+                "ALTER TABLE requests ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"
+            )
+            logger.info("Added metadata column to requests")
+        self.conn.commit()
+
+    def _migrate_shadow_comparison_verdicts(self) -> None:
+        """F1: create the shadow_comparison_verdicts table if missing.
+
+        Idempotent; safe to run on every startup. The PRAGMA-LBYL guard
+        avoids running the CREATE statements on every boot for
+        already-migrated DBs — mirrors the :meth:`_migrate_request_metadata`
+        pattern. The ``CREATE TABLE IF NOT EXISTS`` in :data:`_DDL` will
+        also create this table on a fresh database, so this helper is a
+        no-op there; its purpose is explicit symmetry with the per-feature
+        migration convention and a single named hook the disk/supabase
+        backends in Tasks 6/7 can mirror.
+        """
+        cur = self.conn.execute("PRAGMA table_info(shadow_comparison_verdicts)")
+        cols = cur.fetchall()
+        if cols:
+            return
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS shadow_comparison_verdicts (
+                verdict_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                interaction_id          TEXT    NOT NULL,
+                session_id              TEXT    NOT NULL,
+                agent_version           TEXT    NOT NULL,
+                reflexio_is_request_1   INTEGER NOT NULL,
+                better_request          TEXT    NOT NULL CHECK (better_request IN ('1','2','tie')),
+                is_significantly_better INTEGER NOT NULL,
+                comparison_reason       TEXT,
+                judge_prompt_version    TEXT    NOT NULL,
+                created_at              TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_session
+                ON shadow_comparison_verdicts (session_id, agent_version);
+            CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_created_at
+                ON shadow_comparison_verdicts (created_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_prompt_v
+                ON shadow_comparison_verdicts (judge_prompt_version);
+        """)
+        self.conn.commit()
+        logger.info("Created shadow_comparison_verdicts table (F1 migration)")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1491,7 +1619,8 @@ CREATE TABLE IF NOT EXISTS requests (
     created_at TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT '',
     agent_version TEXT NOT NULL DEFAULT '',
-    session_id TEXT
+    session_id TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id);
 CREATE INDEX IF NOT EXISTS idx_requests_session_id ON requests(session_id);
@@ -1515,7 +1644,8 @@ CREATE TABLE IF NOT EXISTS user_playbooks (
     expanded_terms TEXT,
     source_span TEXT,
     notes TEXT,
-    reader_angle TEXT
+    reader_angle TEXT,
+    polarity TEXT NOT NULL DEFAULT 'positive'
 );
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_playbook_name ON user_playbooks(playbook_name);
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_agent_version ON user_playbooks(agent_version);
@@ -1657,6 +1787,80 @@ CREATE TABLE IF NOT EXISTS _operation_state (
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS _agent_runs (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    extractor_kind TEXT NOT NULL,
+    extractor_name TEXT NOT NULL,
+    user_id TEXT,
+    request_id TEXT NOT NULL,
+    agent_version TEXT,
+    source TEXT,
+    source_interaction_ids TEXT NOT NULL DEFAULT '[]',
+    window_start_interaction_id INTEGER,
+    window_end_interaction_id INTEGER,
+    extractor_config_hash TEXT,
+    status TEXT NOT NULL,
+    generation_request_snapshot TEXT NOT NULL DEFAULT '{}',
+    service_config_snapshot TEXT,
+    agent_context_snapshot TEXT,
+    committed_output TEXT,
+    pending_tool_call_ids TEXT NOT NULL DEFAULT '[]',
+    max_steps_remaining INTEGER,
+    resume_attempts INTEGER NOT NULL DEFAULT 0,
+    finalization_attempts INTEGER NOT NULL DEFAULT 0,
+    next_resume_at TEXT,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    agent_completed_at TEXT,
+    finalized_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expires_at TEXT,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_ready ON _agent_runs(status, next_resume_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_binding ON _agent_runs(org_id, extractor_kind, extractor_name, user_id);
+
+CREATE TABLE IF NOT EXISTS _pending_tool_calls (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    user_id TEXT,
+    scope TEXT NOT NULL DEFAULT '{}',
+    scope_hash TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    dedup_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    question_text TEXT NOT NULL,
+    answer_format TEXT,
+    args TEXT NOT NULL DEFAULT '{}',
+    tags TEXT NOT NULL DEFAULT '[]',
+    result TEXT,
+    embedding TEXT,
+    superseded_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    resolved_at TEXT,
+    expires_at TEXT NOT NULL,
+    cache_until TEXT NOT NULL,
+    valid_until TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_tool_calls_active ON _pending_tool_calls(org_id, scope_hash, tool_name, dedup_key, status, cache_until);
+CREATE INDEX IF NOT EXISTS idx_pending_tool_calls_prior ON _pending_tool_calls(org_id, scope_hash, tool_name, status, valid_until);
+
+CREATE TABLE IF NOT EXISTS _run_tool_dependencies (
+    run_id TEXT NOT NULL,
+    pending_tool_call_id TEXT NOT NULL,
+    dependency_kind TEXT NOT NULL DEFAULT 'followup',
+    resolved_at TEXT,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (run_id, pending_tool_call_id),
+    FOREIGN KEY (run_id) REFERENCES _agent_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (pending_tool_call_id) REFERENCES _pending_tool_calls(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_run_tool_dependencies_pending ON _run_tool_dependencies(pending_tool_call_id, resolved_at, consumed_at);
+CREATE INDEX IF NOT EXISTS idx_run_tool_dependencies_ready ON _run_tool_dependencies(run_id, resolved_at, consumed_at);
+
 -- FTS5 virtual tables
 CREATE VIRTUAL TABLE IF NOT EXISTS interactions_fts USING fts5(
     content, user_action_description,
@@ -1689,5 +1893,57 @@ CREATE TABLE IF NOT EXISTS share_links (
     created_by_email TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_share_links_resource ON share_links(resource_type, resource_id);
+
+-- ============================================================================
+-- Braintrust connector (Plan C-backend)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS braintrust_connection (
+    org_id TEXT PRIMARY KEY,
+    api_key_enc TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    workspace_name TEXT NOT NULL DEFAULT '',
+    project_ids TEXT NOT NULL DEFAULT '[]',
+    last_sync_ts INTEGER,
+    last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS imported_score (
+    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_run_id TEXT NOT NULL,
+    session_id TEXT,
+    scorer_name TEXT NOT NULL,
+    value REAL NOT NULL,
+    ts INTEGER NOT NULL,
+    UNIQUE (org_id, source, source_run_id, scorer_name)
+);
+CREATE INDEX IF NOT EXISTS idx_imported_score_session
+    ON imported_score (org_id, session_id) WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_imported_score_ts ON imported_score (org_id, ts);
+
+-- ============================================================================
+-- Per-turn shadow comparison verdicts (F1)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS shadow_comparison_verdicts (
+    verdict_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    interaction_id          TEXT    NOT NULL,
+    session_id              TEXT    NOT NULL,
+    agent_version           TEXT    NOT NULL,
+    reflexio_is_request_1   INTEGER NOT NULL,
+    better_request          TEXT    NOT NULL CHECK (better_request IN ('1','2','tie')),
+    is_significantly_better INTEGER NOT NULL,
+    comparison_reason       TEXT,
+    judge_prompt_version    TEXT    NOT NULL,
+    created_at              TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_session
+    ON shadow_comparison_verdicts (session_id, agent_version);
+CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_created_at
+    ON shadow_comparison_verdicts (created_at);
+CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_prompt_v
+    ON shadow_comparison_verdicts (judge_prompt_version);
 
 """

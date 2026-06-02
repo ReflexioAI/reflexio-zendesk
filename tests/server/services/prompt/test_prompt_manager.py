@@ -236,7 +236,23 @@ class TestPromptManager:
             pytest.fail("Validation errors:\n" + "\n".join(errors))
 
     def test_exactly_one_active_per_prompt(self):
-        """Test that each prompt directory has exactly one active version."""
+        """Test that each prompt directory has exactly one active version.
+
+        Fully-deprecated prompt directories (every version marked
+        ``active: false``) are allowed and are listed in
+        ``deprecated_prompt_dirs``. They are kept on disk as a historical
+        record so verdicts produced by retired prompts can still be traced in
+        audit logs, but they no longer drive any production code path.
+        """
+        # F1 cleanup: the session-level shadow comparison code path was
+        # retracted because multi-turn shadow content suffers from
+        # trajectory contamination. Both prompts that backed that path are
+        # kept as historical records with every version marked inactive.
+        deprecated_prompt_dirs = {
+            "agent_success_evaluation_with_comparison",
+            "shadow_content_evaluation",
+        }
+
         current_dir = Path(prompt.__file__).parent
         prompt_bank_path = (current_dir / "prompt_bank").resolve()
 
@@ -261,10 +277,60 @@ class TestPromptManager:
                 except ValueError:
                     pass
 
-            if active_count != 1:
+            expected_active = 0 if prompt_dir.name in deprecated_prompt_dirs else 1
+            if active_count != expected_active:
                 errors.append(
-                    f"{prompt_dir.name}: {active_count} active versions (expected 1)"
+                    f"{prompt_dir.name}: {active_count} active versions "
+                    f"(expected {expected_active})"
                 )
 
         if errors:
             pytest.fail("Active version errors:\n" + "\n".join(errors))
+
+    def test_agentic_user_playbook_prompt_extracts_compact_task_recipes(self):
+        """Agentic UserPlaybook prompt preserves compact recipe guidance."""
+        rendered = PromptManager().render_prompt(
+            "extraction_user_playbook",
+            {
+                "sessions": "User requested a substantive task. Assistant completed it.",
+                "extraction_criteria": "Extract agent-performance playbooks.",
+                "max_steps": "12",
+            },
+        )
+
+        assert "Success Path Recipes" in rendered
+        assert "Failure/Avoidance Recipes" in rendered
+        assert "compact replay recipe" in rendered
+        assert "decisive source/artifact/signal" in rendered
+        assert "narrow verification" in rendered
+        assert "detour" in rendered
+
+    def test_classic_playbook_context_extracts_compact_task_recipes(self):
+        """Classic playbook prompt uses the same compact recipe shape."""
+        rendered = PromptManager().render_prompt(
+            "playbook_extraction_context",
+            {
+                "agent_context_prompt": "Agent context.",
+                "extraction_definition_prompt": "Extract playbooks.",
+                "tool_can_use": "Tools.",
+            },
+        )
+
+        assert "Success Path Recipes" in rendered
+        assert "reusable task structure" in rendered
+        assert "compact replay recipe" in rendered
+        assert "decisive source/artifact/signal" in rendered
+        assert "necessary constraints" in rendered
+        assert "Avoid:" in rendered
+        assert "Validate:" in rendered
+        assert "working-directory or import-path relationship" in rendered
+        assert "wrong working directories" in rendered
+        assert "failed command -> same goal succeeds" in rendered
+        assert "ignore benchmark sentinel/handoff mechanics" in rendered
+        assert "emit that setup recipe as its own playbook" in rendered
+        assert "Skip broad summaries" in rendered
+        assert "narrow verification" in rendered
+        assert "Do not add markdown headings" in rendered
+        assert "extra top-level keys" in rendered
+        assert "separate entries for those independent lessons" in rendered
+        assert "Do not add a separate polarity field" in rendered

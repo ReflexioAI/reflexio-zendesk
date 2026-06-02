@@ -26,6 +26,25 @@
 
 ---
 
+### Migration from claude_code integration (removed in this release)
+
+The `reflexio setup claude-code` command and its hook files have been removed.
+The replacement is **[claude-smart](https://github.com/ReflexioAI/claude-smart)**,
+a standalone Claude Code plugin distributed via npm.
+
+*This migration only removes the **hook/plugin installation** path. The local
+`claude-code` LLM provider routing (used to call Anthropic via the Claude Code
+CLI binary as a model backend) remains available — only remove obsolete hook
+entries, not your provider configuration.*
+
+**If you had the old integration installed**, your `.claude/settings.json` (per-project)
+or `~/.claude/settings.json` (global) likely has hook entries referencing files that no longer exist.
+Open the file and remove any `hooks` entries that reference paths under `reflexio/integrations/claude_code/`
+or `integrations/claude_code/`. Then run `npx claude-smart install` (or use the Claude Code plugin marketplace)
+for the modern equivalent.
+
+---
+
 ## What is Reflexio?
 Reflexio is an **AI agent self-improvement harness** that enables your AI agents to continuously learn from real user interactions. It turns user corrections into persisted behavioral improvements for agents and capturing successful execution paths for reuse.  
 
@@ -208,6 +227,7 @@ Reflexio will automatically generate profiles and extract playbooks in the backg
 - Session-level evaluation triggered automatically (10 min after last request)
 - Shadow comparison mode: A/B test regular vs shadow agent responses
 - Tool usage analysis for blocking issue detection
+- **Causal measurement of Reflexio's impact** — session-level A/B grouping on the Evaluation page driven by `Request.metadata.reflexio_retrieval_enabled` (with per-turn shadow comparison in development)
 
 [Read more about evaluation →](https://www.reflexio.ai/docs/examples/agent-evaluation)
 
@@ -281,9 +301,14 @@ client.set_config(reflexio.SetConfigRequest(
 
 Reflexio integrates with popular AI agent frameworks out of the box:
 
-- **[Claude Code](reflexio/integrations/claude_code/README.md)** -- Hook into Claude Code sessions to automatically capture corrections and preferences.
-- **[LangChain](reflexio/integrations/langchain/README.md)** -- Drop-in callbacks for LangChain chains and agents.
 - **[OpenClaw](reflexio/integrations/openclaw/README.md)** -- Native integration with the OpenClaw agent framework.
+
+> **Migration from the LangChain integration (removed in this release).** The
+> `reflexio.integrations.langchain` package and the `reflexio-client[langchain]`
+> extra have been removed. To inject Reflexio context into a LangChain chain or
+> agent, call the Reflexio client's search API directly and add the formatted
+> results to your prompt (e.g. as a system message) — no framework-specific glue
+> is required.
 
 ## Architecture
 

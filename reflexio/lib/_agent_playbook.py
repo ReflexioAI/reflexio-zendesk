@@ -24,6 +24,7 @@ from reflexio.models.api_schema.service_schemas import (
     PlaybookAggregationChangeLogResponse,
 )
 from reflexio.models.config_schema import SearchOptions
+from reflexio.server.tracing import profile_step
 
 
 class AgentPlaybookMixin(ReflexioBase):
@@ -140,8 +141,8 @@ class AgentPlaybookMixin(ReflexioBase):
 
         try:
             # Normalize playbooks - only keep required fields, reset others to defaults.
-            # Top-level structured fields (trigger, rationale, blocking_issue) are
-            # preserved so CLI callers and the aggregation pipeline don't lose them.
+            # Top-level structured fields (trigger, rationale) are preserved so CLI
+            # callers and the aggregation pipeline don't lose them.
             normalized_playbooks = [
                 AgentPlaybook(
                     agent_version=fb.agent_version,
@@ -149,7 +150,6 @@ class AgentPlaybookMixin(ReflexioBase):
                     content=fb.content,
                     trigger=fb.trigger,
                     rationale=fb.rationale,
-                    blocking_issue=fb.blocking_issue,
                     playbook_status=fb.playbook_status,
                     playbook_metadata=(fb.playbook_metadata or ""),
                 )
@@ -239,9 +239,16 @@ class AgentPlaybookMixin(ReflexioBase):
                 if query_embedding
                 else None
             )
-            agent_playbooks = self._get_storage().search_agent_playbooks(
-                search_request, options
-            )
+            with profile_step(
+                "search.storage",
+                entity_type="agent_playbooks",
+                search_mode=search_request.search_mode,
+                top_k=search_request.top_k,
+            ) as span:
+                agent_playbooks = self._get_storage().search_agent_playbooks(
+                    search_request, options
+                )
+                span.set_data("result_count", len(agent_playbooks))
             return SearchAgentPlaybookResponse(
                 success=True,
                 agent_playbooks=agent_playbooks,
@@ -296,7 +303,6 @@ class AgentPlaybookMixin(ReflexioBase):
             content=request.content,
             trigger=request.trigger,
             rationale=request.rationale,
-            blocking_issue=request.blocking_issue,
             playbook_status=request.playbook_status,
         )
         return UpdateAgentPlaybookResponse(

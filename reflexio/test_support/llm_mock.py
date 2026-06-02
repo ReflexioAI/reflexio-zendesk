@@ -1,8 +1,11 @@
 """Global LiteLLM mock for reflexio test suites.
 
 Patches ``litellm.completion`` with a deterministic mock that returns
-JSON responses based on prompt content heuristics.  E2E tests are
-excluded so they can make real API calls.
+JSON responses based on prompt content heuristics. E2E tests are
+excluded from the session-level autouse so they can make real API
+calls — but an e2e test that wants determinism can opt in via the
+``patched_litellm`` context manager (or the matching ``mock_llm``
+pytest fixture wired into the e2e conftest).
 
 Response payloads are sourced from the model registry
 (``llm_model_registry.py``) so they always validate against the Pydantic
@@ -17,12 +20,22 @@ Usage in conftest.py::
 
     def pytest_unconfigure(config):
         cleanup_llm_mock(config)
+
+Opt-in usage in one e2e test::
+
+    from reflexio.test_support.llm_mock import patched_litellm
+
+    def test_something_e2e():
+        with patched_litellm():
+            ...  # litellm.completion is mocked for the duration
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -43,6 +56,13 @@ def _create_mock_completion(
         content = str(registry["boolean_evaluation"].minimal_valid)
     elif "policy consolidation" in prompt_content:
         content = json.dumps(registry["playbook_aggregation"].minimal_valid)
+    elif (
+        "is_success to True" in prompt_content
+        and "is_escalated to True" in prompt_content
+    ):
+        # Anchor on two markers from the agent_success_evaluation prompt
+        # body — present in every variant of the success-eval prompt.
+        content = json.dumps(registry["agent_success_evaluation"].minimal_valid)
     elif '"playbooks"' in prompt_content:
         # Anchor on the schema marker every playbook-extraction prompt MUST
         # describe (the JSON output key the LLM is told to return). This is
@@ -62,6 +82,20 @@ def _create_mock_completion(
     return mock_response
 
 
+def _extraction_finish_args(prompt_content: str) -> dict[str, Any]:
+    """Pick the ``finish_extraction`` payload for an extraction tool-loop turn.
+
+    Profile and playbook extraction both run the always-on ``finish_extraction``
+    tool loop, so the mock must return the structured output as the *arguments*
+    of a ``finish_extraction`` tool call (not as message content). Routes on the
+    same schema marker the content-mode path uses.
+    """
+    registry = get_model_registry()
+    if '"playbooks"' in prompt_content:
+        return registry["playbook_extraction"].minimal_valid
+    return registry["profile_extraction"].minimal_valid
+
+
 def _mock_completion(*args: Any, **kwargs: Any) -> MagicMock:
     """Mock implementation for litellm.completion."""
     messages = kwargs.get("messages", args[0] if args else [])
@@ -69,6 +103,21 @@ def _mock_completion(*args: Any, **kwargs: Any) -> MagicMock:
     for message in messages:
         if isinstance(message, dict) and "content" in message:
             prompt_content += str(message["content"])
+
+    # Extraction now runs through the ``finish_extraction`` tool loop, which
+    # invokes ``litellm.completion`` with ``tools=``. In that mode the loop
+    # reads ``resp.tool_calls`` (not message content), so emit a single
+    # ``finish_extraction`` tool call carrying the structured output as args.
+    if kwargs.get("tools"):
+        # Imported lazily to avoid importing the extraction service stack at
+        # module load time (this module is imported by the root conftest).
+        from reflexio.server.services.extraction.resumable_agent import (
+            FINISH_EXTRACTION_TOOL_NAME,
+        )
+
+        return make_tool_call_response(
+            FINISH_EXTRACTION_TOOL_NAME, _extraction_finish_args(prompt_content)
+        )
 
     parse_structured = kwargs.get("response_format") is not None
     return _create_mock_completion(prompt_content, parse_structured)
@@ -116,6 +165,31 @@ def cleanup_llm_mock(config: Any) -> None:  # noqa: ARG001
     if _litellm_patcher:
         _litellm_patcher.stop()
         _litellm_patcher = None
+
+
+@contextmanager
+def patched_litellm() -> Iterator[None]:
+    """Opt-in patch for one e2e test that wants deterministic LLM responses.
+
+    The session-level ``configure_llm_mock`` skips e2e runs entirely so
+    historical e2e tests can hit real APIs. This context manager
+    re-enables the same mock for the scope of one test (or one block) —
+    useful for new e2e tests that need a predictable LLM response and
+    don't want to pay for or wait on a real provider.
+
+    Returns:
+        Iterator[None]: A context that patches ``litellm.completion``
+            on entry and restores the original on exit.
+    """
+    os.environ["MOCK_LLM_RESPONSE"] = "true"
+    patcher = patch("litellm.completion", side_effect=_mock_completion)
+    patcher.start()
+    try:
+        yield
+    finally:
+        patcher.stop()
+        # Leave MOCK_LLM_RESPONSE as-is — tests that read it should not
+        # depend on its lifetime being tied to a single context block.
 
 
 def make_tool_call_response(tool_name: str, args: dict[str, Any]) -> MagicMock:

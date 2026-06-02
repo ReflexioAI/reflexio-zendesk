@@ -34,6 +34,7 @@ handle_exceptions = PostgresStorageBase.handle_exceptions
 class RequestMixin(SchemaScopedClient):
     # Type hints for instance attributes/methods provided by PostgresStorageBase via MRO
     client: Any
+    _opensearch: Any
 
     # ==============================
     # Request methods
@@ -83,6 +84,10 @@ class RequestMixin(SchemaScopedClient):
         """
         # First delete all interactions associated with this request
         self._table("interactions").delete().eq("request_id", request_id).execute()
+        if self._opensearch:
+            self._opensearch.delete_by_filter(
+                "interactions", [{"term": {"request_id": request_id}}]
+            )
         # Then delete the request itself
         self._table("requests").delete().eq("request_id", request_id).execute()
 
@@ -115,6 +120,10 @@ class RequestMixin(SchemaScopedClient):
         # Delete all interactions for all requests in this session
         for request_id in request_ids:
             self._table("interactions").delete().eq("request_id", request_id).execute()
+        if self._opensearch:
+            self._opensearch.delete_by_filter(
+                "interactions", [{"terms": {"request_id": request_ids}}]
+            )
 
         # Delete all requests in this session
         self._table("requests").delete().eq("session_id", session_id).execute()
@@ -126,6 +135,8 @@ class RequestMixin(SchemaScopedClient):
         """Delete all requests and their associated interactions."""
         # First delete all interactions
         self._delete_all_text_keyed("interactions", "request_id")
+        if self._opensearch:
+            self._opensearch.delete_by_filter("interactions", [])
         # Then delete all requests
         self._delete_all_text_keyed("requests", "request_id")
 
@@ -136,6 +147,10 @@ class RequestMixin(SchemaScopedClient):
             return 0
         # First delete all interactions for these requests
         self._table("interactions").delete().in_("request_id", request_ids).execute()
+        if self._opensearch:
+            self._opensearch.delete_by_filter(
+                "interactions", [{"terms": {"request_id": list(request_ids)}}]
+            )
         # Then delete the requests
         response = (
             self._table("requests").delete().in_("request_id", request_ids).execute()

@@ -190,10 +190,6 @@ class PlaybookAggregator:
                 lines.append(f'Trigger: "{fb.trigger}"')
             if fb.rationale:
                 lines.append(f'Rationale: "{fb.rationale}"')
-            if fb.blocking_issue:
-                lines.append(
-                    f"Blocked by: [{fb.blocking_issue.kind.value}] {fb.blocking_issue.details}"
-                )
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks) if blocks else "(No playbook items)"
 
@@ -202,11 +198,18 @@ class PlaybookAggregator:
         """
         Extract a direction key from a user playbook for similarity grouping.
 
+        Returns the raw content used for token-overlap comparison. Polarity is
+        intentionally NOT encoded into this key — embedding it as a prefix
+        token (e.g. ``positive::ask clarifying questions``) does not actually
+        prevent cross-polarity grouping because ``_token_overlap`` splits on
+        whitespace and the prefix is only one token out of many. Polarity is
+        gated explicitly in ``_group_playbooks_by_direction``.
+
         Args:
             fb: A user playbook item
 
         Returns:
-            str: Content as the direction key for grouping
+            str: Content used as the direction key for grouping
         """
         return fb.content or ""
 
@@ -240,11 +243,14 @@ class PlaybookAggregator:
         threshold: float = 0.6,
     ) -> list[list[UserPlaybook]]:
         """
-        Group playbooks by similarity of their content.
+        Group playbooks by similarity of their content, gated by polarity.
 
-        Uses greedy single-linkage: each playbook is assigned to the first existing group
-        that has any member with sufficient token overlap. Groups are returned sorted by
-        size descending (largest first).
+        Uses greedy single-linkage: each playbook is assigned to the first existing
+        group that has any member with sufficient token overlap AND the same polarity.
+        Polarity is gated explicitly (not encoded into the comparison string) because
+        ``_token_overlap`` is token-set based and a single prefix token cannot mask
+        same-content cross-polarity matches at typical thresholds. Groups are returned
+        sorted by size descending (largest first).
 
         Args:
             cluster_playbooks: List of raw playbooks to group
@@ -260,7 +266,8 @@ class PlaybookAggregator:
             matched = False
             for group in groups:
                 if any(
-                    PlaybookAggregator._token_overlap(
+                    fb.polarity == group_fb.polarity
+                    and PlaybookAggregator._token_overlap(
                         key,
                         PlaybookAggregator._get_direction_key(group_fb),
                         threshold,
@@ -302,7 +309,7 @@ class PlaybookAggregator:
 
         if len(groups) <= 1:
             return self._format_flat(cluster_playbooks)
-        return self._format_grouped(groups, cluster_playbooks)
+        return self._format_grouped(groups)
 
     def _format_flat(self, cluster_playbooks: list[UserPlaybook]) -> str:
         """
@@ -335,7 +342,6 @@ class PlaybookAggregator:
             lines.append("RATIONALE summaries:")
             lines.extend(f"- {r}" for r in rationales)
 
-        self._append_blocking_issues(lines, cluster_playbooks)
         self._append_freeform_observations(lines, cluster_playbooks)
 
         return "\n".join(lines)
@@ -343,14 +349,12 @@ class PlaybookAggregator:
     def _format_grouped(
         self,
         groups: list[list[UserPlaybook]],
-        cluster_playbooks: list[UserPlaybook],
     ) -> str:
         """
         Format playbooks in grouped layout (used when conflicting directions are detected).
 
         Args:
             groups: AgentPlaybook groups sorted by size descending
-            cluster_playbooks: All playbooks in the cluster (for blocking issues / freeform)
 
         Returns:
             str: Formatted input with group headers and per-playbook fields
@@ -377,23 +381,7 @@ class PlaybookAggregator:
                     lines.extend(f"    {p}" for p in parts[1:])
             lines.append("")
 
-        self._append_blocking_issues(lines, cluster_playbooks)
-
         return "\n".join(lines)
-
-    @staticmethod
-    def _append_blocking_issues(
-        lines: list[str], cluster_playbooks: list[UserPlaybook]
-    ) -> None:
-        """Append blocking issues from cluster playbooks to output lines."""
-        blocking_issues = [
-            f"[{fb.blocking_issue.kind.value}] {fb.blocking_issue.details}"
-            for fb in cluster_playbooks
-            if fb.blocking_issue
-        ]
-        if blocking_issues:
-            lines.append("BLOCKED BY issues:")
-            lines.extend(f"- {issue}" for issue in blocking_issues)
 
     @staticmethod
     def _append_freeform_observations(
@@ -1376,7 +1364,6 @@ class PlaybookAggregator:
             content=playbook_content,
             trigger=structured.trigger,
             rationale=structured.rationale,
-            blocking_issue=structured.blocking_issue,
             playbook_status=PlaybookStatus.PENDING,
             playbook_metadata="",
         )
@@ -1386,13 +1373,6 @@ class PlaybookAggregator:
     ) -> PlaybookAggregatorConfig | None:
         root_config = self.configurator.get_config()
         playbook_config = getattr(root_config, "user_playbook_extractor_config", None)
-        if playbook_config is None or not isinstance(
-            getattr(playbook_config, "extractor_name", None), str
-        ):
-            legacy_configs = getattr(
-                root_config, "user_playbook_extractor_configs", None
-            )
-            playbook_config = legacy_configs[0] if legacy_configs else None
         if not playbook_config:
             return None
         if playbook_config.extractor_name == playbook_name:
