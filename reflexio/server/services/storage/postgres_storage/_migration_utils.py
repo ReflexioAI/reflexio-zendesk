@@ -572,6 +572,11 @@ COMMENT ON SCHEMA public IS 'standard public schema';
 """
 
 
+def _acquire_reflexio_db_lock(cursor: Any, lock_name: str) -> None:
+    """Serialize database-wide DDL across app processes."""
+    cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_name,))
+
+
 def execute_postgres_prerequisites(db_url: str) -> tuple[bool, str]:
     """Prepare database-level prerequisites for native Postgres storage."""
     try:
@@ -579,6 +584,7 @@ def execute_postgres_prerequisites(db_url: str) -> tuple[bool, str]:
             closing(psycopg2.connect(db_url)) as conn,
             closing(conn.cursor()) as cursor,
         ):
+            _acquire_reflexio_db_lock(cursor, "reflexio.postgres_prerequisites")
             cursor.execute(_POSTGRES_PREREQUISITES_SQL)
             conn.commit()
         return True, "Postgres prerequisites are ready"
@@ -786,6 +792,7 @@ def execute_migration(
             closing(psycopg2.connect(db_url)) as conn,
             closing(conn.cursor()) as cursor,
         ):
+            _acquire_reflexio_db_lock(cursor, "reflexio.postgres_migrations")
             tracking_schema, tracking_table = _schema_tracking_table(schema)
             if schema == "public":
                 cursor.execute("CREATE SCHEMA IF NOT EXISTS supabase_migrations;")

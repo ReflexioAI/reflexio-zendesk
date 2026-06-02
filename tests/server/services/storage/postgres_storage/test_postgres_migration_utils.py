@@ -1,13 +1,16 @@
 """Tests for native Postgres migration SQL rendering."""
 
 from reflexio.server.services.storage.postgres_storage._migration_utils import (
+    _MIGRATION_DIR,
     get_latest_migration_version,
     render_migration_sql_for_backend,
 )
 
 
 def test_latest_migration_version_uses_packaged_migrations() -> None:
-    assert get_latest_migration_version() == "20260525000000"
+    latest_migration = sorted(_MIGRATION_DIR.glob("*.sql"))[-1].name.split("_")[0]
+
+    assert get_latest_migration_version() == latest_migration
 
 
 def test_postgres_renderer_filters_supabase_only_sql() -> None:
