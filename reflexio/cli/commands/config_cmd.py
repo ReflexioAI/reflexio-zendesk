@@ -117,7 +117,7 @@ def show_local(ctx: typer.Context) -> None:
     resolved = resolve_storage(None)  # full resolution without CLI flag
     config_path = default_config_path()
     config_exists = config_path.exists()
-    resolved_mode = "local" if resolved in ("sqlite", "disk") else "cloud"
+    resolved_mode = "local" if resolved == "sqlite" else "cloud"
 
     json_mode: bool = ctx.obj.json_mode
 
@@ -329,8 +329,8 @@ def update_config(
             error_type="validation",
             message="Must provide one of --data, --file, or one or more --field",
             hint=(
-                'Examples: --data \'{"extraction_backend":"classic"}\'  |  '
-                "--file partial.json  |  --field extraction_backend=classic"
+                "Examples: --data '{\"shadow_mode_enabled\":true}'  |  "
+                "--file partial.json  |  --field skip_should_run_check=true"
             ),
             exit_code=EXIT_VALIDATION,
         )

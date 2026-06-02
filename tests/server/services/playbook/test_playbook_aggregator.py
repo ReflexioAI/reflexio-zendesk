@@ -546,7 +546,7 @@ class TestGetPlaybookAggregatorConfig:
             extraction_definition_prompt="prompt",
             aggregation_config=fac,
         )
-        agg.configurator.get_config.return_value.user_playbook_extractor_configs = [afc]
+        agg.configurator.get_config.return_value.user_playbook_extractor_config = afc
 
         result = agg._get_playbook_aggregator_config("my_fb")
 
@@ -558,13 +558,13 @@ class TestGetPlaybookAggregatorConfig:
             extractor_name="other",
             extraction_definition_prompt="prompt",
         )
-        agg.configurator.get_config.return_value.user_playbook_extractor_configs = [afc]
+        agg.configurator.get_config.return_value.user_playbook_extractor_config = afc
 
         assert agg._get_playbook_aggregator_config("missing") is None
 
     def test_returns_none_when_no_playbook_configs(self):
         agg = _make_aggregator()
-        agg.configurator.get_config.return_value.user_playbook_extractor_configs = None
+        agg.configurator.get_config.return_value.user_playbook_extractor_config = None
 
         assert agg._get_playbook_aggregator_config("any") is None
 
@@ -589,7 +589,7 @@ class TestRun:
             extraction_definition_prompt="prompt",
             aggregation_config=fac,
         )
-        agg.configurator.get_config.return_value.user_playbook_extractor_configs = [afc]
+        agg.configurator.get_config.return_value.user_playbook_extractor_config = afc
         # storage returns
         agg.storage.count_user_playbooks.return_value = 5
         agg.storage.get_agent_playbooks.return_value = []
@@ -599,7 +599,7 @@ class TestRun:
 
     def test_no_config_returns_early(self):
         agg = _make_aggregator()
-        agg.configurator.get_config.return_value.user_playbook_extractor_configs = None
+        agg.configurator.get_config.return_value.user_playbook_extractor_config = None
 
         req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
         agg.run(req)
@@ -616,7 +616,7 @@ class TestRun:
             extraction_definition_prompt="prompt",
             aggregation_config=fac,
         )
-        agg.configurator.get_config.return_value.user_playbook_extractor_configs = [afc]
+        agg.configurator.get_config.return_value.user_playbook_extractor_config = afc
 
         req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
         agg.run(req)
@@ -633,7 +633,7 @@ class TestRun:
             extraction_definition_prompt="prompt",
             aggregation_config=fac,
         )
-        agg.configurator.get_config.return_value.user_playbook_extractor_configs = [afc]
+        agg.configurator.get_config.return_value.user_playbook_extractor_config = afc
         agg.storage.count_user_playbooks.return_value = 1
 
         req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
@@ -1207,6 +1207,68 @@ class TestProcessAggregationResponse:
         assert result.trigger == "when testing"
         assert result.content == "do something"
         assert result.playbook_status == PlaybookStatus.PENDING
+
+
+# ---------------------------------------------------------------------------
+# _group_playbooks_by_direction — polarity isolation
+# ---------------------------------------------------------------------------
+
+
+def _make_pb(
+    content: str,
+    polarity: str = "positive",
+    rid: int = 1,
+) -> UserPlaybook:
+    """Build a UserPlaybook with explicit content and polarity for grouping tests."""
+    return UserPlaybook(
+        user_playbook_id=rid,
+        agent_version="v1",
+        request_id=f"req-{rid}",
+        playbook_name="test_fb",
+        content=content,
+        polarity=polarity,  # type: ignore[arg-type]
+    )
+
+
+def test_aggregator_separates_positive_and_negative_polarity():
+    """When a cluster contains both positive and negative playbooks on similar
+    content, the aggregator must group them by polarity."""
+    cluster = [
+        _make_pb(content="Recommend X", polarity="positive", rid=1),
+        _make_pb(content="Recommend X (variant)", polarity="positive", rid=2),
+        _make_pb(content="Avoid X", polarity="negative", rid=3),
+    ]
+    groups = PlaybookAggregator._group_playbooks_by_direction(cluster, threshold=0.6)
+    # Expect 2 groups: one for positive, one for negative
+    polarities_per_group = [{p.polarity for p in g} for g in groups]
+    assert {"positive"} in polarities_per_group
+    assert {"negative"} in polarities_per_group
+    # And no group mixes polarities
+    assert all(len(pset) == 1 for pset in polarities_per_group)
+
+
+def test_aggregator_splits_identical_content_across_polarities():
+    """Regression: an explicit polarity gate (not a string prefix) is required.
+
+    Previously, polarity was smuggled into ``_get_direction_key`` as a prefix
+    token (``f"{polarity}::{content}"``), but ``_token_overlap`` is set-based
+    over whitespace-split tokens — so two playbooks with identical multi-token
+    content but opposite polarity would still overlap at 3/4 tokens and land
+    in the same group at the default 0.6 threshold. This test ensures the
+    grouping routine gates on ``fb.polarity`` explicitly.
+    """
+    content = "ask clarifying questions before proceeding"
+    cluster = [
+        _make_pb(content=content, polarity="positive", rid=1),
+        _make_pb(content=content, polarity="negative", rid=2),
+    ]
+    groups = PlaybookAggregator._group_playbooks_by_direction(cluster, threshold=0.6)
+    assert len(groups) == 2, (
+        f"identical content across polarities must split into 2 groups, got {groups}"
+    )
+    polarities_per_group = [{p.polarity for p in g} for g in groups]
+    assert {"positive"} in polarities_per_group
+    assert {"negative"} in polarities_per_group
 
 
 def test_playbook_aggregation_prompt_specifies_structured_format():

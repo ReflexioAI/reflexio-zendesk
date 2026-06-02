@@ -1,6 +1,9 @@
 import asyncio
+import inspect
 import logging
+import threading
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import (
@@ -19,6 +22,25 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from reflexio.models.api_schema.braintrust_schema import (
+    BraintrustStatusResponse,
+    ConnectBraintrustRequest,
+    ConnectBraintrustResponse,
+    SelectProjectsRequest,
+    SelectProjectsResponse,
+    SyncBraintrustResponse,
+)
+from reflexio.models.api_schema.eval_overview_schema import (
+    GetEvaluationOverviewRequest,
+    GetEvaluationOverviewResponse,
+    GetRecentShadowComparisonsResponse,
+    GradeOnDemandRequest,
+    GradeOnDemandResponse,
+    RegenerateFailure,
+    RegenerateRequest,
+    RegenerateStartResponse,
+    RegenerateStatusResponse,
+)
 from reflexio.models.api_schema.retriever_schema import (
     GetAgentPlaybooksRequest,
     GetAgentPlaybooksViewResponse,
@@ -133,6 +155,7 @@ from reflexio.server._auth import DEFAULT_ORG_ID, default_get_org_id
 from reflexio.server.api_endpoints import (
     account_api,
     health_api,
+    pending_tool_call_api,
     publisher_api,
     stall_state_api,
 )
@@ -141,41 +164,20 @@ from reflexio.server.cache.reflexio_cache import (
     invalidate_reflexio_cache,
 )
 from reflexio.server.correlation import correlation_id_var, generate_correlation_id
-
-logger = logging.getLogger(__name__)
-
-_LEGACY_EXTRACTOR_PARTIAL_FIELDS: tuple[tuple[str, str], ...] = (
-    ("profile_extractor_configs", "profile_extractor_config"),
-    ("user_playbook_extractor_configs", "user_playbook_extractor_config"),
-    ("playbook_configs", "user_playbook_extractor_config"),
-    ("agent_feedback_configs", "user_playbook_extractor_config"),
+from reflexio.server.operation_limiter import (
+    OperationName,
+    limiter_http_exception,
+    run_with_operation_limit,
+)
+from reflexio.server.services.agent_success_evaluation.group_evaluation_runner import (
+    run_group_evaluation,
+)
+from reflexio.server.services.agent_success_evaluation.regen_jobs import (
+    REGEN_JOBS,
+    run_regen,
 )
 
-
-def _normalize_legacy_extractor_partial(partial: dict[str, Any]) -> dict[str, Any]:
-    """Map legacy extractor list keys in PATCH payloads to canonical fields.
-
-    ``/api/update_config`` merges partial payloads over a serialized existing
-    config that already contains canonical extractor fields. Schema-level
-    migration cannot tell which keys came from the client, so legacy keys are
-    normalized before the merge.
-    """
-    normalized = dict(partial)
-    for legacy_name, canonical_name in _LEGACY_EXTRACTOR_PARTIAL_FIELDS:
-        if legacy_name not in partial:
-            continue
-        if canonical_name in partial or canonical_name in normalized:
-            normalized.pop(legacy_name, None)
-            continue
-
-        legacy_value = partial[legacy_name]
-        if isinstance(legacy_value, list):
-            normalized[canonical_name] = legacy_value[0] if legacy_value else None
-        else:
-            normalized[canonical_name] = legacy_value
-        normalized.pop(legacy_name, None)
-    return normalized
-
+logger = logging.getLogger(__name__)
 
 # Re-exported for backwards compatibility — callers that did
 # ``from reflexio.server.api import default_get_org_id`` or ``DEFAULT_ORG_ID``
@@ -205,6 +207,22 @@ def get_rate_limit_key(request: Request) -> str:
 
 # Initialize rate limiter
 limiter = Limiter(key_func=get_rate_limit_key)
+
+
+def _run_limited_api[T](
+    org_id: str,
+    operation: OperationName,
+    fn: Callable[[], T],
+) -> T:
+    try:
+        return run_with_operation_limit(
+            org_id=org_id,
+            operation=operation,
+            fn=fn,
+        )
+    except TimeoutError as exc:
+        http_exc = limiter_http_exception(operation)
+        raise http_exc from exc
 
 
 def configure_rate_limiter(key_func: Callable[..., str]) -> None:
@@ -393,11 +411,29 @@ def publish_user_interaction(
 ) -> PublishUserInteractionResponse:
     if wait_for_response:
         # Process synchronously so the caller gets the real result
-        return publisher_api.add_user_interaction(org_id=org_id, request=payload)
+        return _run_limited_api(
+            org_id,
+            "publish",
+            lambda: publisher_api.add_user_interaction(org_id=org_id, request=payload),
+        )
+
+    def _limited_publish_task() -> None:
+        try:
+            run_with_operation_limit(
+                org_id=org_id,
+                operation="publish",
+                fn=lambda: publisher_api.add_user_interaction(
+                    org_id=org_id, request=payload
+                ),
+            )
+        except TimeoutError:
+            logger.warning(
+                "Dropped queued publish for org %s because publish limiter is saturated",
+                org_id,
+            )
+
     # Run in background — caller gets immediate acknowledgement
-    background_tasks.add_task(
-        publisher_api.add_user_interaction, org_id=org_id, request=payload
-    )
+    background_tasks.add_task(_limited_publish_task)
     return PublishUserInteractionResponse(
         success=True, message="Interaction queued for processing"
     )
@@ -486,7 +522,11 @@ def search_user_profiles(
     payload: SearchUserProfileRequest,
     org_id: str = Depends(default_get_org_id),
 ) -> SearchProfilesViewResponse:
-    response = get_reflexio(org_id=org_id).search_user_profiles(payload)
+    response = _run_limited_api(
+        org_id,
+        "search",
+        lambda: get_reflexio(org_id=org_id).search_user_profiles(payload),
+    )
     return SearchProfilesViewResponse(
         success=response.success,
         user_profiles=[to_profile_view(p) for p in response.user_profiles],
@@ -515,7 +555,11 @@ def rerank_user_profiles(
     Returns:
         SearchProfilesViewResponse: Reranked profiles, top_k entries.
     """
-    response = get_reflexio(org_id=org_id).rerank_user_profiles(payload)
+    response = _run_limited_api(
+        org_id,
+        "search",
+        lambda: get_reflexio(org_id=org_id).rerank_user_profiles(payload),
+    )
     return SearchProfilesViewResponse(
         success=response.success,
         user_profiles=[to_profile_view(p) for p in response.user_profiles],
@@ -545,8 +589,12 @@ def storage_stats(
     Returns:
         StorageStatsResponse: Counts and timestamp range for the user.
     """
-    return get_reflexio(org_id=org_id).storage_stats(
-        StorageStatsRequest(user_id=user_id)
+    return _run_limited_api(
+        org_id,
+        "search",
+        lambda: get_reflexio(org_id=org_id).storage_stats(
+            StorageStatsRequest(user_id=user_id)
+        ),
     )
 
 
@@ -561,7 +609,11 @@ def search_interactions(
     payload: SearchInteractionRequest,
     org_id: str = Depends(default_get_org_id),
 ) -> SearchInteractionsViewResponse:
-    response = get_reflexio(org_id=org_id).search_interactions(payload)
+    response = _run_limited_api(
+        org_id,
+        "search",
+        lambda: get_reflexio(org_id=org_id).search_interactions(payload),
+    )
     return SearchInteractionsViewResponse(
         success=response.success,
         interactions=[to_interaction_view(i) for i in response.interactions],
@@ -593,7 +645,11 @@ def search_user_playbooks_endpoint(
     Returns:
         SearchUserPlaybooksViewResponse: Response containing matching user playbooks
     """
-    response = get_reflexio(org_id=org_id).search_user_playbooks(payload)
+    response = _run_limited_api(
+        org_id,
+        "search",
+        lambda: get_reflexio(org_id=org_id).search_user_playbooks(payload),
+    )
     return SearchUserPlaybooksViewResponse(
         success=response.success,
         user_playbooks=[to_user_playbook_view(rf) for rf in response.user_playbooks],
@@ -625,7 +681,11 @@ def search_agent_playbooks_endpoint(
     Returns:
         SearchAgentPlaybooksViewResponse: Response containing matching agent playbooks
     """
-    response = get_reflexio(org_id=org_id).search_agent_playbooks(payload)
+    response = _run_limited_api(
+        org_id,
+        "search",
+        lambda: get_reflexio(org_id=org_id).search_agent_playbooks(payload),
+    )
     return SearchAgentPlaybooksViewResponse(
         success=response.success,
         agent_playbooks=[to_agent_playbook_view(fb) for fb in response.agent_playbooks],
@@ -658,7 +718,11 @@ def unified_search_endpoint(
     Returns:
         UnifiedSearchViewResponse: Combined search results
     """
-    response = get_reflexio(org_id=org_id).unified_search(payload, org_id=org_id)
+    response = _run_limited_api(
+        org_id,
+        "search",
+        lambda: get_reflexio(org_id=org_id).unified_search(payload, org_id=org_id),
+    )
     return UnifiedSearchViewResponse(
         success=response.success,
         profiles=[to_profile_view(p) for p in response.profiles],
@@ -1155,7 +1219,11 @@ def run_playbook_aggregation(
     payload: RunPlaybookAggregationRequest,
     org_id: str = Depends(default_get_org_id),
 ) -> RunPlaybookAggregationResponse:
-    return publisher_api.run_playbook_aggregation(org_id=org_id, request=payload)
+    return _run_limited_api(
+        org_id,
+        "aggregation",
+        lambda: publisher_api.run_playbook_aggregation(org_id=org_id, request=payload),
+    )
 
 
 @core_router.post("/api/set_config")
@@ -1229,8 +1297,7 @@ def update_config(
     existing = reflexio.request_context.configurator.get_config().model_dump(
         mode="python"
     )
-    normalized_partial = _normalize_legacy_extractor_partial(partial)
-    merged = {**existing, **normalized_partial}
+    merged = {**existing, **partial}
     # Pydantic validates the merged shape and rejects unknown / malformed
     # fields here, before storage validation in reflexio.set_config.
     # Convert ValidationError into 422 so callers passing a partial that
@@ -1543,6 +1610,616 @@ def get_playbook_application_stats(
     """
     reflexio = get_reflexio(org_id=org_id)
     return reflexio.get_playbook_application_stats(request)
+
+
+# ============================================================================
+# Braintrust connector (Plan C-backend)
+# ============================================================================
+
+
+@core_router.post(
+    "/api/braintrust/connect",
+    response_model=ConnectBraintrustResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("10/minute")
+def braintrust_connect(
+    request: Request,
+    payload: ConnectBraintrustRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> ConnectBraintrustResponse:
+    """Step 1: validate the Braintrust API key and list workspaces/projects.
+
+    Persists nothing — call `/api/braintrust/select_projects` to commit.
+
+    Args:
+        request (Request): The HTTP request object for rate limiting.
+        payload (ConnectBraintrustRequest): Customer's Braintrust API key.
+        org_id (str): Resolved by auth dependency.
+
+    Returns:
+        ConnectBraintrustResponse: Workspaces tree on success; `success=False`
+            with a message when the key is rejected.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.braintrust_connect(payload)
+
+
+@core_router.post(
+    "/api/braintrust/select_projects",
+    response_model=SelectProjectsResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("10/minute")
+def braintrust_select_projects(
+    request: Request,
+    payload: SelectProjectsRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> SelectProjectsResponse:
+    """Step 2: commit the Braintrust connection with selected projects.
+
+    The API key is encrypted at rest. Subsequent syncs use the persisted
+    connection until the customer calls DELETE /api/braintrust/connection.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.braintrust_select_projects(payload)
+
+
+@core_router.get(
+    "/api/braintrust/status",
+    response_model=BraintrustStatusResponse,
+    response_model_exclude_none=True,
+)
+def braintrust_status(
+    org_id: str = Depends(default_get_org_id),
+) -> BraintrustStatusResponse:
+    """Return Braintrust connection state. Never echoes the API key."""
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.braintrust_status()
+
+
+@core_router.delete("/api/braintrust/connection")
+@limiter.limit("10/minute")
+def braintrust_disconnect(
+    request: Request,
+    org_id: str = Depends(default_get_org_id),
+) -> dict:
+    """Delete the persisted Braintrust connection for the org.
+
+    Args:
+        org_id (str): Resolved by auth dependency.
+
+    Returns:
+        dict: ``{"success": True}`` on completion.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    reflexio.braintrust_disconnect()
+    return {"success": True}
+
+
+@core_router.post(
+    "/api/braintrust/sync",
+    response_model=SyncBraintrustResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("10/minute")
+def braintrust_sync(
+    request: Request,
+    org_id: str = Depends(default_get_org_id),
+) -> SyncBraintrustResponse:
+    """Trigger a one-shot sync of Braintrust scorer outputs.
+
+    Scheduled (cron) sync is a follow-up; for now the endpoint exists so
+    operators can drive a manual import.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.braintrust_sync()
+
+
+@core_router.post(
+    "/api/get_evaluation_overview",
+    response_model=GetEvaluationOverviewResponse,
+    response_model_exclude_none=True,
+)
+def get_evaluation_overview(
+    request: GetEvaluationOverviewRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> GetEvaluationOverviewResponse:
+    """Return the redesigned /evaluations page payload.
+
+    Aggregates hero state, four context tiles with deltas, top rule
+    attribution, and a corrections-per-session distribution into a single
+    response shaped exactly as the frontend renders it.
+
+    Args:
+        request (GetEvaluationOverviewRequest): Window + bucket granularity.
+        org_id (str): Organization ID resolved by the auth dependency.
+
+    Returns:
+        GetEvaluationOverviewResponse: Full overview payload.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.get_evaluation_overview(request)
+
+
+# ---------------------------------------------------------------------------
+# /api/evaluations/regenerate — replay the LLM judge over a window
+# ---------------------------------------------------------------------------
+
+
+@core_router.post(
+    "/api/evaluations/regenerate",
+    response_model=RegenerateStartResponse,
+    response_model_exclude_none=True,
+)
+def start_regenerate(
+    payload: RegenerateRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> RegenerateStartResponse:
+    """Start a regenerate job for one evaluator over a time window.
+
+    Args:
+        payload (RegenerateRequest): Evaluator name + window bounds.
+        org_id (str): Organization ID resolved by the auth dependency.
+
+    Returns:
+        RegenerateStartResponse: ``job_id`` to poll/cancel and ``total``
+            tuples queued.
+
+    Raises:
+        HTTPException: 400 when ``evaluation_name`` is not configured for
+            the org. 409 when a regenerate for the same (org, evaluator)
+            is already running. 503 when storage is not configured.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    config = reflexio.request_context.configurator.get_config()
+    success_config = getattr(config, "agent_success_config", None)
+    known = {success_config.evaluation_name} if success_config else set()
+    if payload.evaluation_name not in known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown evaluation_name '{payload.evaluation_name}'",
+        )
+
+    storage = reflexio.request_context.storage
+    if storage is None:
+        raise HTTPException(status_code=503, detail="Storage not configured")
+    descriptors = storage.get_session_ids_in_window(
+        from_ts=payload.from_ts, to_ts=payload.to_ts
+    )
+    try:
+        job = REGEN_JOBS.create(
+            org_id=org_id,
+            evaluation_name=payload.evaluation_name,
+            from_ts=payload.from_ts,
+            to_ts=payload.to_ts,
+            total=len(descriptors),
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    threading.Thread(
+        target=run_regen,
+        kwargs={
+            "job": job,
+            "request_context": reflexio.request_context,
+            "llm_client": reflexio.llm_client,
+        },
+        daemon=True,
+    ).start()
+    return RegenerateStartResponse(job_id=job.job_id, total=job.total)
+
+
+@core_router.get(
+    "/api/evaluations/regenerate/{job_id}",
+    response_model=RegenerateStatusResponse,
+    response_model_exclude_none=True,
+)
+def get_regenerate_status(
+    job_id: str,
+    org_id: str = Depends(default_get_org_id),
+) -> RegenerateStatusResponse:
+    """Poll the status of a regenerate job.
+
+    Args:
+        job_id (str): Opaque handle returned by POST /api/evaluations/regenerate.
+        org_id (str): Organization ID resolved by the auth dependency.
+
+    Returns:
+        RegenerateStatusResponse: Counters, status, and failure list.
+
+    Raises:
+        HTTPException: 404 when ``job_id`` is unknown or belongs to a
+            different org.
+    """
+    job = REGEN_JOBS.get(job_id)
+    if job is None or job.org_id != org_id:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    return RegenerateStatusResponse(
+        job_id=job.job_id,
+        status=job.status,
+        total=job.total,
+        completed=job.completed,
+        failed=job.failed,
+        failures=[
+            RegenerateFailure(session_id=f.session_id, reason=f.reason)
+            for f in job.failures
+        ],
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        # F3 informational counters — surface sampler + concurrency facts
+        # so the dashboard can render "n_sampled / total_candidates" and
+        # the configured worker cap without a second round-trip.
+        total_candidates=job.total_candidates,
+        sampled_count=job.sampled_count,
+        concurrency_limit=job.concurrency_limit,
+    )
+
+
+@core_router.delete("/api/evaluations/regenerate/{job_id}")
+def cancel_regenerate(
+    job_id: str,
+    org_id: str = Depends(default_get_org_id),
+) -> dict[str, str]:
+    """Request cancellation of a running regenerate job.
+
+    Sets the worker's cancel event; the worker checks the flag between
+    sessions and transitions to ``"cancelled"`` on its next iteration.
+
+    Args:
+        job_id (str): Opaque handle returned by POST /api/evaluations/regenerate.
+        org_id (str): Organization ID resolved by the auth dependency.
+
+    Returns:
+        dict[str, str]: ``{"status": "cancelled"}`` on successful flag set.
+
+    Raises:
+        HTTPException: 404 when ``job_id`` is unknown or belongs to a
+            different org.
+    """
+    job = REGEN_JOBS.get(job_id)
+    if job is None or job.org_id != org_id:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    REGEN_JOBS.cancel(job_id)
+    return {"status": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# /api/evaluations/grade_on_demand — single-session click-through grading
+# ---------------------------------------------------------------------------
+#
+# F3 sampling means most sessions in a regen window are NEVER graded —
+# the sampler keeps cost predictable by capping each (day, group) stratum
+# at ``Config.eval_sample_n_per_stratum``. Plan 3 (F1) surfaces a
+# bounded list of sessions in the UI; when a customer clicks one that
+# wasn't in the sampled subset, the frontend hits this endpoint to grade
+# it on demand. The 24h cache prevents repeated clicks from triggering
+# redundant LLM calls.
+
+_GRADE_ON_DEMAND_CACHE_TTL_SECONDS = 24 * 60 * 60
+_GRADE_ON_DEMAND_CACHE_KEY_PREFIX = "grade_on_demand"
+
+
+def _grade_on_demand_cache_key(
+    org_id: str, session_id: str, agent_version: str, evaluation_name: str
+) -> str:
+    """Build the operation_state key for the on-demand grading cache.
+
+    The key embeds every dimension that could change the verdict: org_id
+    (multi-tenant scope), session_id (the unit of work), agent_version
+    (eval results are versioned) and evaluation_name (one session can be
+    graded by multiple evaluators). Changing any dimension cuts a fresh
+    cache lane so customers never see a stale verdict from a different
+    evaluator.
+
+    Args:
+        org_id (str): Tenant identifier from the auth context.
+        session_id (str): Target session.
+        agent_version (str): Agent version filter.
+        evaluation_name (str): Evaluator config name.
+
+    Returns:
+        str: A namespaced key suitable for ``storage.upsert_operation_state``.
+    """
+    return (
+        f"{_GRADE_ON_DEMAND_CACHE_KEY_PREFIX}::{org_id}::{session_id}"
+        f"::{agent_version}::{evaluation_name}"
+    )
+
+
+def _read_grade_on_demand_cache(
+    storage: Any, cache_key: str, *, now: int
+) -> int | None:
+    """Return the cached ``result_id`` if a valid entry exists, else None.
+
+    Returns None on three conditions: no entry, malformed entry, or entry
+    whose ``last_graded_at`` is older than the 24h TTL. Keeps the handler
+    body focused on the happy path.
+
+    Args:
+        storage: The request's storage backend.
+        cache_key (str): Key produced by ``_grade_on_demand_cache_key``.
+        now (int): Current Unix-seconds wall-clock timestamp.
+
+    Returns:
+        int | None: Cached result_id when fresh, else None.
+    """
+    cached_state = storage.get_operation_state(cache_key)
+    if not cached_state:
+        return None
+    state = cached_state.get("operation_state")
+    if not isinstance(state, dict):
+        return None
+    last_graded_at = state.get("last_graded_at")
+    if not isinstance(last_graded_at, int):
+        return None
+    if (now - last_graded_at) >= _GRADE_ON_DEMAND_CACHE_TTL_SECONDS:
+        return None
+    cached_result_id = state.get("result_id")
+    return cached_result_id if isinstance(cached_result_id, int) else None
+
+
+def _resolve_session_user_id(storage: Any, session_id: str) -> str | None:
+    """Look up the user_id that owns a session_id without requiring it as input.
+
+    Uses ``get_sessions(session_id=...)`` because it's the only storage
+    method on ``BaseStorage`` that accepts session_id alone — every other
+    request-fetcher requires a user_id paired with it. Returns None when
+    the session has no requests, signalling NO_REQUESTS to the caller.
+
+    Args:
+        storage: The request's storage backend.
+        session_id (str): The target session whose owner to resolve.
+
+    Returns:
+        str | None: The user_id of the earliest request in the session,
+        or None when no requests exist.
+    """
+    sessions = storage.get_sessions(session_id=session_id, top_k=100)
+    rows = sessions.get(session_id) or []
+    if not rows:
+        return None
+    earliest = min(rows, key=lambda r: r.request.created_at)
+    return earliest.request.user_id
+
+
+def _find_fresh_result_id(
+    storage: Any,
+    *,
+    session_id: str,
+    evaluation_name: str,
+    agent_version: str,
+) -> int | None:
+    """Locate the result_id written by the most-recent grade for this triple.
+
+    The runner writes rows but doesn't return the id. Reading back through
+    ``get_agent_success_evaluation_results`` matches the pattern used by
+    the regen worker's prior-row capture (group_evaluation_runner step 5).
+
+    Args:
+        storage: The request's storage backend.
+        session_id (str): The graded session.
+        evaluation_name (str): The evaluator that produced the row.
+        agent_version (str): The version dimension.
+
+    Returns:
+        int | None: result_id of the latest matching row, or None if the
+        runner wrote nothing.
+    """
+    rows = storage.get_agent_success_evaluation_results(
+        limit=1000, agent_version=agent_version
+    )
+    matched = [
+        r
+        for r in rows
+        if r.session_id == session_id and r.evaluation_name == evaluation_name
+    ]
+    if not matched:
+        return None
+    latest = max(matched, key=lambda r: r.created_at)
+    return latest.result_id
+
+
+@core_router.post(
+    "/api/evaluations/grade_on_demand",
+    response_model=GradeOnDemandResponse,
+    response_model_exclude_none=False,
+)
+def grade_on_demand(
+    payload: GradeOnDemandRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> GradeOnDemandResponse:
+    """Grade a single session synchronously; serve cached results within 24h.
+
+    Flow:
+      1. Validate ``evaluation_name`` against the configured evaluators
+         (400 on miss — symmetric with /regenerate).
+      2. Read the operation_state cache; if a fresh entry exists, return it
+         with ``cached=True``.
+      3. Resolve the session's user_id from storage (skip with ``NO_REQUESTS``
+         when the session is unknown — surfaced as 200 + ``skipped_reason``
+         so the frontend's bounded-list click-through can handle stale ids
+         locally without polluting 5xx telemetry).
+      4. Invoke ``run_group_evaluation(force_regenerate=True)`` so the
+         "already evaluated" short-circuit doesn't suppress a customer's
+         explicit click.
+      5. Find the freshly-written result_id and persist it in the cache
+         with ``last_graded_at`` so future calls within 24h short-circuit.
+
+    Args:
+        payload (GradeOnDemandRequest): Session + version + evaluator triple.
+        org_id (str): Tenant identifier resolved by the auth dependency.
+
+    Returns:
+        GradeOnDemandResponse: Echoes ``session_id`` and carries either
+            a fresh ``result_id`` (``cached=False``), a cached one
+            (``cached=True``), or a ``skipped_reason`` (NO_REQUESTS).
+
+    Raises:
+        HTTPException: 400 when ``evaluation_name`` is not configured
+            for the org. 503 when storage is not configured.
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    config = reflexio.request_context.configurator.get_config()
+    success_config = getattr(config, "agent_success_config", None)
+    known = {success_config.evaluation_name} if success_config else set()
+    if payload.evaluation_name not in known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown evaluation_name '{payload.evaluation_name}'",
+        )
+
+    storage = reflexio.request_context.storage
+    if storage is None:
+        raise HTTPException(status_code=503, detail="Storage not configured")
+
+    cache_key = _grade_on_demand_cache_key(
+        org_id,
+        payload.session_id,
+        payload.agent_version,
+        payload.evaluation_name,
+    )
+    now = int(datetime.now(UTC).timestamp())
+
+    cached_result_id = _read_grade_on_demand_cache(storage, cache_key, now=now)
+    if cached_result_id is not None:
+        return GradeOnDemandResponse(
+            session_id=payload.session_id,
+            result_id=cached_result_id,
+            cached=True,
+            skipped_reason=None,
+        )
+
+    user_id = _resolve_session_user_id(storage, payload.session_id)
+    if user_id is None:
+        return GradeOnDemandResponse(
+            session_id=payload.session_id,
+            result_id=None,
+            cached=False,
+            skipped_reason="NO_REQUESTS",
+        )
+
+    # Two operation_state rows are intentionally written for this session:
+    #   1) `grade_on_demand::{org_id}::{session_id}::{agent_version}::{evaluation_name}`
+    #      — our 24h cache, set below after the result_id is resolved.
+    #   2) `agent_success_group_eval::{org_id}::{user_id}::{session_id}`
+    #      — the runner's own "evaluated" marker, written by
+    #      run_group_evaluation. Future background runs without
+    #      force_regenerate will skip this session as a result.
+    # The cache key namespaces are distinct so the two markers do not
+    # interfere; the explicit force_regenerate=True here is what makes
+    # an on-demand grade always do real work on a cache miss.
+    run_group_evaluation(
+        org_id=org_id,
+        user_id=user_id,
+        session_id=payload.session_id,
+        agent_version=payload.agent_version,
+        source=None,
+        request_context=reflexio.request_context,
+        llm_client=reflexio.llm_client,
+        force_regenerate=True,
+        evaluation_name=payload.evaluation_name,
+    )
+
+    result_id = _find_fresh_result_id(
+        storage,
+        session_id=payload.session_id,
+        evaluation_name=payload.evaluation_name,
+        agent_version=payload.agent_version,
+    )
+
+    storage.upsert_operation_state(
+        cache_key,
+        {"last_graded_at": now, "result_id": result_id},
+    )
+
+    return GradeOnDemandResponse(
+        session_id=payload.session_id,
+        result_id=result_id,
+        cached=False,
+        skipped_reason=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /api/evaluations/shadow_comparisons/recent — F1 drawer + Top 10 widget
+# ---------------------------------------------------------------------------
+#
+# Powers two surfaces on /evaluations:
+#   1. The drawer triggered from the per-turn comparison tile — shows the
+#      N most recent verdicts so customers can spot-check the judge.
+#   2. The "Top 10 disagreements" widget — fetches a wider pool and the
+#      frontend filters to ``is_significantly_better=True`` losses to surface
+#      actionable rule-correction candidates.
+#
+# Filtering is restricted to the org's currently pinned
+# ``shadow_comparison_judge_prompt_version`` so verdicts from an older rubric
+# never mix into the drawer. The 30-day lookback is a defensive cap that lets
+# the storage layer use an index range scan instead of a full table read.
+
+_RECENT_SHADOW_COMPARISONS_LOOKBACK_SECONDS = 30 * 24 * 60 * 60
+_RECENT_SHADOW_COMPARISONS_MAX_LIMIT = 100
+
+
+@core_router.get(
+    "/api/evaluations/shadow_comparisons/recent",
+    response_model=GetRecentShadowComparisonsResponse,
+)
+def get_recent_shadow_comparisons(
+    limit: int = 10,
+    org_id: str = Depends(default_get_org_id),
+) -> GetRecentShadowComparisonsResponse:
+    """Return the N most recent shadow comparison verdicts for the pinned rubric.
+
+    Filters to the org's currently pinned
+    ``Config.shadow_comparison_judge_prompt_version`` so verdicts produced
+    under an older rubric do not mix into the drawer or the Top 10
+    disagreements widget. Storage returns verdicts in ascending ``created_at``
+    order; we reverse to "newest first" and cap at ``limit``.
+
+    Args:
+        limit (int): Max verdicts to return. Clamped to ``[1, 100]``.
+            Default 10 — matches the size of the drawer and Top 10 widget.
+        org_id (str): Tenant identifier resolved by the auth dependency.
+
+    Returns:
+        GetRecentShadowComparisonsResponse: Verdicts in newest-first order.
+            Empty list when the backend does not support the
+            ``shadow_comparison_verdicts`` storage feature, when no verdicts
+            exist in the 30-day window, or when no verdicts match the pinned
+            prompt version.
+
+    Raises:
+        HTTPException: 503 when storage is not configured.
+    """
+    clamped_limit = max(1, min(int(limit), _RECENT_SHADOW_COMPARISONS_MAX_LIMIT))
+    reflexio = get_reflexio(org_id=org_id)
+    storage = reflexio.request_context.storage
+    if storage is None:
+        raise HTTPException(status_code=503, detail="Storage not configured")
+
+    config = reflexio.request_context.configurator.get_config()
+    pinned_version = (
+        config.shadow_comparison_judge_prompt_version
+        if config is not None
+        else "v1.0.0"
+    )
+
+    now = int(datetime.now(UTC).timestamp())
+    try:
+        verdicts = storage.get_shadow_comparison_verdicts(
+            from_ts=now - _RECENT_SHADOW_COMPARISONS_LOOKBACK_SECONDS,
+            to_ts=now,
+            judge_prompt_version=pinned_version,
+        )
+    except NotImplementedError:
+        # Backends that don't support shadow verdicts (e.g., Disk) should
+        # quietly return empty rather than 5xx — the surface degrades to
+        # "no data yet" in the UI.
+        return GetRecentShadowComparisonsResponse(verdicts=[])
+
+    # Storage contract returns ascending — flip to "newest first" and cap.
+    newest_first = list(reversed(verdicts))[:clamped_limit]
+    return GetRecentShadowComparisonsResponse(verdicts=newest_first)
 
 
 @core_router.post(
@@ -1920,12 +2597,44 @@ def create_app(
     from collections.abc import AsyncIterator
     from contextlib import asynccontextmanager
 
+    from reflexio.server._auth import default_get_org_id
+    from reflexio.server.api_endpoints.request_context import RequestContext
     from reflexio.server.llm.model_defaults import validate_llm_availability
+    from reflexio.server.services.extraction.resume_scheduler import (
+        maybe_start_resume_scheduler,
+    )
+
+    def _lifespan_org_id() -> str:
+        if get_org_id is None:
+            return default_get_org_id()
+        try:
+            signature = inspect.signature(get_org_id)
+        except (TypeError, ValueError):
+            return default_get_org_id()
+        if signature.parameters:
+            return default_get_org_id()
+        try:
+            return str(get_org_id())
+        except Exception:
+            logger.exception("Failed to resolve lifespan org_id; using default org")
+            return default_get_org_id()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         validate_llm_availability()
-        yield
+        # The scheduler discovers every org with resumable work each tick and
+        # drives a per-org worker with org-scoped claims, so it is not limited
+        # to the bootstrap org. The bootstrap org is only used to read config
+        # and to seed cross-org discovery.
+        scheduler = maybe_start_resume_scheduler(
+            lambda org_id: RequestContext(org_id=org_id),
+            bootstrap_org_id=_lifespan_org_id(),
+        )
+        try:
+            yield
+        finally:
+            if scheduler is not None:
+                scheduler.stop()
 
     app = FastAPI(docs_url="/docs", lifespan=lifespan)
 
@@ -1986,6 +2695,9 @@ def create_app(
 
     # Include stall_state routes
     app.include_router(stall_state_api.router)
+
+    # Include pending tool call routes
+    app.include_router(pending_tool_call_api.router)
 
     # Include additional routers
     for router in additional_routers or []:

@@ -1,5 +1,5 @@
 # Playbook Service
-Description: Playbook extraction, aggregation, and deduplication pipeline
+Description: Playbook extraction, aggregation, and consolidation pipeline
 
 > Part of the [Reflexio Server](../../README.md). See also the [Prompt Bank](../../prompt/prompt_bank/README.md) for prompt template details.
 
@@ -8,7 +8,7 @@ Description: Playbook extraction, aggregation, and deduplication pipeline
 - **Service Orchestrator**: `playbook_generation_service.py` - Manages playbook extraction lifecycle (regular, rerun, manual modes)
 - **Playbook Extractor**: `playbook_extractor.py` - Extracts user playbooks from interactions via LLM
 - **Playbook Aggregator**: `playbook_aggregator.py` - Clusters similar user playbooks and generates aggregated insights
-- **Playbook Deduplicator**: `playbook_deduplicator.py` - Merges duplicate playbooks from multiple extractors using LLM
+- **Playbook Consolidator**: `playbook_consolidator.py` - Reconciles newly extracted playbooks against existing storage via LLM. Decides per pair to merge as duplicates, prefer the new entry, prefer the existing entry, differentiate (split with refined triggers), or keep both as independent
 
 ## Supporting Files
 
@@ -24,7 +24,7 @@ Description: Playbook extraction, aggregation, and deduplication pipeline
 ```
 Interactions
   -> PlaybookExtractor (per-extractor, extraction-only, parallel)
-    -> PlaybookDeduplicator (deduplicates new vs existing DB playbooks)
+    -> PlaybookConsolidator (consolidates new vs existing DB playbooks)
       -> UserPlaybook (with optional blocking_issue) -> Storage
         -> PlaybookAggregator (manual trigger)
           -> AgentPlaybook (aggregated insights) -> Storage
@@ -54,9 +54,17 @@ Triggered manually via `/api/run_playbook_aggregation`. Clusters user playbooks 
 
 **Clustering**: Embeds user playbooks -> HDBSCAN clustering -> falls back to Agglomerative if too few clusters
 
-### Playbook Deduplication (`playbook_deduplicator.py`)
+### Playbook Consolidation (`playbook_consolidator.py`)
 
-Deduplicates newly extracted playbooks against existing playbooks in the database via LLM semantic matching. Identifies duplicates between new extractions and existing DB playbooks, merging where appropriate.
+Consolidates newly extracted playbooks against existing playbooks in the database via LLM semantic matching. For each NEW vs EXISTING pair the LLM returns one of five decision kinds, and the consolidator applies the chosen kind:
+
+- `duplicate` — merge multiple rows into one, archiving members and emitting one merged row.
+- `prefer_new` — archive the existing row and insert the new candidate unchanged.
+- `prefer_existing` — drop the new candidate; the existing row wins.
+- `differentiate` — archive the existing row and emit two refined rows (one per side) with sharpened triggers.
+- `independent` — both rows are kept; the new candidate is inserted alongside the existing row.
+
+A safety fallback inserts any new candidate that no decision consumed, so extracted data is never silently dropped on a malformed LLM response.
 
 ## Prompt IDs
 

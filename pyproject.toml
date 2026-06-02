@@ -21,6 +21,7 @@ dependencies = [
     "anthropic>=0.72.0",
     "litellm>=1.80.11",
     "braintrust>=0.12.0",
+    "cryptography>=45.0.0",
     "python-jose>=3.3.0",
     "passlib>=1.7.4",
     "tenacity>=9.0.0",
@@ -56,7 +57,6 @@ dependencies = [
 [project.optional-dependencies]
 vec = ["sqlite-vec>=0.1.6"]
 notebooks = ["pandas>=3.0.2"]
-langchain = ["langchain-core>=1.2.28"]
 benchmark = [
     "datasets>=4.8.4",
     "fire>=0.7.1",
@@ -210,7 +210,8 @@ ignore = [
 "__init__.py" = ["F401", "F403"]
 "tests/**" = ["S101", "ARG001", "ARG002", "PTH", "ANN", "S105", "S106", "S107", "S108"]
 "conftest.py" = ["ARG001"]
-"notebooks/**" = ["S101", "F821", "S105", "S106", "ANN", "PTH", "RET504", "S113", "ARG001"]
+"notebooks/**" = ["S101", "F403", "F405", "F821", "S105", "S106", "S110", "ANN", "PTH", "RET504", "S113", "ARG001", "PERF401"]
+"benchmark/**" = ["S101", "PTH", "G004", "ANN", "S607", "ARG001", "ARG005"]
 "reflexio/scripts/**" = ["S101", "G004", "ANN"]
 "reflexio/benchmarks/**" = ["S311"]
 "reflexio/server/api.py" = ["B008", "ARG001", "ARG002"]
@@ -231,7 +232,6 @@ indent-style = "space"
 [tool.pyright]
 include = ["reflexio", "tests"]
 exclude = [
-    "reflexio/integrations/langchain",
     "tests/test_scripts",
     "**/__pycache__",
     "**/.venv",

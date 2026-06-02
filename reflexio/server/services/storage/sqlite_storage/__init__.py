@@ -1,3 +1,4 @@
+from ._agent_run import SQLiteAgentRunMixin
 from ._base import (
     SQLiteStorageBase,
     _cosine_similarity,
@@ -11,11 +12,12 @@ from ._operations import OperationMixin
 from ._playbook import PlaybookMixin
 from ._profiles import ProfileMixin
 from ._requests import RequestMixin
+from ._shadow_verdicts import ShadowVerdictsMixin as SQLiteShadowVerdictsMixin
 from ._share_links import SQLiteShareLinkMixin
 from ._stall_state import (
+    SQLiteStallStateMixin,
     StallReason,
     StallState,
-    SQLiteStallStateMixin,
     clear_stall_state,
     get_stall_state,
     init_stall_state_table,
@@ -25,6 +27,7 @@ from ._stall_state import (
 
 
 class SQLiteStorage(
+    SQLiteAgentRunMixin,
     ProfileMixin,
     RequestMixin,
     PlaybookMixin,
@@ -32,6 +35,7 @@ class SQLiteStorage(
     ExtrasMixin,
     SQLiteShareLinkMixin,
     SQLiteStallStateMixin,
+    SQLiteShadowVerdictsMixin,
     SQLiteStorageBase,
 ):
     """SQLite-based storage with FTS5 and hybrid search."""

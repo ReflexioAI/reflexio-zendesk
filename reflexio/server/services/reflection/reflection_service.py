@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,9 @@ from reflexio.models.api_schema.domain.entities import (
 )
 from reflexio.server.llm.litellm_client import LiteLLMClient
 from reflexio.server.services.operation_state_utils import OperationStateManager
+from reflexio.server.services.polarity_utils import (
+    warn_if_polarity_content_mismatch,
+)
 from reflexio.server.services.reflection.reflection_extractor import (
     ReflectionExtractor,
 )
@@ -138,11 +142,35 @@ class ReflectionService:
             )
             return result
 
+        # Post-horizon filter: only send citations with enough follow-up context.
+        post_horizon_size = (
+            reflection_config.post_horizon_size if reflection_config else 3
+        )
+        eligible = _filter_citations_by_horizon(
+            citations=citations,
+            window=window_interactions,
+            post_horizon_size=post_horizon_size,
+            stride_size=stride_size,
+        )
+        deferred_count = len(citations) - len(eligible)
+        result.skipped_count += deferred_count
+        if not eligible:
+            mgr.update_extractor_bookmark(
+                REFLECTION_OPERATION_NAME,
+                processed_interactions=window_interactions,
+                user_id=request.user_id,
+            )
+            return result
+
+        eligible_citations = [e.citation for e in eligible]
+        horizon_by_key = {
+            (e.citation.kind, e.citation.real_id): e.has_full_horizon for e in eligible
+        }
         cited_profiles, cited_playbooks, missing = self._resolve_cited_rows(
             user_id=request.user_id,
-            citations=citations,
+            citations=eligible_citations,
         )
-        result.skipped_count = missing
+        result.skipped_count += missing
         result.considered_count = len(cited_profiles) + len(cited_playbooks)
         if result.considered_count == 0:
             mgr.update_extractor_bookmark(
@@ -166,6 +194,7 @@ class ReflectionService:
                 window_interactions=window_interactions,
                 cited_profiles=cited_profiles,
                 cited_user_playbooks=cited_playbooks,
+                horizon_by_key=horizon_by_key,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
@@ -182,11 +211,12 @@ class ReflectionService:
         playbooks_by_id = {p.user_playbook_id: p for p in cited_playbooks}
 
         for decision in output.decisions:
-            if decision.action == "no_change":
+            if not _is_revision(decision):
                 result.no_change_count += 1
                 continue
             try:
-                applied = self._apply_replace(
+                self._validate_decision(decision, profiles_by_id, playbooks_by_id)
+                applied, was_flip = self._apply_revision(
                     request=request,
                     decision=decision,
                     profiles_by_id=profiles_by_id,
@@ -204,7 +234,9 @@ class ReflectionService:
                 )
                 continue
             if applied:
-                result.replaced_count += 1
+                result.revised_count += 1
+                if was_flip:
+                    result.flipped_count += 1
             else:
                 result.skipped_count += 1
 
@@ -216,7 +248,7 @@ class ReflectionService:
 
         logger.info(
             "event=reflection_done user_id=%s gate_open=%s ran=%s "
-            "cited=%d considered=%d no_change=%d replaced=%d "
+            "cited=%d considered=%d no_change=%d revised=%d flipped=%d "
             "skipped=%d failed=%d",
             request.user_id,
             result.gate_open,
@@ -224,7 +256,8 @@ class ReflectionService:
             result.cited_count,
             result.considered_count,
             result.no_change_count,
-            result.replaced_count,
+            result.revised_count,
+            result.flipped_count,
             result.skipped_count,
             result.failed_count,
         )
@@ -287,31 +320,93 @@ class ReflectionService:
         )
         return cited_profiles, cited_playbooks, missing
 
-    def _apply_replace(
+    def _validate_decision(
+        self,
+        decision: ReflectionDecision,
+        profiles_by_id: dict[str, UserProfile],  # noqa: ARG002 - kept for signature parity with _apply_revision
+        playbooks_by_id: dict[int, UserPlaybook],
+    ) -> None:
+        """Raise if the decision violates polarity invariants.
+
+        Per-decision try/except in the caller catches these and counts
+        them as failed_count.
+
+        Args:
+            decision (ReflectionDecision): The decision to validate.
+            profiles_by_id (dict[str, UserProfile]): Resolved profile
+                rows keyed by profile_id.
+            playbooks_by_id (dict[int, UserPlaybook]): Resolved playbook
+                rows keyed by user_playbook_id.
+
+        Raises:
+            ValueError: When the decision violates a polarity invariant.
+        """
+        if decision.target_kind == "profile":
+            if decision.new_polarity is not None:
+                raise ValueError("profile decisions may not set new_polarity")
+            return
+        # Playbook
+        try:
+            target_id = int(decision.target_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"playbook target_id not an int: {decision.target_id!r}"
+            ) from exc
+        cited = playbooks_by_id.get(target_id)
+        if cited is None:
+            return  # apply step will mark as skipped
+        if (
+            decision.new_polarity is not None
+            and decision.new_polarity != cited.polarity
+            and not decision.new_rationale
+        ):
+            raise ValueError("polarity flip must include new_rationale")
+
+    def _apply_revision(
         self,
         *,
         request: ReflectionServiceRequest,
         decision: ReflectionDecision,
         profiles_by_id: dict[str, UserProfile],
         playbooks_by_id: dict[int, UserPlaybook],
-    ) -> bool:
-        if decision.action != "replace" or not decision.new_content:
-            return False
+    ) -> tuple[bool, bool]:
+        """Apply a revision decision.
+
+        Args:
+            request (ReflectionServiceRequest): The current service
+                request (for user_id / agent_version).
+            decision (ReflectionDecision): The revision to apply.
+            profiles_by_id (dict[str, UserProfile]): Resolved profile
+                rows keyed by profile_id.
+            playbooks_by_id (dict[int, UserPlaybook]): Resolved playbook
+                rows keyed by user_playbook_id.
+
+        Returns:
+            tuple[bool, bool]: ``(applied, was_flip)``. ``applied=False``
+            means the target row could not be resolved (target archived
+            between resolve and apply, etc.). ``was_flip=True`` indicates
+            the new playbook polarity differs from the cited one (profiles
+            always return False here).
+        """
         if decision.target_kind == "profile":
-            cited = profiles_by_id.get(decision.target_id)
-            if cited is None:
-                return False
-            return self._replace_profile(request, decision, cited)
-        if decision.target_kind == "playbook":
-            try:
-                target_id = int(decision.target_id)
-            except (TypeError, ValueError):
-                return False
-            cited = playbooks_by_id.get(target_id)
-            if cited is None:
-                return False
-            return self._replace_playbook(request, decision, cited)
-        return False
+            cited_p = profiles_by_id.get(decision.target_id)
+            if cited_p is None:
+                return False, False
+            return self._replace_profile(request, decision, cited_p), False
+        # Playbook
+        try:
+            target_id = int(decision.target_id)
+        except (TypeError, ValueError):
+            return False, False
+        cited_pb = playbooks_by_id.get(target_id)
+        if cited_pb is None:
+            return False, False
+        was_flip = (
+            decision.new_polarity is not None
+            and decision.new_polarity != cited_pb.polarity
+        )
+        applied = self._replace_playbook(request, decision, cited_pb)
+        return applied, was_flip
 
     def _replace_profile(
         self,
@@ -405,11 +500,27 @@ class ReflectionService:
                 if decision.new_rationale is not None
                 else cited.rationale
             ),
-            blocking_issue=cited.blocking_issue,
+            polarity=(
+                decision.new_polarity
+                if decision.new_polarity is not None
+                else cited.polarity
+            ),
             status=None,
             source=cited.source,
             source_interaction_ids=list(cited.source_interaction_ids),
         )
+        warn_if_polarity_content_mismatch(new_playbook)
+        if new_playbook.polarity != cited.polarity:
+            logger.info(
+                "reflection.flip prior_polarity=%s new_polarity=%s playbook_id=%s "
+                'content_excerpt="%s" prior_excerpt="%s" citation_excerpt="%s"',
+                cited.polarity,
+                new_playbook.polarity,
+                cited.user_playbook_id,
+                (new_playbook.content or "")[:120].replace('"', "'"),
+                (cited.content or "")[:120].replace('"', "'"),
+                (decision.new_rationale or "")[:120].replace('"', "'"),
+            )
         storage.save_user_playbooks([new_playbook])
         try:
             archived = storage.archive_user_playbook_by_id(
@@ -436,6 +547,43 @@ class ReflectionService:
         return True
 
 
+_PROFILE_REVISION_FIELDS: tuple[str, ...] = (
+    "new_content",
+    "new_profile_time_to_live",
+)
+_PLAYBOOK_REVISION_FIELDS: tuple[str, ...] = (
+    "new_content",
+    "new_trigger",
+    "new_rationale",
+    "new_polarity",
+)
+_REVISION_FIELDS_BY_KIND: dict[str, tuple[str, ...]] = {
+    "profile": _PROFILE_REVISION_FIELDS,
+    "playbook": _PLAYBOOK_REVISION_FIELDS,
+}
+
+
+def _is_revision(decision: ReflectionDecision) -> bool:
+    """Return True iff a revision field relevant to the target kind is set.
+
+    Splits the revision-field set by ``target_kind`` so a profile decision
+    is not classified as a revision purely because a playbook-only field
+    (e.g. ``new_trigger``) happens to be populated. This prevents
+    unnecessary replace/archive churn that would otherwise produce no
+    effective change.
+
+    Args:
+        decision (ReflectionDecision): The decision to inspect.
+
+    Returns:
+        bool: True if at least one kind-relevant revision field is non-None.
+    """
+    fields = _REVISION_FIELDS_BY_KIND.get(
+        decision.target_kind, _PLAYBOOK_REVISION_FIELDS
+    )
+    return any(getattr(decision, f) is not None for f in fields)
+
+
 def _flatten(
     request_models: list[RequestInteractionDataModel],
 ) -> list[Interaction]:
@@ -460,4 +608,88 @@ def _collect_citations(interactions: list[Interaction]) -> list[Citation]:
                 continue
             seen.add(key)
             out.append(c)
+    return out
+
+
+@dataclass(frozen=True)
+class _EligibleCitation:
+    """A citation that passed the post-horizon filter.
+
+    Attributes:
+        citation (Citation): The citation itself.
+        position (int): 0-indexed position in the window where it
+            appeared (earliest occurrence — see deduplication note in
+            ``_filter_citations_by_horizon``).
+        has_full_horizon (bool): True iff at least
+            ``post_horizon_size`` interactions follow the citation in
+            the window. False indicates a ``last_chance`` judgment
+            with weaker evidence.
+    """
+
+    citation: Citation
+    position: int
+    has_full_horizon: bool
+
+
+def _filter_citations_by_horizon(
+    citations: list[Citation],
+    window: list[Interaction],
+    post_horizon_size: int,
+    stride_size: int,
+) -> list[_EligibleCitation]:
+    """Filter citations to those that have enough post-citation context.
+
+    For each unique ``(kind, real_id)``, finds the **earliest** occurrence
+    in the window (maximizes follow-up turns) and decides:
+
+    - ``after_count >= post_horizon_size`` → eligible, ``has_full_horizon=True``.
+    - ``position < stride_size`` → eligible (last-chance, about to fall
+      out of the window next stride), ``has_full_horizon=False``.
+    - otherwise → deferred (excluded from this pass).
+
+    Only Assistant-role interactions contribute citations to consider —
+    user-role interactions are skipped even if their ``citations`` list is
+    populated.
+
+    Args:
+        citations (list[Citation]): Distinct citations collected from
+            assistant turns in the window.
+        window (list[Interaction]): The reflection window, oldest first.
+        post_horizon_size (int): Minimum follow-up turns required for a
+            full-horizon judgment. Zero disables the horizon check.
+        stride_size (int): Used to detect citations about to fall out.
+
+    Returns:
+        list[_EligibleCitation]: Citations to send to the LLM, each
+        paired with its window position and horizon flag.
+    """
+    seen: dict[tuple[str, str], int] = {}
+    for idx, interaction in enumerate(window):
+        if interaction.role != "Assistant":
+            continue
+        for c in interaction.citations:
+            key = (c.kind, c.real_id)
+            seen.setdefault(key, idx)  # earliest occurrence only
+
+    citation_by_key = {(c.kind, c.real_id): c for c in citations}
+
+    out: list[_EligibleCitation] = []
+    for key, position in seen.items():
+        cite = citation_by_key.get(key)
+        if cite is None:
+            continue
+        after_count = len(window) - position - 1
+        if post_horizon_size <= 0 or after_count >= post_horizon_size:
+            out.append(
+                _EligibleCitation(
+                    citation=cite, position=position, has_full_horizon=True
+                )
+            )
+        elif position < stride_size:
+            out.append(
+                _EligibleCitation(
+                    citation=cite, position=position, has_full_horizon=False
+                )
+            )
+        # else: deferred — not included
     return out

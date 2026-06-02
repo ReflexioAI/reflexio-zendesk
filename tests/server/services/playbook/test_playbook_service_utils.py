@@ -4,10 +4,9 @@ from datetime import UTC, datetime
 
 import pytest
 
+from reflexio.models.api_schema.domain.enums import UserActionType
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.models.api_schema.service_schemas import (
-    BlockingIssue,
-    BlockingIssueKind,
     Interaction,
     Request,
 )
@@ -32,7 +31,7 @@ def test_construct_playbook_extraction_messages_with_sessions():
             content="I need help with my account",
             role="user",
             created_at=int(datetime.now(UTC).timestamp()),
-            user_action="none",
+            user_action=UserActionType.NONE,
             user_action_description="",
         ),
         Interaction(
@@ -42,7 +41,7 @@ def test_construct_playbook_extraction_messages_with_sessions():
             content="Here is how to access your account",
             role="assistant",
             created_at=int(datetime.now(UTC).timestamp()),
-            user_action="none",
+            user_action=UserActionType.NONE,
             user_action_description="",
         ),
         Interaction(
@@ -52,7 +51,7 @@ def test_construct_playbook_extraction_messages_with_sessions():
             content="Thank you!",
             role="user",
             created_at=int(datetime.now(UTC).timestamp()),
-            user_action="click",
+            user_action=UserActionType.CLICK,
             user_action_description="help button",
         ),
     ]
@@ -197,22 +196,8 @@ class TestFormatStructuredFieldsForDisplay:
         result = format_structured_fields_for_display(structured)
         assert "Trigger:" not in result
 
-    def test_with_blocking_issue(self):
-        """Test formatting with blocking_issue."""
-        structured = StructuredPlaybookContent(
-            trigger="user asks for real-time data",
-            blocking_issue=BlockingIssue(
-                kind=BlockingIssueKind.MISSING_TOOL,
-                details="No real-time data API available",
-            ),
-        )
-        result = format_structured_fields_for_display(structured)
-        assert "Blocked by:" in result
-        assert "missing_tool" in result
-        assert "No real-time data API available" in result
-
-    def test_all_fields_none_returns_empty(self):
-        """Test that all-None fields returns empty string."""
+    def test_all_fields_none_returns_empty_string(self):
+        """All-None structured fields produce no fallback content."""
         structured = StructuredPlaybookContent()
         result = format_structured_fields_for_display(structured)
         assert result == ""
@@ -454,7 +439,7 @@ class TestEnsurePlaybookContentEdgeCases:
     """Additional edge cases for ensure_playbook_content."""
 
     def test_returns_empty_string_when_both_empty(self):
-        """When both playbook content and structured fields are empty, returns empty string."""
+        """When playbook content is missing and no structured fields are set, fallback content is empty."""
         result = ensure_playbook_content(None, StructuredPlaybookContent())
         assert result == ""
 

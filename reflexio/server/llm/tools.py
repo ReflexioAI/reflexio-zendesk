@@ -6,16 +6,52 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 logger = logging.getLogger(__name__)
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from reflexio.server.llm.llm_utils import make_strict_json_schema
 from reflexio.server.llm.model_defaults import ModelRole, resolve_model_name
 
 if TYPE_CHECKING:
     from reflexio.server.llm.litellm_client import LiteLLMClient
+
+
+@dataclass(frozen=True)
+class AsyncRequestSpec:
+    """Pre-persistence request produced by an asynchronous information tool."""
+
+    tool_name: str
+    dedup_key: str
+    scope: dict[str, Any]
+    question_text: str
+    answer_format: str | None = None
+    args: dict[str, Any] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
+    cache_until_seconds: int = 300
+    valid_until_seconds: int = 2_592_000
+
+
+@dataclass(frozen=True)
+class Completed:
+    """Synchronous tool result."""
+
+    result: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AsyncAccepted:
+    """Accepted asynchronous tool request returned as a normal tool result."""
+
+    pending_tool_call_id: str
+    result: dict[str, Any]
+
+
+ToolOutcome = Completed | AsyncAccepted
+ToolHandlerResult = dict[str, Any] | ToolOutcome
 
 
 class Tool(BaseModel):
@@ -31,17 +67,43 @@ class Tool(BaseModel):
 
     name: str
     args_model: type[BaseModel]
-    handler: Callable[[BaseModel, Any], dict]
+    handler: Callable[[BaseModel, Any], ToolHandlerResult]
+    strict: bool = True
 
     def openai_spec(self) -> dict:
+        parameters = self.args_model.model_json_schema()
+        if self.strict:
+            parameters = make_strict_json_schema(parameters)
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": (self.args_model.__doc__ or "").strip(),
-                "parameters": self.args_model.model_json_schema(),
+                "parameters": parameters,
+                "strict": self.strict,
             },
         }
+
+
+class AsyncInfoTool(Tool):
+    """Marker type for tools that register async work and continue the loop."""
+
+
+def _coerce_tool_outcome(value: ToolHandlerResult) -> ToolOutcome:
+    if isinstance(value, Completed | AsyncAccepted):
+        return value
+    return Completed(result=value)
+
+
+def _tool_result_from_outcome(
+    outcome: ToolOutcome,
+    pending_tool_call_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    if isinstance(outcome, AsyncAccepted):
+        if pending_tool_call_ids is not None:
+            pending_tool_call_ids.append(outcome.pending_tool_call_id)
+        return outcome.result
+    return outcome.result
 
 
 class ToolRegistry:
@@ -56,20 +118,23 @@ class ToolRegistry:
     def openai_specs(self) -> list[dict]:
         return [t.openai_spec() for t in self._tools.values()]
 
-    def handle(self, name: str, args_json: str, ctx: Any) -> dict:
+    def handle_outcome(self, name: str, args_json: str, ctx: Any) -> ToolOutcome:
         tool = self._tools.get(name)
         if tool is None:
-            return {"error": f"unknown tool: {name}"}
+            return Completed(result={"error": f"unknown tool: {name}"})
         try:
             raw = json.loads(args_json or "{}")
             args = tool.args_model.model_validate(raw)
         except (ValidationError, json.JSONDecodeError) as e:
-            return {"error": f"invalid args for {name}: {e}"}
+            return Completed(result={"error": f"invalid args for {name}: {e}"})
         try:
-            return tool.handler(args, ctx)
+            return _coerce_tool_outcome(tool.handler(args, ctx))
         except Exception as e:  # handler errors are recoverable tool-turn errors
             logger.exception("tool handler %s failed", name)
-            return {"error": f"handler error: {type(e).__name__}"}
+            return Completed(result={"error": f"handler error: {type(e).__name__}"})
+
+    def handle(self, name: str, args_json: str, ctx: Any) -> dict:
+        return _tool_result_from_outcome(self.handle_outcome(name, args_json, ctx))
 
 
 class ToolLoopTurn(BaseModel):
@@ -105,7 +170,10 @@ class ToolLoopResult(BaseModel):
 
     ctx: Any
     trace: ToolLoopTrace
-    finished_reason: Literal["finish_tool", "max_steps", "error"]
+    finished_reason: Literal["finish_tool", "no_tool_call", "max_steps", "error"]
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    pending_tool_call_ids: list[str] = Field(default_factory=list)
+    max_steps_remaining: int = 0
 
 
 # Models we know support function calling per vendor docs but that litellm's
@@ -128,7 +196,7 @@ _TOOL_CALLING_OVERRIDES: tuple[str, ...] = (
     # entry for them, so it returns False. The provider handles tool
     # calling explicitly by rendering tool specs into the system prompt
     # and parsing the model's JSON output back into ChatCompletionMessageToolCall
-    # blocks. Verified end-to-end against the agentic ExtractionAgent loop.
+    # blocks. Verified end-to-end against the resumable extraction tool loop.
     "claude-code/",
 )
 
@@ -206,6 +274,7 @@ def _run_multi_stage_fallback(
     multi_stage_schema: type[BaseModel],
     log_label: str | None,
     trace: ToolLoopTrace,
+    pending_tool_call_ids: list[str],
 ) -> ToolLoopResult:
     """Drive a multi-turn tool loop using one structured-output call per turn.
 
@@ -293,7 +362,8 @@ def _run_multi_stage_fallback(
         if tool_name == finish_tool_name:
             # Dispatch finish through the registry so any ctx-side
             # bookkeeping (e.g. stashing the answer) still runs.
-            result = registry.handle(tool_name, args_json, ctx)
+            outcome = registry.handle_outcome(tool_name, args_json, ctx)
+            result = _tool_result_from_outcome(outcome, pending_tool_call_ids)
             trace.turns.append(
                 ToolLoopTurn(
                     tool_name=tool_name,
@@ -303,9 +373,17 @@ def _run_multi_stage_fallback(
                 )
             )
             trace.finished = True
-            return ToolLoopResult(ctx=ctx, trace=trace, finished_reason="finish_tool")
+            return ToolLoopResult(
+                ctx=ctx,
+                trace=trace,
+                finished_reason="finish_tool",
+                messages=messages,
+                pending_tool_call_ids=pending_tool_call_ids,
+                max_steps_remaining=max_steps - turn_idx - 1,
+            )
 
-        result = registry.handle(tool_name, args_json, ctx)
+        outcome = registry.handle_outcome(tool_name, args_json, ctx)
+        result = _tool_result_from_outcome(outcome, pending_tool_call_ids)
         trace.turns.append(
             ToolLoopTurn(
                 tool_name=tool_name,
@@ -325,7 +403,14 @@ def _run_multi_stage_fallback(
         )
 
     trace.finished = False
-    return ToolLoopResult(ctx=ctx, trace=trace, finished_reason="max_steps")
+    return ToolLoopResult(
+        ctx=ctx,
+        trace=trace,
+        finished_reason="max_steps",
+        messages=messages,
+        pending_tool_call_ids=pending_tool_call_ids,
+        max_steps_remaining=0,
+    )
 
 
 def run_tool_loop(
@@ -340,6 +425,7 @@ def run_tool_loop(
     fallback_schema: type[BaseModel] | None = None,
     fallback_tool_name: str | None = None,
     multi_stage_schema: type[BaseModel] | None = None,
+    tool_choice: str | dict[str, Any] = "auto",
     log_label: str | None = None,
 ) -> ToolLoopResult:
     """Drive an LLM through a tool-calling loop until ``finish_tool_name`` or ``max_steps``.
@@ -379,6 +465,11 @@ def run_tool_loop(
             ``tool`` discriminator literal — that literal names the tool
             to dispatch, all other fields become its args. Takes priority
             over ``fallback_schema``.
+        tool_choice (str | dict): Forwarded to each native tool-calling turn.
+            Defaults to ``"auto"``. Pass an OpenAI tool-choice dict (e.g.
+            ``{"type": "function", "function": {"name": "finish"}}``) to force a
+            specific tool — used to make a single-tool loop behave like a forced
+            structured-output call.
         log_label (str | None): When set, each LLM call in the loop is
             mirrored into ``~/.reflexio/logs/llm_io.log`` using this label
             (suffixed with ``(turn N)``, ``(fallback)``, or
@@ -400,6 +491,7 @@ def run_tool_loop(
         api_key_config=getattr(client.config, "api_key_config", None),
     )
     trace = ToolLoopTrace()
+    pending_tool_call_ids: list[str] = []
 
     # Lazily import the llm_io helpers only when logging is requested —
     # matches classic's per-call lazy-import pattern in profile_deduplicator.py.
@@ -423,6 +515,7 @@ def run_tool_loop(
                 multi_stage_schema=multi_stage_schema,
                 log_label=log_label,
                 trace=trace,
+                pending_tool_call_ids=pending_tool_call_ids,
             )
         if fallback_schema is None or fallback_tool_name is None:
             raise RuntimeError(
@@ -453,7 +546,12 @@ def run_tool_loop(
         bounded_items = items[:max_steps]
         for item in bounded_items:
             tool_t0 = time.monotonic()
-            res = registry.handle(fallback_tool_name, item.model_dump_json(), ctx)
+            outcome = registry.handle_outcome(
+                fallback_tool_name,
+                item.model_dump_json(),
+                ctx,
+            )
+            res = _tool_result_from_outcome(outcome, pending_tool_call_ids)
             trace.turns.append(
                 ToolLoopTurn(
                     tool_name=fallback_tool_name,
@@ -468,6 +566,9 @@ def run_tool_loop(
             ctx=ctx,
             trace=trace,
             finished_reason="max_steps" if exceeded else "finish_tool",
+            messages=messages,
+            pending_tool_call_ids=pending_tool_call_ids,
+            max_steps_remaining=0 if exceeded else max_steps - len(bounded_items),
         )
 
     # ---- Native tool loop ---------------------------------------------
@@ -479,7 +580,7 @@ def run_tool_loop(
             resp = client.generate_chat_response(
                 messages=local_msgs,
                 tools=registry.openai_specs(),
-                tool_choice="auto",
+                tool_choice=tool_choice,
                 model_role=model_role,
             )
             if log_label:
@@ -501,9 +602,21 @@ def run_tool_loop(
 
             tool_calls = getattr(resp, "tool_calls", None)
             if not tool_calls:
+                # The model returned a plain-text turn with no tool calls. For a
+                # text-output agent this means "done", but the finish handler did
+                # NOT run, so no structured output was committed. Report a
+                # distinct reason so callers (and logs) don't conflate this with
+                # an actual finish_extraction call. Callers that require output
+                # (extraction) already gate success on committed output, so this
+                # surfaces accurately as a non-finish termination.
                 trace.finished = True
                 return ToolLoopResult(
-                    ctx=ctx, trace=trace, finished_reason="finish_tool"
+                    ctx=ctx,
+                    trace=trace,
+                    finished_reason="no_tool_call",
+                    messages=local_msgs,
+                    pending_tool_call_ids=pending_tool_call_ids,
+                    max_steps_remaining=max_steps - _step,
                 )
             # Emit ONE assistant message carrying ALL tool_calls from this turn.
             # OpenAI/Anthropic strict mode requires this shape.
@@ -520,7 +633,8 @@ def run_tool_loop(
                 tool_t0 = time.monotonic()
                 name = tc.function.name
                 args_json = tc.function.arguments
-                result = registry.handle(name, args_json, ctx)
+                outcome = registry.handle_outcome(name, args_json, ctx)
+                result = _tool_result_from_outcome(outcome, pending_tool_call_ids)
                 try:
                     args_dict = json.loads(args_json or "{}")
                 except json.JSONDecodeError:
@@ -550,11 +664,30 @@ def run_tool_loop(
             if any(tc.function.name == finish_tool_name for tc in tool_calls):
                 trace.finished = True
                 return ToolLoopResult(
-                    ctx=ctx, trace=trace, finished_reason="finish_tool"
+                    ctx=ctx,
+                    trace=trace,
+                    finished_reason="finish_tool",
+                    messages=local_msgs,
+                    pending_tool_call_ids=pending_tool_call_ids,
+                    max_steps_remaining=max_steps - _step - 1,
                 )
     except Exception:
         logger.exception("Tool loop raised an unexpected exception")
         trace.finished = False
-        return ToolLoopResult(ctx=ctx, trace=trace, finished_reason="error")
+        return ToolLoopResult(
+            ctx=ctx,
+            trace=trace,
+            finished_reason="error",
+            messages=local_msgs,
+            pending_tool_call_ids=pending_tool_call_ids,
+            max_steps_remaining=0,
+        )
 
-    return ToolLoopResult(ctx=ctx, trace=trace, finished_reason="max_steps")
+    return ToolLoopResult(
+        ctx=ctx,
+        trace=trace,
+        finished_reason="max_steps",
+        messages=local_msgs,
+        pending_tool_call_ids=pending_tool_call_ids,
+        max_steps_remaining=0,
+    )

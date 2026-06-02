@@ -1,10 +1,12 @@
 import logging
+import time
 from dataclasses import dataclass
 
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.models.config_schema import AgentSuccessConfig
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient
+from reflexio.server.services.agent_success_evaluation import _eval_health
 from reflexio.server.services.agent_success_evaluation.agent_success_evaluation_utils import (
     AgentSuccessEvaluationRequest,
 )
@@ -25,12 +27,16 @@ class AgentSuccessGenerationServiceConfig:
         agent_version: The agent version
         request_interaction_data_models: The interactions to evaluate
         source: Source of the interactions
+        evaluation_name_filter: Optional evaluator-name filter. When set,
+            _load_extractor_config returns the configured AgentSuccessConfig only
+            when its evaluation_name matches.
     """
 
     session_id: str
     agent_version: str
     request_interaction_data_models: list[RequestInteractionDataModel]
     source: str | None = None
+    evaluation_name_filter: str | None = None
 
 
 class AgentSuccessEvaluationService(
@@ -42,8 +48,7 @@ class AgentSuccessEvaluationService(
     ]
 ):
     """
-    Service for evaluating agent success across multiple evaluation criteria.
-    Runs multiple AgentSuccessEvaluator instances sequentially.
+    Service for evaluating agent success with the configured evaluator.
     """
 
     def __init__(
@@ -79,16 +84,34 @@ class AgentSuccessEvaluationService(
             agent_version=request.agent_version,
             request_interaction_data_models=request.request_interaction_data_models,
             source=request.source,
+            evaluation_name_filter=request.evaluation_name_filter,
         )
 
-    def _load_extractor_configs(self) -> list[AgentSuccessConfig]:
+    def _load_extractor_config(self) -> AgentSuccessConfig | None:
         """
-        Load agent success configs from configurator.
+        Load agent success config from configurator.
+
+        When the active service_config carries an evaluation_name_filter
+        (set by run_group_evaluation in regenerate mode), return None when
+        the configured evaluator's name does not match.
+
+        When the active service_config carries an evaluation_name_filter
+        (set by run_group_evaluation in regenerate mode), skip every config
+        whose evaluation_name does not match — so the regenerate flow only
+        re-runs the targeted evaluator instead of every configured rubric.
 
         Returns:
-            list[AgentSuccessConfig]: List of agent success configuration objects from YAML
+            AgentSuccessConfig | None: Configured evaluator, or None when disabled
+            or filtered out.
         """
-        return self.configurator.get_config().agent_success_configs  # type: ignore[reportReturnType]
+        root_config = self.configurator.get_config()
+        config = getattr(root_config, "agent_success_config", None)
+        name_filter = getattr(self.service_config, "evaluation_name_filter", None)
+        if name_filter is None:
+            return config
+        if config and config.evaluation_name == name_filter:
+            return config
+        return None
 
     def _create_extractor(
         self,
@@ -134,24 +157,46 @@ class AgentSuccessEvaluationService(
             self.service_config.session_id,  # type: ignore[reportOptionalMemberAccess]
         )
 
-        # Save results
+        # Save results with retry+backoff. After the final attempt the producer
+        # failure is recorded into EvalHealth so the operator-facing healthcheck
+        # surfaces persistent storage problems.
         if all_results:
-            try:
-                self.storage.save_agent_success_evaluation_results(all_results)  # type: ignore[reportOptionalMemberAccess]
-                self.last_run_saved_result_count = len(all_results)
-                logger.info(
-                    "Saved %d agent success evaluation results for session: %s",
-                    len(all_results),
-                    self.service_config.session_id,  # type: ignore[reportOptionalMemberAccess]
-                )
-            except Exception as e:
+            backoffs = [1, 4]
+            attempt = 0
+            saved = False
+            while True:
+                attempt += 1
+                try:
+                    self.storage.save_agent_success_evaluation_results(all_results)  # type: ignore[reportOptionalMemberAccess]
+                    self.last_run_saved_result_count = len(all_results)
+                    logger.info(
+                        "Saved %d agent success evaluation results for session: %s (attempt %d)",
+                        len(all_results),
+                        self.service_config.session_id,  # type: ignore[reportOptionalMemberAccess]
+                        attempt,
+                    )
+                    saved = True
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "Save attempt %d/%d failed for session %s: %s",
+                        attempt,
+                        len(backoffs) + 1,
+                        self.service_config.session_id,  # type: ignore[reportOptionalMemberAccess]
+                        e,
+                    )
+                    if attempt > len(backoffs):
+                        break
+                    time.sleep(backoffs[attempt - 1])
+
+            if not saved:
                 self.last_run_save_failed = True
+                _eval_health.record_producer_failure()
                 logger.error(
-                    "Failed to save %s results for session: %s due to %s, exception type: %s",
+                    "Failed to save %s results for session %s after %d attempts",
                     self._get_service_name(),
                     self.service_config.session_id,  # type: ignore[reportOptionalMemberAccess]
-                    str(e),
-                    type(e).__name__,
+                    attempt,
                 )
 
     def has_run_failures(self) -> bool:

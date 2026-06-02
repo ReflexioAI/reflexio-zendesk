@@ -1,16 +1,39 @@
 from reflexio.models.api_schema.domain.enums import Status
 
+from ._agent_run import (
+    NOT_APPLICABLE_ANSWER,
+    AgentBinding,
+    AgentRunMixin,
+    AgentRunRecord,
+    AgentRunStatus,
+    PendingToolCallRecord,
+    PendingToolCallStatus,
+    PendingToolCallUpsertResult,
+    PriorAnswerMatch,
+    RunToolDependencyKind,
+    RunToolDependencyRecord,
+    build_pending_tool_call_dedup_key,
+    build_scope_hash,
+    canonical_json,
+    embedding_similarity,
+    human_feedback_scope,
+    is_not_applicable_tool_result,
+    normalize_dedup_text,
+    not_applicable_tool_result,
+)
 from ._base import BaseStorageCore, matches_status_filter
 from ._extras import ExtrasMixin
 from ._operations import OperationMixin
 from ._playbook import PlaybookMixin
 from ._profiles import ProfileMixin
 from ._requests import RequestMixin
+from ._shadow_verdicts import ShadowVerdictsMixin
 from ._share_links import ShareLinkMixin
 from ._stall_state import StallStateMixin
 
 
 class BaseStorage(
+    AgentRunMixin,
     ProfileMixin,
     RequestMixin,
     PlaybookMixin,
@@ -18,6 +41,7 @@ class BaseStorage(
     ExtrasMixin,
     ShareLinkMixin,
     StallStateMixin,
+    ShadowVerdictsMixin,
     BaseStorageCore,
 ):
     """Base class for storage."""
@@ -34,8 +58,8 @@ class BaseStorage(
         in-flight task's rows.
 
         The default implementation composes existing per-user / by-ids
-        primitives so any backend that implements those (sqlite, disk,
-        supabase, postgres, ...) gets correct behaviour for free.
+        primitives so any backend that implements those (sqlite, supabase,
+        postgres, ...) gets correct behaviour for free.
         Subclasses MAY override for atomic / transactional efficiency.
 
         Args:
@@ -101,9 +125,29 @@ class BaseStorage(
 
 
 __all__ = [
+    "AgentBinding",
+    "AgentRunMixin",
+    "AgentRunRecord",
+    "AgentRunStatus",
     "BaseStorage",
+    "NOT_APPLICABLE_ANSWER",
+    "PendingToolCallRecord",
+    "PendingToolCallStatus",
+    "PendingToolCallUpsertResult",
     "PlaybookMixin",
+    "PriorAnswerMatch",
+    "RunToolDependencyKind",
+    "RunToolDependencyRecord",
+    "ShadowVerdictsMixin",
     "ShareLinkMixin",
     "StallStateMixin",
+    "build_pending_tool_call_dedup_key",
+    "build_scope_hash",
+    "canonical_json",
+    "embedding_similarity",
+    "human_feedback_scope",
+    "is_not_applicable_tool_result",
     "matches_status_filter",
+    "not_applicable_tool_result",
+    "normalize_dedup_text",
 ]

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import os
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -49,9 +51,6 @@ from reflexio.server.services.storage.retention import (
 from reflexio.server.usage_metrics import record_usage_event
 
 if TYPE_CHECKING:
-    from reflexio.server.services.search.agentic_search_service import (
-        AgenticSearchService,
-    )
     from reflexio.server.services.unified_search_service import UnifiedSearchService
 
 logger = logging.getLogger(__name__)
@@ -60,6 +59,23 @@ CLEANUP_STALE_LOCK_SECONDS = 600
 # Timeout for the outer generation service parallel execution
 GENERATION_SERVICE_TIMEOUT_SECONDS = 600
 _STALL_WARNING_PREFIX = "Reflexio learning is paused"
+
+
+def _retention_cleanup_interval_seconds() -> float:
+    raw = os.getenv("REFLEXIO_RETENTION_CLEANUP_INTERVAL_SECONDS", "300") or "300"
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid REFLEXIO_RETENTION_CLEANUP_INTERVAL_SECONDS=%r; using 300",
+            raw,
+        )
+        return 300.0
+
+
+_RETENTION_CLEANUP_INTERVAL_SECONDS = _retention_cleanup_interval_seconds()
+_retention_cleanup_last_run: dict[tuple[str, str], float] = {}
+_retention_cleanup_lock = threading.Lock()
 
 
 @dataclass
@@ -186,13 +202,16 @@ class GenerationService:
                 count_value=len(new_interactions),
             )
 
-            # Store Request
+            # Store Request — propagate customer-stamped metadata so the
+            # eval pipeline (e.g. F2 sticky-group aggregator) can read it
+            # back from the first request of each session.
             new_request = Request(
                 request_id=request_id,
                 user_id=user_id,
                 source=publish_user_interaction_request.source,
                 agent_version=agent_version,
                 session_id=publish_user_interaction_request.session_id or None,
+                metadata=publish_user_interaction_request.metadata,
             )
             self.storage.add_request(new_request)  # type: ignore[reportOptionalMemberAccess]
 
@@ -234,48 +253,6 @@ class GenerationService:
             self._maybe_run_reflection(
                 user_id=user_id, agent_version=agent_version, source=source
             )
-
-            # Dispatch to the agentic pipeline when the config flag is set.
-            # Classic path (default) falls through to the ProfileGenerationService
-            # + PlaybookGenerationService fan-out below.
-            root_config = self.configurator.get_config()
-            if (
-                root_config is not None
-                and getattr(root_config, "extraction_backend", "classic") == "agentic"
-            ):
-                from reflexio.server.services.extraction.agentic_adapter import (
-                    AgenticExtractionRunner,
-                )
-
-                runner = AgenticExtractionRunner(
-                    llm_client=self.client,
-                    request_context=self.request_context,
-                )
-                result.warnings.extend(
-                    runner.run(
-                        publish_request=publish_user_interaction_request,
-                        request_id=request_id,
-                        new_interactions=new_interactions,
-                        new_request=new_request,
-                        config=root_config,
-                    )
-                )
-                record_usage_event(
-                    org_id=self.org_id,
-                    user_id=user_id,
-                    request_id=request_id,
-                    session_id=new_request.session_id,
-                    source=source,
-                    agent_version=agent_version,
-                    backend="agentic",
-                    event_name="publish_request_succeeded",
-                    event_category="publish",
-                    outcome="success",
-                    count_value=len(new_interactions),
-                    duration_ms=int((time.perf_counter() - publish_start) * 1000),
-                    metadata={"warning_count": len(result.warnings)},
-                )
-                return result
 
             # Create generation services and requests
             # Each service writes to separate storage tables and has no dependencies on others
@@ -346,45 +323,12 @@ class GenerationService:
                 executor.shutdown(wait=False, cancel_futures=True)
 
             # Schedule delayed group evaluation if session_id is present
-            session_id = new_request.session_id
-            if session_id:
-                scheduler = GroupEvaluationScheduler.get_instance()
-                key = (self.org_id, user_id, session_id)
-
-                def make_callback(
-                    _org_id: str,
-                    _user_id: str,
-                    _sid: str,
-                    _av: str,
-                    _src: str | None,
-                    _rc: RequestContext,
-                    _llm: LiteLLMClient,
-                ) -> Callable[[], None]:
-                    def callback() -> None:
-                        run_group_evaluation(
-                            org_id=_org_id,
-                            user_id=_user_id,
-                            session_id=_sid,
-                            agent_version=_av,
-                            source=_src,
-                            request_context=_rc,
-                            llm_client=_llm,
-                        )
-
-                    return callback
-
-                scheduler.schedule(
-                    key,
-                    make_callback(
-                        self.org_id,
-                        user_id,
-                        session_id,
-                        agent_version,
-                        source,
-                        self.request_context,
-                        self.client,
-                    ),
-                )
+            self._schedule_group_evaluation_if_needed(
+                new_request=new_request,
+                user_id=user_id,
+                agent_version=agent_version,
+                source=source,
+            )
 
             record_usage_event(
                 org_id=self.org_id,
@@ -430,6 +374,70 @@ class GenerationService:
     # private methods
     # ===============================
 
+    def _schedule_group_evaluation_if_needed(
+        self,
+        *,
+        new_request: Request,
+        user_id: str,
+        agent_version: str,
+        source: str | None,
+    ) -> None:
+        """Enqueue agent-success evaluation for this session, if session_id is set.
+
+        Must be called once per publish — from BOTH the classic and the agentic
+        extraction code paths — so that ``AgentSuccessEvaluationResult`` records
+        get produced regardless of which backend is in use. Skipping this for
+        the agentic path was the silent root cause of empty /evaluations tiles.
+
+        Args:
+            new_request (Request): The just-stored request whose session is being
+                published into. ``new_request.session_id`` gates scheduling.
+            user_id (str): The user owning the session.
+            agent_version (str): Agent version string carried into the evaluator.
+            source (str | None): Optional source label.
+        """
+        session_id = new_request.session_id
+        if not session_id:
+            return
+
+        scheduler = GroupEvaluationScheduler.get_instance()
+        key = (self.org_id, user_id, session_id)
+
+        def make_callback(
+            _org_id: str,
+            _user_id: str,
+            _sid: str,
+            _av: str,
+            _src: str | None,
+            _rc: RequestContext,
+            _llm: LiteLLMClient,
+        ) -> Callable[[], None]:
+            def callback() -> None:
+                run_group_evaluation(
+                    org_id=_org_id,
+                    user_id=_user_id,
+                    session_id=_sid,
+                    agent_version=_av,
+                    source=_src,
+                    request_context=_rc,
+                    llm_client=_llm,
+                )
+
+            return callback
+
+        scheduler.schedule(
+            key,
+            make_callback(
+                self.org_id,
+                user_id,
+                session_id,
+                agent_version,
+                source,
+                self.request_context,
+                self.client,
+            ),
+        )
+
     def _maybe_run_reflection(
         self, *, user_id: str, agent_version: str, source: str | None
     ) -> None:
@@ -460,10 +468,11 @@ class GenerationService:
 
     def _cleanup_storage_tables_if_needed(self) -> None:
         """Best-effort publish-boundary cleanup for capped storage tables."""
+        now = time.monotonic()
         limits = {
             target_name: limit
             for target_name, limit in get_row_retention_limits().items()
-            if limit > 0
+            if limit > 0 and self._should_check_retention_target(target_name, now)
         }
         if not limits:
             return
@@ -495,6 +504,20 @@ class GenerationService:
         except Exception as e:
             logger.error("Failed to cleanup storage tables: %s", e)
             # Don't raise - cleanup failure shouldn't block normal operation
+
+    def _should_check_retention_target(self, target_name: str, now: float) -> bool:
+        if _RETENTION_CLEANUP_INTERVAL_SECONDS <= 0:
+            return True
+        key = (self.org_id, target_name)
+        with _retention_cleanup_lock:
+            last_run = _retention_cleanup_last_run.get(key)
+            if (
+                last_run is not None
+                and now - last_run < _RETENTION_CLEANUP_INTERVAL_SECONDS
+            ):
+                return False
+            _retention_cleanup_last_run[key] = now
+            return True
 
     def _active_learning_stall_warning(self) -> str | None:
         """Return a warning when extraction should not auto-retry.
@@ -598,12 +621,7 @@ def build_extraction_service(
     llm_client: LiteLLMClient,
     request_context: RequestContext,
 ) -> ProfileGenerationService:
-    """Return the classic profile extraction service.
-
-    The agentic extraction path is handled directly by
-    ``AgenticExtractionRunner`` inside ``GenerationService.run`` and does not
-    go through this factory.  This function exists for the classic dispatcher
-    path only.
+    """Return the profile extraction service.
 
     Args:
         config (Config): Top-level ``Config`` (unused; kept for API consistency).
@@ -620,33 +638,21 @@ def build_extraction_service(
 
 
 def build_search_service(
-    config: Config,
+    config: Config,  # noqa: ARG001
     *,
     llm_client: LiteLLMClient,
     request_context: RequestContext,
-) -> UnifiedSearchService | AgenticSearchService:
-    """Dispatch to the classic or agentic search service.
-
-    Selected by ``config.search_backend``. Classic returns a
-    ``UnifiedSearchService``; agentic returns the Phase-4 pipeline.
+) -> UnifiedSearchService:
+    """Build the unified search service.
 
     Args:
-        config (Config): Top-level ``Config``. Reads ``search_backend``.
+        config (Config): Top-level ``Config`` (unused; kept for API consistency).
         llm_client (LiteLLMClient): Configured ``LiteLLMClient``.
         request_context (RequestContext): Current request context.
 
     Returns:
-        Object holding ``llm_client`` and ``request_context`` — either a
-        classic ``UnifiedSearchService`` or the agentic service.
+        A ``UnifiedSearchService`` holding ``llm_client`` and ``request_context``.
     """
-    if config.search_backend == "agentic":
-        from reflexio.server.services.search.agentic_search_service import (  # type: ignore[import-not-found]
-            AgenticSearchService,
-        )
-
-        return AgenticSearchService(
-            llm_client=llm_client, request_context=request_context
-        )
     from reflexio.server.services.unified_search_service import UnifiedSearchService
 
     return UnifiedSearchService(llm_client=llm_client, request_context=request_context)

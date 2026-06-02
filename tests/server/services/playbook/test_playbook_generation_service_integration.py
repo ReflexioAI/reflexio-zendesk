@@ -76,15 +76,13 @@ def mock_request_context():
     # Mock get_last_k_interactions_grouped to return empty by default
     context.storage.get_last_k_interactions_grouped.return_value = ([], [])
     context.configurator = MagicMock()
-    context.configurator.get_config.return_value.user_playbook_extractor_configs = [
+    context.configurator.get_config.return_value.user_playbook_extractor_config = (
         PlaybookConfig(
             extractor_name="test_playbook",
             extraction_definition_prompt="Test playbook definition",
-            aggregation_config=PlaybookAggregatorConfig(
-                min_cluster_size=2,
-            ),
+            aggregation_config=PlaybookAggregatorConfig(min_cluster_size=2),
         )
-    ]
+    )
     # Mock window_size for extractor
     context.configurator.get_config.return_value.window_size = 100
     context.prompt_manager = PromptManager()
@@ -135,14 +133,38 @@ def _setup_mock_chat_completion(
     should_generate=True,
     content="The agent was helpful and provided accurate information",
 ):
-    """Helper function to set up mock chat completion responses."""
+    """Helper function to set up mock chat completion responses.
+
+    Playbook extraction now runs through the always-on ``finish_extraction``
+    tool loop, which calls ``generate_chat_response`` with ``tools=`` and reads
+    ``resp.tool_calls``. So the extraction turn must return a
+    ``ToolCallingChatResponse``-shaped object carrying a single
+    ``finish_extraction`` tool call. The boolean should-generate gate still
+    returns a plain string.
+    """
+    from reflexio.server.llm.litellm_client import ToolCallingChatResponse
+    from reflexio.server.services.extraction.resumable_agent import (
+        FINISH_EXTRACTION_TOOL_NAME,
+    )
+
+    def _finish_tool_call() -> MagicMock:
+        playbooks = StructuredPlaybookList(
+            playbooks=[
+                StructuredPlaybookContent(
+                    trigger="interacting with users",
+                    content=content,
+                )
+            ]
+        )
+        tc = MagicMock()
+        tc.id = f"tc_{FINISH_EXTRACTION_TOOL_NAME}"
+        tc.type = "function"
+        tc.function.name = FINISH_EXTRACTION_TOOL_NAME
+        tc.function.arguments = playbooks.model_dump_json()
+        return tc
 
     def mock_generate_chat_response(messages, **kwargs):
-        """
-        Check prompt content to determine which mock response to return.
-        If prompt contains boolean output instruction, return boolean response.
-        Otherwise, return structured JSON playbook response.
-        """
+        """Route on prompt content / tool-loop mode to the right mock response."""
         # Get the prompt content from the messages
         prompt_content = ""
         for message in messages:
@@ -156,14 +178,12 @@ def _setup_mock_chat_completion(
             or "Return only true or false" in prompt_content
         ):
             return "true" if should_generate else "false"
-        # Otherwise, this is a playbook extraction call - return list-shaped output
-        return StructuredPlaybookList(
-            playbooks=[
-                StructuredPlaybookContent(
-                    trigger="interacting with users",
-                    content=content,
-                )
-            ]
+        # Otherwise this is a playbook extraction turn driven by the tool loop —
+        # return a finish_extraction tool call carrying the structured output.
+        return ToolCallingChatResponse(
+            content=None,
+            tool_calls=[_finish_tool_call()],
+            finish_reason="tool_calls",
         )
 
     service.client.generate_chat_response = MagicMock(
@@ -254,7 +274,7 @@ def test_playbook_generation_with_no_playbook_config(
     _setup_mock_chat_completion(playbook_generation_service)
 
     # Set empty playbook config
-    mock_request_context.configurator.get_config.return_value.user_playbook_extractor_configs = []
+    mock_request_context.configurator.get_config.return_value.user_playbook_extractor_config = None
 
     # Create request interaction data model
     request_interaction_data_model = create_request_interaction_data_model(

@@ -638,3 +638,40 @@ class PlaybookMixin:
     def delete_all_agent_success_evaluation_results(self) -> None:
         """Delete all agent success evaluation results from storage."""
         raise NotImplementedError
+
+    @abstractmethod
+    def delete_agent_success_evaluation_results_for_session(
+        self,
+        session_id: str,
+        evaluation_name: str,
+        agent_version: str,
+    ) -> int:
+        """Delete stored results for (session_id, evaluation_name, agent_version).
+
+        Args:
+            session_id (str): Session whose results to clear.
+            evaluation_name (str): Which evaluator's results to clear.
+            agent_version (str): Agent version scope.
+
+        Returns:
+            int: Number of rows deleted.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_agent_success_evaluation_results_by_ids(
+        self, result_ids: list[int]
+    ) -> int:
+        """Delete agent success eval results matching specific result_ids.
+
+        Used by the regenerate flow to remove only the prior-run rows after the
+        new rows have been saved durably (so an LLM/save failure cannot leave
+        the session with zero rows).
+
+        Args:
+            result_ids (list[int]): Primary-key result_ids to delete.
+
+        Returns:
+            int: Number of rows deleted.
+        """
+        raise NotImplementedError

@@ -135,10 +135,10 @@ class TestConfigLocal:
         assert result.exit_code == 0, result.output
         assert "mode: cloud" in result.output
 
-    def test_local_mode_for_disk(self, runner: CliRunner, cli_app) -> None:
+    def test_local_mode_for_sqlite(self, runner: CliRunner, cli_app) -> None:
         with (
-            patch(self._PATCH_LOAD, return_value="disk"),
-            patch(self._PATCH_RESOLVE, return_value="disk"),
+            patch(self._PATCH_LOAD, return_value="sqlite"),
+            patch(self._PATCH_RESOLVE, return_value="sqlite"),
         ):
             result = runner.invoke(cli_app, ["config", "local"])
         assert result.exit_code == 0, result.output
@@ -169,12 +169,10 @@ class TestConfigUpdate:
         ):
             result = runner.invoke(
                 cli_app,
-                ["config", "update", "--data", '{"extraction_backend":"classic"}'],
+                ["config", "update", "--data", '{"window_size":8}'],
             )
         assert result.exit_code == 0, result.output
-        mock_client.update_config.assert_called_once_with(
-            {"extraction_backend": "classic"}
-        )
+        mock_client.update_config.assert_called_once_with({"window_size": 8})
 
     def test_file_partial(self, runner: CliRunner, cli_app, tmp_path) -> None:
         cfg = tmp_path / "partial.json"
@@ -198,14 +196,14 @@ class TestConfigUpdate:
                     "config",
                     "update",
                     "--field",
-                    "extraction_backend=classic",
+                    "window_size=:json:8",
                     "--field",
-                    "search_backend=classic",
+                    "stride_size=:json:4",
                 ],
             )
         assert result.exit_code == 0, result.output
         mock_client.update_config.assert_called_once_with(
-            {"extraction_backend": "classic", "search_backend": "classic"}
+            {"window_size": 8, "stride_size": 4}
         )
 
     def test_field_json_value_int(self, runner: CliRunner, cli_app) -> None:
@@ -351,7 +349,7 @@ class TestConfigUpdate:
                     "config",
                     "update",
                     "--field",
-                    "extraction_backend=classic",
+                    "window_size=:json:8",
                 ],
             )
         assert result.exit_code == 0, result.output
