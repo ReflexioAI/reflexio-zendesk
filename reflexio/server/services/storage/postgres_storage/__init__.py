@@ -1,5 +1,8 @@
 """Native Postgres storage with direct SQL and pgvector search."""
 
+from reflexio.server.services.storage.postgres_storage._agent_run import (
+    PostgresAgentRunMixin,
+)
 from reflexio.server.services.storage.postgres_storage._extras import ExtrasMixin
 from reflexio.server.services.storage.postgres_storage._operations import (
     OperationMixin,
@@ -17,6 +20,7 @@ from ._base import PostgresStorageBase
 
 
 class PostgresStorage(
+    PostgresAgentRunMixin,
     ProfileMixin,
     RequestMixin,
     PlaybookMixin,

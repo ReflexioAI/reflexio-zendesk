@@ -24,6 +24,11 @@ from reflexio.models.api_schema.service_schemas import (
 )
 from reflexio.models.config_schema import StorageConfigPostgres
 from reflexio.server.services.storage.postgres_storage import PostgresStorage
+from reflexio.server.services.storage.storage_base import (
+    AgentBinding,
+    AgentRunRecord,
+    AgentRunStatus,
+)
 from tests.server.test_utils import skip_in_precommit
 
 
@@ -95,3 +100,49 @@ def test_postgres_storage_round_trip(postgres_storage: PostgresStorage) -> None:
     assert postgres_storage.get_request(request_id).request_id == request_id
     profiles = postgres_storage.get_user_profile(user_id)
     assert [item.profile_id for item in profiles] == [profile.profile_id]
+
+
+@skip_in_precommit
+def test_postgres_agent_run_round_trip(postgres_storage: PostgresStorage) -> None:
+    run_id = f"pg-agent-run-{uuid.uuid4().hex[:8]}"
+    request_id = f"pg-agent-request-{uuid.uuid4().hex[:8]}"
+
+    created = postgres_storage.create_agent_run(
+        AgentRunRecord(
+            id=run_id,
+            binding=AgentBinding(
+                org_id=postgres_storage.org_id,
+                extractor_kind="profile",
+                extractor_name="docker_postgres_agent_run",
+                user_id="pg-agent-user",
+                request_id=request_id,
+                agent_version="docker-postgres-e2e",
+                source="docker-postgres-e2e",
+                source_interaction_ids=[1, 2],
+            ),
+            status=AgentRunStatus.RUNNING,
+            generation_request_snapshot={"request_id": request_id},
+            service_config_snapshot={"window_size": 10},
+        )
+    )
+
+    assert created.id == run_id
+    assert created.binding.source_interaction_ids == [1, 2]
+    assert created.status == AgentRunStatus.RUNNING
+
+    updated = postgres_storage.update_agent_run_status(
+        run_id,
+        AgentRunStatus.FINALIZED,
+        committed_output={"profiles": [{"content": "Postgres agent run works"}]},
+    )
+
+    assert updated is not None
+    assert updated.status == AgentRunStatus.FINALIZED
+    assert updated.committed_output == {
+        "profiles": [{"content": "Postgres agent run works"}]
+    }
+    assert updated.finalized_at is not None
+
+    loaded = postgres_storage.get_agent_run(run_id)
+    assert loaded is not None
+    assert loaded.status == AgentRunStatus.FINALIZED
