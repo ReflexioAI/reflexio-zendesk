@@ -53,23 +53,29 @@ class ReflectionDecision(BaseModel):
             profiles, stringified ``user_playbook_id`` for playbooks.
         new_content (str | None): Replacement content text. Setting any
             of ``new_content`` / ``new_trigger`` / ``new_rationale`` /
-            ``new_profile_time_to_live`` / ``new_polarity`` flags this
-            decision as a revision. Leave all None for no_change.
+            ``new_profile_time_to_live`` flags this decision as a
+            revision. Leave all None for no_change.
+
+            Polarity is never declared on the decision: a playbook
+            *flip* is expressed purely by rewriting ``new_content`` in
+            the opposite orientation (negative wording such as
+            ``Avoid`` / ``Do not`` / ``Don't`` / ``Never`` for a
+            success→failure flip; affirmative wording for the reverse).
+            A flip is LLM-reported via that rewritten ``new_content``
+            plus a ``new_rationale`` naming the motivating failure — it
+            is not derived from wording.
         new_trigger (str | None): Replacement playbook trigger.
             Optional even on revision; None falls back to the cited
             value. Ignored for profiles.
         new_rationale (str | None): Replacement playbook rationale.
-            Same fallback semantics. Required when ``new_polarity``
-            differs from the cited row's polarity (audit trail).
+            Same fallback semantics. Required whenever applying a
+            ``new_content`` revision (the prompt sets it on substance
+            rewrites and flips alike, so a content rewrite needs an
+            audit trail naming the motivating failure/observation).
             Ignored for profiles.
         new_profile_time_to_live (ProfileTimeToLive | None): Replacement
             profile TTL. None falls back to the cited value. Ignored
             for playbooks.
-        new_polarity (Literal["positive", "negative"] | None):
-            Replacement polarity for the cited playbook. None keeps the
-            current polarity. Setting a value different from the cited
-            polarity is a flip and requires ``new_rationale`` to be
-            set. Must be None for profile decisions.
         reason (str): Short justification, logged.
     """
 
@@ -79,7 +85,6 @@ class ReflectionDecision(BaseModel):
     new_trigger: str | None = None
     new_rationale: str | None = None
     new_profile_time_to_live: ProfileTimeToLive | None = None
-    new_polarity: Literal["positive", "negative"] | None = None
     reason: str = ""
 
 
@@ -105,12 +110,26 @@ class ReflectionResult(BaseModel):
             ``deferred`` by the post-horizon filter.
         no_change_count (int): Decisions with no revision fields set.
         revised_count (int): Decisions with at least one revision
-            field set (excludes flipped — flipped is a strict subset
-            counted separately).
-        flipped_count (int): Subset of revised: playbook decisions
-            whose ``new_polarity`` differs from the cited row's
-            polarity.
-        failed_count (int): Per-decision apply failures, logged.
+            field set. Flips (orientation changes) are LLM-reported via
+            the rewritten ``new_content`` + ``new_rationale`` the prompt
+            emits and are counted as ordinary revisions — there is no
+            separate flip counter, because the prompt sets ``new_rationale``
+            on both flips and non-flip content rewrites, so the two cannot
+            be distinguished without re-deriving polarity (which is retired).
+        trigger_revised_count (int): Subset of applied revisions where
+            ``new_trigger`` was set (playbook trigger changed).
+        content_revised_count (int): Subset of applied revisions where
+            ``new_content`` was set (profile or playbook content changed).
+        ttl_changed_count (int): Subset of applied revisions where
+            ``new_profile_time_to_live`` was set (profile TTL changed).
+        capped_count (int): Revision-intent decisions skipped because the
+            per-pass cap (``ReflectionConfig.max_revisions_per_pass``) was
+            already reached. no_change decisions never count here.
+        failed_count (int): Per-decision failures, logged. Includes both
+            apply-step errors and decisions rejected by ``_validate_decision``
+            (e.g. a playbook ``new_content`` revision that omits
+            ``new_rationale``, which the prompt requires on every playbook
+            content edit).
     """
 
     ran: bool = False
@@ -120,5 +139,8 @@ class ReflectionResult(BaseModel):
     skipped_count: int = 0
     no_change_count: int = 0
     revised_count: int = 0
-    flipped_count: int = 0
+    trigger_revised_count: int = 0
+    content_revised_count: int = 0
+    ttl_changed_count: int = 0
+    capped_count: int = 0
     failed_count: int = 0

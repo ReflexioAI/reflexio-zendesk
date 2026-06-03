@@ -369,6 +369,7 @@ class DeduplicationConfig(BaseModel):
     Args:
         search_threshold: Minimum similarity score for search results (0.0-1.0).
         search_top_k: Maximum number of existing playbooks to retrieve per new playbook.
+        max_unified_content_chars: Soft cap on a unified playbook's content length.
     """
 
     search_threshold: float = Field(
@@ -381,6 +382,15 @@ class DeduplicationConfig(BaseModel):
         default=5,
         ge=1,
         description="Maximum number of existing playbooks to retrieve per new playbook.",
+    )
+    max_unified_content_chars: int = Field(
+        default=1200,
+        gt=0,
+        description=(
+            "Soft cap on a unified playbook's content length; unify that would "
+            "exceed it should prefer differentiate/keep-separate. Enforced as a "
+            "warning-only backstop in the consolidator apply path."
+        ),
     )
 
 
@@ -511,6 +521,10 @@ class ReflectionConfig(BaseModel):
             edge of the window with fewer than this many follow-up turns get a
             'last_chance' judgment with the prompt biased toward no_change.
             Set to 0 to disable the filter (legacy behavior).
+        max_revisions_per_pass (int): Cap on the number of revision decisions
+            applied in a single reflection pass (regularization). Once the cap
+            is hit, remaining revision-intent decisions are skipped and counted
+            in ``ReflectionResult.capped_count``.
     """
 
     enabled: bool = True
@@ -526,6 +540,33 @@ class ReflectionConfig(BaseModel):
         ),
         ge=0,
     )
+    max_revisions_per_pass: int = Field(
+        default=8,
+        gt=0,
+        description=(
+            "Cap on revision decisions applied per reflection pass "
+            "(regularization; excess are skipped)."
+        ),
+    )
+
+
+class RetrievalFloorConfig(BaseModel):
+    """Read-path relevance floor: drop search results below a per-arm cross-encoder score.
+
+    Floors are RAW cross-encoder logits (ms-marco-MiniLM), not probabilities. On this
+    corpus relevant items score roughly -2..-4 and clear junk -6..-11, so a conservative
+    default of -5 isolates junk. Calibrate per arm on real data.
+    """
+
+    enabled: bool = True
+    pool_size: int = Field(
+        default=30,
+        gt=0,
+        description="Candidates fetched per arm before flooring + cap to top_k.",
+    )
+    profile_floor: float = -5.0
+    user_playbook_floor: float = -5.0
+    agent_playbook_floor: float = -5.0
 
 
 class PlaybookOptimizerConfig(BaseModel):
@@ -719,6 +760,8 @@ class Config(BaseModel):
     llm_config: LLMConfig | None = None
     # Post-publish reflection service configuration
     reflection_config: ReflectionConfig = Field(default_factory=ReflectionConfig)
+    # Read-path relevance floor (per-arm cross-encoder score cutoff)
+    retrieval_floor: RetrievalFloorConfig = Field(default_factory=RetrievalFloorConfig)
     # Optional GEPA-backed playbook content optimizer
     playbook_optimizer_config: PlaybookOptimizerConfig = Field(
         default_factory=PlaybookOptimizerConfig
@@ -781,6 +824,7 @@ class Config(BaseModel):
                 "reflection_config",
                 "playbook_optimizer_config",
                 "pending_tool_call_config",
+                "retrieval_floor",
             ):
                 if key in data and data[key] is None:
                     del data[key]

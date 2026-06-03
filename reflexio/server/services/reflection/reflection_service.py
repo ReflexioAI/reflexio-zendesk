@@ -39,9 +39,6 @@ from reflexio.models.api_schema.domain.entities import (
 )
 from reflexio.server.llm.litellm_client import LiteLLMClient
 from reflexio.server.services.operation_state_utils import OperationStateManager
-from reflexio.server.services.polarity_utils import (
-    warn_if_polarity_content_mismatch,
-)
 from reflexio.server.services.reflection.reflection_extractor import (
     ReflectionExtractor,
 )
@@ -59,6 +56,10 @@ if TYPE_CHECKING:
     from reflexio.server.api_endpoints.request_context import RequestContext
 
 logger = logging.getLogger(__name__)
+
+# Fallback per-pass revision cap when no ReflectionConfig is available in
+# the apply path. Mirrors ReflectionConfig.max_revisions_per_pass default.
+_DEFAULT_MAX_REVISIONS_PER_PASS = 8
 
 
 class ReflectionService:
@@ -210,13 +211,24 @@ class ReflectionService:
         profiles_by_id = {p.profile_id: p for p in cited_profiles}
         playbooks_by_id = {p.user_playbook_id: p for p in cited_playbooks}
 
+        max_revisions_per_pass = (
+            reflection_config.max_revisions_per_pass
+            if reflection_config is not None
+            else _DEFAULT_MAX_REVISIONS_PER_PASS
+        )
+
         for decision in output.decisions:
             if not _is_revision(decision):
                 result.no_change_count += 1
                 continue
+            # Per-pass cap: once we've applied max_revisions_per_pass
+            # revisions, skip any further revision-intent decisions.
+            if result.revised_count >= max_revisions_per_pass:
+                result.capped_count += 1
+                continue
             try:
                 self._validate_decision(decision, profiles_by_id, playbooks_by_id)
-                applied, was_flip = self._apply_revision(
+                applied = self._apply_revision(
                     request=request,
                     decision=decision,
                     profiles_by_id=profiles_by_id,
@@ -235,8 +247,13 @@ class ReflectionService:
                 continue
             if applied:
                 result.revised_count += 1
-                if was_flip:
-                    result.flipped_count += 1
+                # Field-derivable granular counters (no mode label exists).
+                if decision.new_trigger is not None:
+                    result.trigger_revised_count += 1
+                if decision.new_content is not None:
+                    result.content_revised_count += 1
+                if decision.new_profile_time_to_live is not None:
+                    result.ttl_changed_count += 1
             else:
                 result.skipped_count += 1
 
@@ -248,7 +265,8 @@ class ReflectionService:
 
         logger.info(
             "event=reflection_done user_id=%s gate_open=%s ran=%s "
-            "cited=%d considered=%d no_change=%d revised=%d flipped=%d "
+            "cited=%d considered=%d no_change=%d revised=%d "
+            "trigger_revised=%d content_revised=%d ttl_changed=%d capped=%d "
             "skipped=%d failed=%d",
             request.user_id,
             result.gate_open,
@@ -257,7 +275,10 @@ class ReflectionService:
             result.considered_count,
             result.no_change_count,
             result.revised_count,
-            result.flipped_count,
+            result.trigger_revised_count,
+            result.content_revised_count,
+            result.ttl_changed_count,
+            result.capped_count,
             result.skipped_count,
             result.failed_count,
         )
@@ -326,7 +347,15 @@ class ReflectionService:
         profiles_by_id: dict[str, UserProfile],  # noqa: ARG002 - kept for signature parity with _apply_revision
         playbooks_by_id: dict[int, UserPlaybook],
     ) -> None:
-        """Raise if the decision violates polarity invariants.
+        """Raise if a playbook content rewrite omits ``new_rationale``.
+
+        Flip is LLM-reported, not derived: the ``memory_reflection`` prompt
+        instructs the model to set ``new_rationale`` whenever it changes a
+        rule's orientation (a flip), and to set it on substance rewrites of
+        playbook content as well. So any playbook revision that sets
+        ``new_content`` must carry a ``new_rationale`` — this preserves the
+        flip-requires-rationale audit-trail spirit without re-deriving
+        polarity from wording. Trigger-only / TTL-only revisions are exempt.
 
         Per-decision try/except in the caller catches these and counts
         them as failed_count.
@@ -339,11 +368,10 @@ class ReflectionService:
                 rows keyed by user_playbook_id.
 
         Raises:
-            ValueError: When the decision violates a polarity invariant.
+            ValueError: When a playbook ``new_content`` revision omits
+                ``new_rationale``.
         """
         if decision.target_kind == "profile":
-            if decision.new_polarity is not None:
-                raise ValueError("profile decisions may not set new_polarity")
             return
         # Playbook
         try:
@@ -355,12 +383,8 @@ class ReflectionService:
         cited = playbooks_by_id.get(target_id)
         if cited is None:
             return  # apply step will mark as skipped
-        if (
-            decision.new_polarity is not None
-            and decision.new_polarity != cited.polarity
-            and not decision.new_rationale
-        ):
-            raise ValueError("polarity flip must include new_rationale")
+        if decision.new_content is not None and not decision.new_rationale:
+            raise ValueError("playbook content revision must include new_rationale")
 
     def _apply_revision(
         self,
@@ -369,7 +393,7 @@ class ReflectionService:
         decision: ReflectionDecision,
         profiles_by_id: dict[str, UserProfile],
         playbooks_by_id: dict[int, UserPlaybook],
-    ) -> tuple[bool, bool]:
+    ) -> bool:
         """Apply a revision decision.
 
         Args:
@@ -382,31 +406,27 @@ class ReflectionService:
                 rows keyed by user_playbook_id.
 
         Returns:
-            tuple[bool, bool]: ``(applied, was_flip)``. ``applied=False``
-            means the target row could not be resolved (target archived
-            between resolve and apply, etc.). ``was_flip=True`` indicates
-            the new playbook polarity differs from the cited one (profiles
-            always return False here).
+            bool: ``applied``. ``False`` means the target row could not be
+            resolved (target archived between resolve and apply, etc.).
+
+        Flip is no longer derived here: orientation changes are LLM-reported
+        via the rewritten ``new_content`` + ``new_rationale`` the prompt
+        emits, not inferred from wording at apply time.
         """
         if decision.target_kind == "profile":
             cited_p = profiles_by_id.get(decision.target_id)
             if cited_p is None:
-                return False, False
-            return self._replace_profile(request, decision, cited_p), False
+                return False
+            return self._replace_profile(request, decision, cited_p)
         # Playbook
         try:
             target_id = int(decision.target_id)
         except (TypeError, ValueError):
-            return False, False
+            return False
         cited_pb = playbooks_by_id.get(target_id)
         if cited_pb is None:
-            return False, False
-        was_flip = (
-            decision.new_polarity is not None
-            and decision.new_polarity != cited_pb.polarity
-        )
-        applied = self._replace_playbook(request, decision, cited_pb)
-        return applied, was_flip
+            return False
+        return self._replace_playbook(request, decision, cited_pb)
 
     def _replace_profile(
         self,
@@ -441,6 +461,12 @@ class ReflectionService:
             source=cited.source,
             status=None,
             extractor_names=cited.extractor_names,
+        )
+        _log_edit_magnitude(
+            kind="profile",
+            target_id=cited.profile_id,
+            old_content=cited.content,
+            new_content=new_profile.content,
         )
         storage.add_user_profile(cited.user_id, [new_profile])
         try:
@@ -500,22 +526,25 @@ class ReflectionService:
                 if decision.new_rationale is not None
                 else cited.rationale
             ),
-            polarity=(
-                decision.new_polarity
-                if decision.new_polarity is not None
-                else cited.polarity
-            ),
             status=None,
             source=cited.source,
             source_interaction_ids=list(cited.source_interaction_ids),
         )
-        warn_if_polarity_content_mismatch(new_playbook)
-        if new_playbook.polarity != cited.polarity:
+        _log_edit_magnitude(
+            kind="playbook",
+            target_id=str(cited.user_playbook_id),
+            old_content=cited.content,
+            new_content=new_playbook.content,
+        )
+        # Flip is LLM-reported, not derived: when the model changes a rule's
+        # orientation it rewrites ``new_content`` and names the motivating
+        # failure/observation in ``new_rationale`` (per the memory_reflection
+        # prompt). A rewrite-with-rationale is the LLM-reported flip/revision
+        # signal — log it for observability without re-deriving polarity.
+        if decision.new_content is not None and decision.new_rationale:
             logger.info(
-                "reflection.flip prior_polarity=%s new_polarity=%s playbook_id=%s "
-                'content_excerpt="%s" prior_excerpt="%s" citation_excerpt="%s"',
-                cited.polarity,
-                new_playbook.polarity,
+                "reflection.content_revision playbook_id=%s "
+                'content_excerpt="%s" prior_excerpt="%s" rationale_excerpt="%s"',
                 cited.user_playbook_id,
                 (new_playbook.content or "")[:120].replace('"', "'"),
                 (cited.content or "")[:120].replace('"', "'"),
@@ -555,12 +584,45 @@ _PLAYBOOK_REVISION_FIELDS: tuple[str, ...] = (
     "new_content",
     "new_trigger",
     "new_rationale",
-    "new_polarity",
 )
+
+
 _REVISION_FIELDS_BY_KIND: dict[str, tuple[str, ...]] = {
     "profile": _PROFILE_REVISION_FIELDS,
     "playbook": _PLAYBOOK_REVISION_FIELDS,
 }
+
+
+def _log_edit_magnitude(
+    *,
+    kind: str,
+    target_id: str,
+    old_content: str | None,
+    new_content: str | None,
+) -> None:
+    """Log a cheap edit-magnitude signal for one applied revision.
+
+    The magnitude is the content-size delta (new length minus old length)
+    in characters — a coarse proxy for how large the revision is, useful
+    for offline regularization analysis without storing diffs.
+
+    Args:
+        kind (str): ``"profile"`` or ``"playbook"``.
+        target_id (str): Id of the cited row being replaced.
+        old_content (str | None): Cited row content before the revision.
+        new_content (str | None): Replacement row content after the revision.
+    """
+    old_len = len(old_content or "")
+    new_len = len(new_content or "")
+    logger.info(
+        "event=reflection_edit_magnitude target_kind=%s target_id=%s "
+        "old_len=%d new_len=%d delta=%d",
+        kind,
+        target_id,
+        old_len,
+        new_len,
+        new_len - old_len,
+    )
 
 
 def _is_revision(decision: ReflectionDecision) -> bool:

@@ -5,7 +5,9 @@ These tests drive ``PlaybookConsolidator.deduplicate`` end-to-end with a real
 ``ConsolidationDecision`` kinds produces the correct storage transitions:
 
 * ``UnifyDecision`` — 0..N EXISTING archived; one row inserted carrying the
-  LLM-supplied final ``content`` / ``trigger`` / ``rationale`` / ``polarity``.
+  LLM-supplied final ``content`` / ``trigger`` / ``rationale``. Under Option B
+  a unified skill may hold mixed-polarity rules and the apply path performs no
+  mechanical polarity check (the no-self-contradiction judgment is the LLM's).
 * ``RejectNewDecision`` — storage state unchanged (NEW dropped, EXISTING wins).
 * ``DifferentiateDecision`` — existing archived, two refined rows emitted.
 * ``IndependentDecision`` — new candidate inserted, no archive.
@@ -125,6 +127,10 @@ def _make_existing_playbook(
     """
     if content is None:
         content = "Avoid X." if polarity == "negative" else "Recommend X."
+    # Orientation is a wording convention: a negative row uses avoidance
+    # framing ("Avoid …") and carries a failure signal in its rationale to be
+    # coherent, mirroring what the extractor actually writes.
+    rationale = "user pushback observed" if polarity == "negative" else "r"
     pb = UserPlaybook(
         user_playbook_id=0,
         user_id=user_id,
@@ -133,12 +139,11 @@ def _make_existing_playbook(
         playbook_name=playbook_name,
         content=content,
         trigger=trigger,
-        rationale="r",
+        rationale=rationale,
         blocking_issue=None,
         status=None,
         source="chat",
         source_interaction_ids=[],
-        polarity=polarity,  # type: ignore[arg-type]
     )
     storage.save_user_playbooks([pb])
     saved = storage.get_user_playbooks(user_id=user_id)
@@ -166,6 +171,10 @@ def _make_candidate(
     Returns:
         A fresh ``UserPlaybook`` ready to flow through ``deduplicate``.
     """
+    # Orientation is a wording convention: a negative candidate uses avoidance
+    # framing ("Avoid …") and carries a failure signal in its rationale,
+    # mirroring what the extractor actually writes.
+    rationale = "user pushback observed" if polarity == "negative" else "r"
     return UserPlaybook(
         user_playbook_id=0,
         user_id=user_id,
@@ -174,12 +183,11 @@ def _make_candidate(
         playbook_name="default",
         content=content,
         trigger=trigger,
-        rationale="r",
+        rationale=rationale,
         blocking_issue=None,
         status=None,
         source="chat",
         source_interaction_ids=[],
-        polarity=polarity,  # type: ignore[arg-type]
     )
 
 
@@ -258,9 +266,9 @@ class TestUnify:
         """Pair replacement (was ``prefer_new``): NEW negative supersedes EXISTING negative.
 
         ``unify`` with one archived EXISTING and one NEW produces a single
-        unified row carrying the LLM-supplied content and polarity. Polarity
-        validator requires the archived EXISTING's polarity to match the
-        decision's polarity, so this scenario uses a same-polarity pair.
+        unified row carrying the LLM-supplied content. Under Option B there is
+        no apply-time polarity check; this same-orientation pair exercises the
+        plain dedup/supersede path.
         """
         existing = _make_existing_playbook(sqlite_storage, polarity="negative")
         candidate = _make_candidate(content="Avoid X (always).", polarity="negative")
@@ -275,8 +283,7 @@ class TestUnify:
                     archive_existing_ids=[0],
                     content="Avoid X (always).",
                     trigger="when Y",
-                    rationale="merged",
-                    polarity="negative",
+                    rationale="merged after user pushback observed",
                 )
             ],
         )
@@ -284,13 +291,13 @@ class TestUnify:
         assert archive_ids == [existing.user_playbook_id]
         assert len(rows) == 1
         assert rows[0].content == "Avoid X (always)."
-        assert rows[0].polarity == "negative"
+        assert rows[0].content.lstrip().startswith("Avoid")
 
         _apply_to_storage(sqlite_storage, rows, archive_ids)
         surviving = sqlite_storage.get_user_playbooks(user_id="u1")
         # SQLite delete is a hard remove; only the unified row remains.
         assert len(surviving) == 1
-        assert surviving[0].polarity == "negative"
+        assert surviving[0].content.lstrip().startswith("Avoid")
         assert surviving[0].content == "Avoid X (always)."
 
     def test_n_way_merge_archives_all_existing_members_and_inserts_one(
@@ -319,14 +326,15 @@ class TestUnify:
             content="Recommend X (variant b).",
             trigger="when Y",
             rationale="r",
-            polarity="positive",
             source="chat",
             source_interaction_ids=[],
         )
         sqlite_storage.save_user_playbooks([pb_b])
         all_existing = sqlite_storage.get_user_playbooks(user_id="u_nway")
         assert len(all_existing) == 2
-        existing_b = next(p for p in all_existing if p.user_playbook_id != existing_a.user_playbook_id)
+        existing_b = next(
+            p for p in all_existing if p.user_playbook_id != existing_a.user_playbook_id
+        )
 
         candidate = _make_candidate(
             user_id="u_nway",
@@ -348,7 +356,6 @@ class TestUnify:
                     content="Recommend X (canonical).",
                     trigger="when Y",
                     rationale="merged",
-                    polarity="positive",
                 )
             ],
         )
@@ -365,7 +372,9 @@ class TestUnify:
         assert len(surviving) == 1
         assert surviving[0].content == "Recommend X (canonical)."
 
-    def test_insert_without_archive(self, sqlite_storage, request_context, consolidator):
+    def test_insert_without_archive(
+        self, sqlite_storage, request_context, consolidator
+    ):
         """``unify`` with empty ``archive_existing_ids`` inserts NEW without archiving.
 
         This shape is conceptually ``independent`` at the storage layer; the
@@ -385,7 +394,6 @@ class TestUnify:
                     content="Recommend Z.",
                     trigger="when Y",
                     rationale="r",
-                    polarity="positive",
                 )
             ],
         )
@@ -519,92 +527,182 @@ class TestIndependent:
 
 
 class TestContradictionResolutionContract:
-    """Linchpin contract: opposing-polarity same-trigger pairs MUST route through
-    a contradiction kind (``unify`` with matching polarity, ``reject_new``, or
-    ``differentiate``) and MUST NEVER be silently merged via a mixed-polarity
-    ``unify`` or accepted as ``independent``.
+    """Option B contract: a same-SITUATION contradiction (same trigger, opposite
+    advice) MUST route through ``differentiate`` or ``reject_new`` — never
+    ``unify`` (which would let a skill contradict itself) and never
+    ``independent``. The no-self-contradiction judgment is now made by the LLM
+    in the consolidation prompt; the apply layer no longer enforces a mechanical
+    same-polarity guard.
 
-    Under the 4-kind redesign the apply layer enforces this via the ``unify``
-    polarity validator: a ``UnifyDecision`` that archives an EXISTING row with
-    a different polarity raises ``ConsolidationContractError`` and the
-    per-decision isolation in ``_build_deduplicated_results`` bumps the
-    ``failed_count`` and suppresses the safety fallback for the NEW members,
-    so the orphan candidate is not silently re-inserted as an opposing twin.
+    Conversely, a mixed-polarity ``unify`` across DIFFERENT sub-aspects (a
+    do-rule + an avoid-rule for distinct situations) is now LEGITIMATE and
+    composes a multi-rule skill — the case the old mechanical validator wrongly
+    blocked.
     """
 
-    def test_opposing_polarity_unify_is_rejected_by_validator(
-        self, sqlite_storage, request_context, consolidator, caplog
+    def test_mixed_polarity_unify_composes_multi_rule_skill(
+        self, sqlite_storage, request_context, consolidator
     ):
-        """A ``unify`` archiving an opposite-polarity EXISTING is rejected.
+        """Mixed-polarity ``unify`` on DIFFERENT sub-aspects now SUCCEEDS.
 
-        If the LLM returns a ``UnifyDecision`` that archives a positive
-        EXISTING row but declares ``polarity="negative"`` (matching the NEW
-        candidate), the apply layer raises ``ConsolidationContractError`` and
-        the per-decision isolation in ``_build_deduplicated_results`` bumps
-        the failed counter. Crucially, the safety fallback must NOT silently
-        re-insert the orphan candidate — that would still leave both opposing
-        rules in current storage, breaking the contract.
+        A NEW avoid-rule on a distinct sub-aspect ("avoid Friday deploys")
+        composes with an EXISTING do-rule ("announce in the channel") into one
+        multi-rule skill. Under Option B the apply layer no longer derives a
+        whole-content polarity nor rejects the merge — the LLM is responsible
+        for only composing coherent, non-self-contradicting rules. The merge
+        must apply: the existing row is archived and the unified row carries
+        both rules.
         """
         existing = _make_existing_playbook(
             sqlite_storage,
             polarity="positive",
-            content="Recommend X.",
-            trigger="when Y",
+            content="Do: announce the deploy in the team channel.",
+            trigger="deploying a service",
         )
         candidate = _make_candidate(
-            content="Avoid X.",
-            trigger="when Y",
+            content="Avoid Friday-afternoon deploys.",
+            trigger="deploying a service",
             polarity="negative",
         )
 
-        with caplog.at_level("WARNING"):
-            rows, archive_ids = _run_consolidator(
-                consolidator,
-                candidates=[candidate],
-                existing_playbooks=[existing],
-                decisions=[
-                    UnifyDecision(
-                        new_id="NEW-0",
-                        archive_existing_ids=[0],
-                        content="Avoid X.",
-                        trigger="when Y",
-                        rationale="conflict — LLM mis-merged opposite polarities",
-                        polarity="negative",
-                    )
-                ],
-            )
-
-        # Apply layer rejected the bad decision: no row produced, no archive.
-        assert rows == [], (
-            "contract violation must NOT produce a unified row — got "
-            f"{[(r.content, r.polarity) for r in rows]}"
+        unified_content = (
+            "Do: announce the deploy in the team channel. "
+            "Avoid: Friday-afternoon deploys."
         )
-        assert archive_ids == [], (
-            f"contract violation must NOT archive the existing row — got {archive_ids}"
+        rows, archive_ids = _run_consolidator(
+            consolidator,
+            candidates=[candidate],
+            existing_playbooks=[existing],
+            decisions=[
+                UnifyDecision(
+                    new_id="NEW-0",
+                    archive_existing_ids=[0],
+                    content=unified_content,
+                    trigger="deploying a service",
+                    rationale=(
+                        "composed multi-rule deploy skill: announce (do) and "
+                        "avoid Friday deploys (avoid) cover different sub-aspects"
+                    ),
+                )
+            ],
         )
 
-        # The per-decision isolation logged the contract violation.
-        assert any(
-            "consolidation_contract_violation" in record.message
-            for record in caplog.records
-        ), (
-            "expected a consolidation_contract_violation warning; got: "
-            f"{[r.message for r in caplog.records]}"
-        )
+        # The merge applied: the existing row is archived and one unified row
+        # carrying BOTH rules is produced. No ConsolidationContractError.
+        assert archive_ids == [existing.user_playbook_id]
+        assert len(rows) == 1
+        assert rows[0].content == unified_content
+        # Both the do-rule and the avoid-rule survived the merge.
+        assert "announce" in rows[0].content.lower()
+        assert "friday" in rows[0].content.lower()
 
-        # Storage state: the existing positive row remains untouched, and the
-        # negative candidate was NOT silently inserted by the safety fallback.
-        # Opposing-polarity rules with the same trigger must NEVER both occupy
-        # current state simultaneously.
         _apply_to_storage(sqlite_storage, rows, archive_ids)
         surviving = sqlite_storage.get_user_playbooks(user_id="u1")
         assert len(surviving) == 1, (
-            "exactly one row must survive — got "
-            f"{[(r.content, r.polarity) for r in surviving]}"
+            "exactly one composed skill must survive — got "
+            f"{[r.content for r in surviving]}"
         )
+        assert surviving[0].content == unified_content
+
+    def test_same_situation_contradiction_does_not_unify(
+        self, sqlite_storage, request_context, consolidator
+    ):
+        """Same-situation contradiction routes through ``differentiate``, NOT ``unify``.
+
+        Same trigger, opposite advice on the SAME sub-aspect ("use -F" vs
+        "avoid -F"). Under Option B this is the forbidden self-contradiction
+        case, and the decision is driven by the LLM: the mocked LLM returns a
+        ``DifferentiateDecision`` (refine the triggers so each rule owns a
+        disjoint situation) rather than a ``unify``. The apply layer no longer
+        has a mechanical guard — it simply executes the LLM's decision. Assert
+        the pair is NOT merged into one self-contradicting skill.
+        """
+        existing = _make_existing_playbook(
+            sqlite_storage,
+            polarity="positive",
+            content="Use -F when pushing.",
+            trigger="git push",
+        )
+        candidate = _make_candidate(
+            content="Avoid -F when pushing.",
+            trigger="git push",
+            polarity="negative",
+        )
+
+        rows, archive_ids = _run_consolidator(
+            consolidator,
+            candidates=[candidate],
+            existing_playbooks=[existing],
+            decisions=[
+                DifferentiateDecision(
+                    new_id="NEW-0",
+                    existing_id=existing.user_playbook_id,
+                    refined_new_trigger="git push to a shared branch",
+                    refined_existing_trigger="git push to your own feature branch",
+                )
+            ],
+        )
+
+        # NOT unified into one row: differentiate archives the existing and
+        # emits two refined rows on disjoint triggers.
+        assert archive_ids == [existing.user_playbook_id]
+        assert len(rows) == 2
+        assert all(
+            r.content != "Use -F when pushing. Avoid -F when pushing." for r in rows
+        )
+
+        _apply_to_storage(sqlite_storage, rows, archive_ids)
+        surviving = sqlite_storage.get_user_playbooks(user_id="u1")
+        assert len(surviving) == 2
+        surviving_triggers = {r.trigger for r in surviving}
+        assert "git push" not in surviving_triggers
+        assert surviving_triggers == {
+            "git push to a shared branch",
+            "git push to your own feature branch",
+        }
+
+    def test_same_situation_contradiction_resolves_via_reject_new(
+        self, sqlite_storage, request_context, consolidator
+    ):
+        """Same-situation contradiction can also resolve via ``reject_new``.
+
+        The other LLM-driven resolution: the existing rule wins and the new
+        contradicting candidate is dropped. Storage is unchanged and the
+        candidate does not leak in via the safety fallback.
+        """
+        existing = _make_existing_playbook(
+            sqlite_storage,
+            polarity="positive",
+            content="Use -F when pushing.",
+            trigger="git push",
+        )
+        candidate = _make_candidate(
+            content="Avoid -F when pushing.",
+            trigger="git push",
+            polarity="negative",
+        )
+
+        rows, archive_ids = _run_consolidator(
+            consolidator,
+            candidates=[candidate],
+            existing_playbooks=[existing],
+            decisions=[
+                RejectNewDecision(
+                    new_id="NEW-0",
+                    superseded_by_existing_id=existing.user_playbook_id,
+                    reason="storage-stability tie-break on same-situation contradiction",
+                )
+            ],
+        )
+
+        assert rows == []
+        assert archive_ids == []
+
+        _apply_to_storage(sqlite_storage, rows, archive_ids)
+        surviving = sqlite_storage.get_user_playbooks(user_id="u1")
+        assert len(surviving) == 1
         assert surviving[0].user_playbook_id == existing.user_playbook_id
-        assert surviving[0].polarity == "positive"
-        assert surviving[0].content == "Recommend X."
+        assert surviving[0].content == "Use -F when pushing."
 
     def test_opposing_polarity_resolves_via_reject_new(
         self, sqlite_storage, request_context, consolidator
@@ -648,7 +746,7 @@ class TestContradictionResolutionContract:
         surviving = sqlite_storage.get_user_playbooks(user_id="u1")
         assert len(surviving) == 1
         assert surviving[0].user_playbook_id == existing.user_playbook_id
-        assert surviving[0].polarity == "positive"
+        assert surviving[0].content.lstrip().startswith("Recommend")
         assert surviving[0].content == "Recommend X."
 
     def test_opposing_polarity_resolves_via_differentiate(
@@ -697,14 +795,19 @@ class TestContradictionResolutionContract:
         assert len(surviving) == 2
         surviving_triggers = {r.trigger for r in surviving}
         assert "when Y" not in surviving_triggers
-        # Each refined trigger appears with exactly one polarity.
-        polarity_by_trigger = {r.trigger: r.polarity for r in surviving}
+        # Each refined trigger carries exactly the expected wording: the
+        # declined-recently branch keeps the negative (avoidance) candidate;
+        # the not-declined branch keeps the original positive rule.
+        content_by_trigger = {r.trigger: r.content for r in surviving}
         assert (
-            polarity_by_trigger["when Y AND has declined X recently"] == "negative"
+            content_by_trigger["when Y AND has declined X recently"]
+            .lstrip()
+            .startswith("Avoid")
         )
         assert (
-            polarity_by_trigger["when Y AND has not declined X recently"]
-            == "positive"
+            content_by_trigger["when Y AND has not declined X recently"]
+            .lstrip()
+            .startswith("Recommend")
         )
 
     def test_independent_over_contradiction_pair_is_forbidden_post_hoc(
@@ -748,21 +851,24 @@ class TestContradictionResolutionContract:
         _apply_to_storage(sqlite_storage, rows, archive_ids)
         surviving = sqlite_storage.get_user_playbooks(user_id="u1")
 
-        polarities_per_trigger: dict[str, set[str]] = {}
+        # Orientation is a wording convention: avoidance ("Avoid …") vs. not.
+        orientation_per_trigger: dict[str, set[bool]] = {}
         for pb in surviving:
             if pb.trigger is None:
                 continue
-            polarities_per_trigger.setdefault(pb.trigger, set()).add(pb.polarity)
+            orientation_per_trigger.setdefault(pb.trigger, set()).add(
+                pb.content.lstrip().startswith("Avoid")
+            )
 
         violations = [
-            (trigger, polarities)
-            for trigger, polarities in polarities_per_trigger.items()
-            if "positive" in polarities and "negative" in polarities
+            (trigger, orientations)
+            for trigger, orientations in orientation_per_trigger.items()
+            if len(orientations) > 1
         ]
         assert violations, (
             "expected the forbidden 'independent over contradiction pair' to leave "
-            "the post-state with opposing-polarity rows on the same trigger; got "
-            f"{polarities_per_trigger!r}"
+            "the post-state with mixed-orientation rows on the same trigger; got "
+            f"{ {t: [pb.content for pb in surviving if pb.trigger == t] for t in orientation_per_trigger}!r}"
         )
         # The assertion above pins the contract: if the apply layer ever grows
         # a runtime guard, this test will fail and should be updated to assert
