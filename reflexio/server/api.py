@@ -1,8 +1,9 @@
 import asyncio
 import inspect
 import logging
-import threading
+import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 
@@ -21,6 +22,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from reflexio.models.api_schema.braintrust_schema import (
     BraintrustStatusResponse,
@@ -194,6 +196,51 @@ SYNC_REQUEST_TIMEOUT_SECONDS = (
 )
 SUSPICIOUS_USER_AGENTS = ["bot", "crawler", "spider", "scraper", "curl", "wget"]
 ALLOWED_EMPTY_UA_PATHS = ["/health", "/"]  # Paths that allow empty user agents
+DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024
+REGENERATE_MAX_WORKERS = 2
+_regen_executor = ThreadPoolExecutor(
+    max_workers=REGENERATE_MAX_WORKERS,
+    thread_name_prefix="reflexio-regen",
+)
+
+
+def _resolve_cors_origins() -> list[str]:
+    """Resolve browser origins allowed to make credentialed CORS requests."""
+    configured_origins = os.getenv("REFLEXIO_ALLOWED_ORIGINS", "").strip()
+    if configured_origins:
+        origins = [
+            origin.strip().rstrip("/")
+            for origin in configured_origins.split(",")
+            if origin.strip()
+        ]
+        return origins or ["http://localhost:8080"]
+
+    frontend_url = os.getenv("FRONTEND_URL", "").strip()
+    if frontend_url:
+        return [frontend_url.rstrip("/")]
+
+    return ["http://localhost:8080"]
+
+
+def _max_body_bytes_from_env() -> int:
+    raw_value = os.getenv("REFLEXIO_MAX_BODY_BYTES", str(DEFAULT_MAX_BODY_BYTES))
+    try:
+        max_bytes = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid REFLEXIO_MAX_BODY_BYTES=%r; using %s",
+            raw_value,
+            DEFAULT_MAX_BODY_BYTES,
+        )
+        return DEFAULT_MAX_BODY_BYTES
+    if max_bytes <= 0:
+        logger.warning(
+            "Ignoring non-positive REFLEXIO_MAX_BODY_BYTES=%r; using %s",
+            raw_value,
+            DEFAULT_MAX_BODY_BYTES,
+        )
+        return DEFAULT_MAX_BODY_BYTES
+    return max_bytes
 
 
 def get_rate_limit_key(request: Request) -> str:
@@ -310,6 +357,82 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 content={"detail": "Request timeout"},
             )
+
+
+class _RequestBodyTooLargeError(Exception):
+    """Raised when the streamed request body exceeds the configured limit."""
+
+
+class BodySizeLimitMiddleware:
+    """Reject requests whose declared or streamed body size exceeds the limit."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        from starlette.responses import JSONResponse
+
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        max_body_bytes = _max_body_bytes_from_env()
+        content_length = None
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"content-length":
+                content_length = value.decode("latin-1")
+                break
+
+        if content_length is not None:
+            try:
+                body_bytes = int(content_length)
+            except ValueError:
+                body_bytes = 0
+            if body_bytes > max_body_bytes:
+                await JSONResponse(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    content={"detail": "Request body too large"},
+                )(scope, receive, send)
+                return
+
+        consumed_bytes = 0
+
+        async def limited_receive() -> Message:
+            nonlocal consumed_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                consumed_bytes += len(message.get("body", b""))
+                if consumed_bytes > max_body_bytes:
+                    raise _RequestBodyTooLargeError
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _RequestBodyTooLargeError:
+            await JSONResponse(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                content={"detail": "Request body too large"},
+            )(scope, receive, send)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Attach conservative browser security headers to every response."""
+
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        if (
+            request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto", "").lower() == "https"
+        ):
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=31536000; includeSubDomains"
+            )
+        return response
 
 
 class CorrelationIdMiddleware(BaseHTTPMiddleware):
@@ -931,7 +1054,9 @@ def delete_user_playbooks_by_ids(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_interactions(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all requests and their associated interactions.
@@ -950,7 +1075,9 @@ def delete_all_interactions(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_profiles(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all profiles.
@@ -969,7 +1096,9 @@ def delete_all_profiles(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_playbooks(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all playbooks (both user and agent).
@@ -988,7 +1117,9 @@ def delete_all_playbooks(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_user_playbooks(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all user playbooks (user only, not agent).
@@ -1007,7 +1138,9 @@ def delete_all_user_playbooks(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_agent_playbooks(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all agent playbooks (agent only, not user).
@@ -1026,8 +1159,10 @@ def delete_all_agent_playbooks(
     response_model=ClearUserDataResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def clear_user_data(
-    request: ClearUserDataRequest,
+    request: Request,
+    payload: ClearUserDataRequest,
     org_id: str = Depends(default_get_org_id),
 ) -> ClearUserDataResponse:
     """Delete all rows scoped to a single ``user_id``.
@@ -1046,7 +1181,7 @@ def clear_user_data(
     Returns:
         ClearUserDataResponse: Response with per-entity deletion counts
     """
-    return publisher_api.clear_user_data(org_id=org_id, request=request)
+    return publisher_api.clear_user_data(org_id=org_id, request=payload)
 
 
 @core_router.post(
@@ -1071,7 +1206,9 @@ def get_interactions(
     response_model=GetInteractionsViewResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("30/minute")
 def get_all_interactions(
+    request: Request,
     limit: int = 100,
     org_id: str = Depends(default_get_org_id),
 ) -> GetInteractionsViewResponse:
@@ -1154,7 +1291,9 @@ def get_profiles(
     response_model=GetProfilesViewResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("30/minute")
 def get_all_profiles(
+    request: Request,
     limit: int = 100,
     status_filter: str | None = None,
     org_id: str = Depends(default_get_org_id),
@@ -1230,7 +1369,9 @@ def run_playbook_aggregation(
 
 
 @core_router.post("/api/set_config")
+@limiter.limit("10/minute")
 def set_config(
+    request: Request,
     config: dict[str, Any],
     org_id: str = Depends(default_get_org_id),
 ) -> SetConfigResponse:
@@ -1257,7 +1398,9 @@ def set_config(
 
 
 @core_router.post("/api/update_config")
+@limiter.limit("10/minute")
 def update_config(
+    request: Request,
     partial: dict[str, Any],
     org_id: str = Depends(default_get_org_id),
 ) -> SetConfigResponse:
@@ -1566,8 +1709,10 @@ def update_user_profile_endpoint(
     response_model=GetDashboardStatsResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("30/minute")
 def get_dashboard_stats(
-    request: GetDashboardStatsRequest,
+    request: Request,
+    payload: GetDashboardStatsRequest,
     org_id: str = Depends(default_get_org_id),
 ) -> GetDashboardStatsResponse:
     """Get comprehensive dashboard statistics including counts and time-series data.
@@ -1583,7 +1728,7 @@ def get_dashboard_stats(
     reflexio = get_reflexio(org_id=org_id)
 
     # Get dashboard stats using Reflexio's method
-    return reflexio.get_dashboard_stats(request)
+    return reflexio.get_dashboard_stats(payload)
 
 
 @core_router.post(
@@ -1755,7 +1900,9 @@ def get_evaluation_overview(
     response_model=RegenerateStartResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("5/minute")
 def start_regenerate(
+    request: Request,
     payload: RegenerateRequest,
     org_id: str = Depends(default_get_org_id),
 ) -> RegenerateStartResponse:
@@ -1789,15 +1936,12 @@ def start_regenerate(
         )
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    threading.Thread(
-        target=run_regen,
-        kwargs={
-            "job": job,
-            "request_context": reflexio.request_context,
-            "llm_client": reflexio.llm_client,
-        },
-        daemon=True,
-    ).start()
+    _regen_executor.submit(
+        run_regen,
+        job=job,
+        request_context=reflexio.request_context,
+        llm_client=reflexio.llm_client,
+    )
     return RegenerateStartResponse(job_id=job.job_id, total=job.total)
 
 
@@ -2653,14 +2797,32 @@ def create_app(
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[reportArgumentType]
 
     # CORS
-    origins = ["*"]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # The locked-down, credentialed allowlist is an enterprise concern: only
+    # hosts that wire in auth (``require_auth=True``) restrict browser origins.
+    # OSS/local runs have no auth and bundle their own docs playground on a
+    # separate port, so they allow any origin (no credentials needed).
+    if require_auth:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=_resolve_cors_origins(),
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    else:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    # Reject oversized requests before they reach endpoint handlers.
+    app.add_middleware(BodySizeLimitMiddleware)
+
+    # Security headers
+    app.add_middleware(SecurityHeadersMiddleware)
 
     # Timeout middleware
     app.add_middleware(TimeoutMiddleware)
