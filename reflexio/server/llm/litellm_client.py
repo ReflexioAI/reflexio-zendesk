@@ -11,7 +11,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
@@ -207,24 +207,40 @@ class LiteLLMConfig:
     Configuration for LiteLLM client.
 
     Args:
-        model: Model name to use (e.g., 'gpt-4o', 'claude-3-5-sonnet-20241022', 'azure/gpt-4')
-        temperature: Temperature for response generation (0.0 to 2.0)
-        max_tokens: Maximum tokens to generate
-        timeout: Request timeout in seconds
-        max_retries: Maximum number of retry attempts
-        retry_delay: Initial delay between retries in seconds (exponential backoff)
-        top_p: Top-p sampling parameter
-        api_key_config: Optional API key configuration from Config (overrides env vars)
+        model: Model name to use (e.g., 'gpt-4o', 'claude-3-5-sonnet-20241022').
+        temperature: Temperature for response generation (0.0 to 2.0).
+        max_tokens: Maximum tokens to generate.
+        timeout: Request timeout in seconds.
+        max_retries: Maximum retry attempts on the primary model. Passed
+            directly to litellm's num_retries. Default 3.
+        retry_delay: Currently unused — LiteLLM owns retry backoff. Kept for
+            backward compatibility; remove in a follow-up sweep.
+        top_p: Top-p sampling parameter.
+        api_key_config: Optional API key configuration from Config (overrides env vars).
+        fallback_models: Models LiteLLM tries in order after the primary
+            exhausts num_retries. Passed directly to litellm's fallbacks param.
+            Default is an empty list (no fallback) so local reflexio and the
+            claude-smart integration are never silently routed to an unintended
+            provider. Production opts in via the env var
+            REFLEXIO_LLM_FALLBACK_MODELS (comma-separated, e.g. "gpt-5-mini").
+            Self-references are deduped at request time.
     """
 
     model: str
     temperature: float = 0.7
     max_tokens: int | None = None
     timeout: int = 120
-    max_retries: int = 1
+    max_retries: int = 3
     retry_delay: float = 1.0
     top_p: float = 1.0
     api_key_config: APIKeyConfig | None = None
+    fallback_models: list[str] = field(
+        default_factory=lambda: [
+            m.strip()
+            for m in os.environ.get("REFLEXIO_LLM_FALLBACK_MODELS", "").split(",")
+            if m.strip()
+        ]
+    )
 
 
 @dataclass
@@ -284,19 +300,6 @@ class LiteLLMClient:
         "moonshot/": "moonshot",
         "xai/": "xai",
     }
-
-    # Non-retryable error patterns
-    NON_RETRYABLE_ERRORS = [
-        "invalid_api_key",
-        "unauthorized",
-        "permission_denied",
-        "quota_exceeded",
-        "billing",
-        "invalid_request",
-        "authentication",
-        "forbidden",
-        "rate_limit",  # Rate limits are handled by LiteLLM internally
-    ]
 
     # Models that only support temperature=1.0 (custom values cause errors or degraded performance)
     TEMPERATURE_RESTRICTED_MODELS = {
@@ -474,6 +477,8 @@ class LiteLLMClient:
         tools: list[Any] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         model_role: ModelRole | None = None,
+        max_retries: int | None = None,
+        fallback_models: list[str] | None = None,
         **kwargs: Any,
     ) -> str | BaseModel | ToolCallingChatResponse:
         """
@@ -489,6 +494,12 @@ class LiteLLMClient:
             model_role: Optional ``ModelRole`` to override the model selected for
                 this request. The role is resolved via ``resolve_model_name`` using
                 the client's ``api_key_config``.
+            max_retries (int | None): Optional per-call override for the number of
+                retry attempts. When ``None`` (the default), the value falls back to
+                ``LiteLLMConfig.max_retries``.
+            fallback_models (list[str] | None): Optional per-call override for the
+                fallback model chain. When ``None`` (the default), the value falls
+                back to ``LiteLLMConfig.fallback_models``.
             **kwargs: Additional parameters including:
                 - response_format: Pydantic BaseModel class for structured output
                 - parse_structured_output: Whether to parse structured output (default True)
@@ -531,6 +542,10 @@ class LiteLLMClient:
             kwargs["tool_choice"] = tool_choice
         if model_role is not None:
             kwargs["model_role"] = model_role
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
+        if fallback_models is not None:
+            kwargs["fallback_models"] = fallback_models
 
         return self._make_request(final_messages, **kwargs)
 
@@ -642,7 +657,11 @@ class LiteLLMClient:
             if api_version:
                 params["api_version"] = api_version
 
-            response = litellm.embedding(**params, timeout=self.config.timeout)
+            response = litellm.embedding(
+                **params,
+                timeout=self.config.timeout,
+                num_retries=self.config.max_retries,
+            )
             return response.data[0]["embedding"]
         except Exception as e:
             raise LiteLLMClientError(f"Embedding generation failed: {str(e)}") from e
@@ -726,7 +745,11 @@ class LiteLLMClient:
             if api_version:
                 params["api_version"] = api_version
 
-            response = litellm.embedding(**params, timeout=self.config.timeout)
+            response = litellm.embedding(
+                **params,
+                timeout=self.config.timeout,
+                num_retries=self.config.max_retries,
+            )
             # Response data may not be in order, sort by index to ensure correct ordering
             sorted_data = sorted(response.data, key=lambda x: x["index"])
             return [item["embedding"] for item in sorted_data]
@@ -737,7 +760,7 @@ class LiteLLMClient:
 
     def _build_completion_params(
         self, messages: list[dict[str, Any]], **kwargs: Any
-    ) -> tuple[dict[str, Any], Any, bool, int]:
+    ) -> tuple[dict[str, Any], Any, bool, int, list[str]]:
         """Build completion request parameters from messages and kwargs.
 
         Args:
@@ -745,7 +768,9 @@ class LiteLLMClient:
             **kwargs: Additional parameters (response_format, max_retries, model, etc.)
 
         Returns:
-            Tuple of (params dict, response_format, parse_structured_output, max_retries)
+            Tuple of (params dict, response_format, parse_structured_output,
+            max_retries, fallback_models). ``fallback_models`` already has any
+            entry equal to the primary model removed.
         """
         response_format = kwargs.pop("response_format", None)
         strict_response_format = kwargs.pop("strict_response_format", True)
@@ -755,6 +780,14 @@ class LiteLLMClient:
             max_retries = max(1, int(max_retries_arg))
         except (TypeError, ValueError):
             max_retries = max(1, int(self.config.max_retries))
+
+        # Per-call fallback_models wins over config when explicitly provided.
+        # Use sentinel-style check so an explicit empty list disables fallback
+        # for the call even when the config has fallbacks set.
+        if "fallback_models" in kwargs:
+            fallback_models_raw = kwargs.pop("fallback_models") or []
+        else:
+            fallback_models_raw = list(self.config.fallback_models)
 
         # Pop tool-calling kwargs before the final params.update(kwargs) so they
         # don't leak into the params dict twice.
@@ -786,8 +819,11 @@ class LiteLLMClient:
             "model": actual_model,
             "messages": messages,
             "timeout": kwargs.pop("timeout", self.config.timeout),
-            "num_retries": 0,
         }
+
+        # Drop any fallback entry that points back at the primary — sending the
+        # same broken endpoint twice never helps.
+        fallback_models = [m for m in fallback_models_raw if m != actual_model]
 
         temperature = kwargs.pop("temperature", self.config.temperature)
         if self._is_temperature_restricted_model(actual_model):
@@ -863,7 +899,13 @@ class LiteLLMClient:
             params["messages"], params["model"]
         )
 
-        return params, response_format, parse_structured_output, max_retries
+        return (
+            params,
+            response_format,
+            parse_structured_output,
+            max_retries,
+            fallback_models,
+        )
 
     @staticmethod
     @lru_cache(maxsize=256)
@@ -954,163 +996,156 @@ class LiteLLMClient:
             cost_suffix,
         )
 
-    def _handle_retry_or_raise(
-        self,
-        error: Exception,
-        params: dict[str, Any],
-        attempt: int,
-        max_retries: int,
-        response_format: Any,
-        elapsed_seconds: float,
+    def _emit_fallback_observability(
+        self, response: Any, params: dict[str, Any]
     ) -> None:
-        """Handle retry logic or raise on non-retryable/final errors.
+        """Surface fallback-routing info to logs and Sentry when applicable.
+
+        LiteLLM rewrites ``response.model`` to the model that actually served
+        the call, so we detect a fallback by comparing it against the model
+        we asked for. The check is best-effort: any exception inside this
+        helper is swallowed so observability never breaks the request.
 
         Args:
-            error: The exception that occurred
-            params: Request parameters (for logging)
-            attempt: Current attempt index (0-based)
-            max_retries: Maximum number of retries
-            response_format: Response format (for logging)
-            elapsed_seconds: Time elapsed for this attempt
-
-        Raises:
-            LiteLLMClientError: If the error is non-retryable or this was the last attempt
+            response: The litellm completion response object.
+            params: The params dict that was passed to ``litellm.completion`` —
+                used to read the originally requested primary model name.
         """
-        error_str = str(error).lower()
-
-        self.logger.error(
-            "event=llm_request_end model=%s timeout=%s has_response_format=%s attempt=%d/%d elapsed_seconds=%.3f success=%s error_type=%s error=%s",
-            params.get("model"),
-            params.get("timeout"),
-            response_format is not None,
-            attempt + 1,
-            max_retries,
-            elapsed_seconds,
-            False,
-            type(error).__name__,
-            str(error),
-        )
-
-        if self._is_non_retryable_error(error_str):
-            self.logger.error("Non-retryable error: %s", error)
-            raise LiteLLMClientError(f"API call failed: {str(error)}") from error
-
-        if attempt < max_retries - 1:
-            delay = self.config.retry_delay * (2**attempt)
-            self.logger.warning(
-                "Request failed (attempt %s/%s): %s. Retrying in %ss...",
-                attempt + 1,
-                max_retries,
-                error,
-                delay,
+        try:
+            primary_model = params.get("model")
+            hidden = getattr(response, "_hidden_params", {}) or {}
+            served_model = (
+                hidden.get("model_id")
+                or hidden.get("model")
+                or getattr(response, "model", None)
             )
-            time.sleep(delay)
-        else:
-            self.logger.error(
-                "LLM request failed (model=%s, has_response_format=%s): %s",
-                params.get("model"),
-                response_format is not None,
-                error,
+
+            if not served_model or served_model == primary_model:
+                return
+
+            self.logger.info(
+                "event=llm_fallback_used primary_model=%s served_model=%s",
+                primary_model,
+                served_model,
             )
+
+            # Local import keeps sentry out of module-init paths the tests
+            # exercise without a Sentry SDK installed. sentry_sdk is an
+            # enterprise-only dependency; OSS callers run without it and the
+            # ImportError is intentionally absorbed by the outer except.
+            import sentry_sdk  # type: ignore[import-not-found]
+
+            sentry_sdk.set_tag("llm.fallback_used", "true")
+            sentry_sdk.set_tag("llm.primary_model", str(primary_model))
+            sentry_sdk.set_tag("llm.fallback_model", str(served_model))
+        except Exception:  # noqa: BLE001 — observability must not break the call
+            return
 
     def _make_request(
         self, messages: list[dict[str, Any]], **kwargs: Any
     ) -> str | BaseModel | ToolCallingChatResponse:
         """
-        Make a request to the LLM with retry logic.
+        Make a request to the LLM, delegating retries and fallback to litellm.
+
+        Retry and fallback semantics are handed to ``litellm.completion`` via
+        the native ``num_retries`` and ``fallbacks`` kwargs. Per the documented
+        flow at https://docs.litellm.ai/docs/router_architecture, the primary
+        model is tried ``num_retries+1`` times, then each fallback gets a single
+        attempt. The one piece we still own at the client level is a single
+        retry for ``StructuredOutputParseError``: LiteLLM cannot detect a
+        post-hoc Pydantic re-validation failure because it sees a successful
+        HTTP response.
 
         Args:
             messages: List of messages to send.
-            **kwargs: Additional parameters.
+            **kwargs: Additional parameters (response_format, max_retries,
+                fallback_models, tools, etc.).
 
         Returns:
             Response content as string, BaseModel instance, or
             ToolCallingChatResponse when the request was in tool-calling mode.
 
         Raises:
-            LiteLLMClientError: If the request fails after all retries.
+            LiteLLMClientError: If the request fails after all retries and
+                fallbacks have been exhausted by litellm.
         """
-        params, response_format, parse_structured_output, max_retries = (
+        params, response_format, parse_structured_output, max_retries, fallbacks = (
             self._build_completion_params(messages, **kwargs)
         )
 
-        last_error: Exception | None = None
-        # A StructuredOutputParseError is typically a transient malformed or
-        # truncated response that succeeds on a fresh generation, so grant it
-        # one extra attempt beyond the configured budget (once per request).
-        effective_max_retries = max_retries
-        structured_parse_retry_granted = False
-        attempt = 0
-        while attempt < effective_max_retries:
-            request_start = time.perf_counter()
+        # Hand retries + fallbacks to litellm. ``num_retries`` is the documented
+        # alias for max_retries on litellm.completion.
+        params["num_retries"] = max_retries
+        if fallbacks:
+            params["fallbacks"] = fallbacks
+
+        request_start = time.perf_counter()
+        self.logger.info(
+            "event=llm_request_start model=%s timeout=%s has_response_format=%s num_retries=%d fallbacks=%s",
+            params.get("model"),
+            params.get("timeout"),
+            response_format is not None,
+            max_retries,
+            fallbacks,
+        )
+
+        def _call_and_parse() -> str | BaseModel | ToolCallingChatResponse:
+            response = litellm.completion(**params)
+            self._emit_fallback_observability(response, params)
+            message = response.choices[0].message  # type: ignore[reportAttributeAccessIssue]
+            content = message.content
+            self._log_token_usage(params, response)
             self.logger.info(
-                "event=llm_request_start model=%s timeout=%s has_response_format=%s attempt=%d/%d",
+                "event=llm_request_end model=%s timeout=%s has_response_format=%s elapsed_seconds=%.3f success=%s",
                 params.get("model"),
                 params.get("timeout"),
                 response_format is not None,
-                attempt + 1,
-                effective_max_retries,
+                time.perf_counter() - request_start,
+                True,
             )
+
+            # Tool-calling path: return a structured response instead of
+            # going through _maybe_parse_structured_output.
+            if "tools" in params:
+                raw_usage = getattr(response, "usage", None)
+                call_cost = self._compute_cost_usd(response, params.get("model"))
+                return ToolCallingChatResponse(
+                    content=content,
+                    tool_calls=getattr(message, "tool_calls", None),
+                    finish_reason=response.choices[0].finish_reason,  # type: ignore[reportAttributeAccessIssue]
+                    usage=raw_usage,
+                    cost_usd=call_cost,
+                )
+
+            return self._maybe_parse_structured_output(
+                content,  # type: ignore[reportArgumentType]
+                response_format,
+                parse_structured_output,
+            )
+
+        try:
             try:
-                response = litellm.completion(**params)
-                message = response.choices[0].message  # type: ignore[reportAttributeAccessIssue]
-                content = message.content
-                elapsed_seconds = time.perf_counter() - request_start
-
-                self._log_token_usage(params, response)
-
-                self.logger.info(
-                    "event=llm_request_end model=%s timeout=%s has_response_format=%s attempt=%d/%d elapsed_seconds=%.3f success=%s",
+                return _call_and_parse()
+            except StructuredOutputParseError:
+                # LiteLLM's num_retries covers API errors, but a Pydantic
+                # re-validation failure happens AFTER litellm sees a
+                # successful 200 — so we owe one explicit second attempt at
+                # the model. PR #121 documented this as a MiniMax-M3
+                # mitigation.
+                self.logger.warning(
+                    "event=llm_parse_retry model=%s — primary returned malformed structured output, retrying once",
                     params.get("model"),
-                    params.get("timeout"),
-                    response_format is not None,
-                    attempt + 1,
-                    effective_max_retries,
-                    elapsed_seconds,
-                    True,
                 )
-
-                # Tool-calling path: return a structured response instead of
-                # going through _maybe_parse_structured_output.
-                if "tools" in params:
-                    raw_usage = getattr(response, "usage", None)
-                    call_cost = self._compute_cost_usd(response, params.get("model"))
-                    return ToolCallingChatResponse(
-                        content=content,
-                        tool_calls=getattr(message, "tool_calls", None),
-                        finish_reason=response.choices[0].finish_reason,  # type: ignore[reportAttributeAccessIssue]
-                        usage=raw_usage,
-                        cost_usd=call_cost,
-                    )
-
-                return self._maybe_parse_structured_output(
-                    content,  # type: ignore[reportArgumentType]
-                    response_format,
-                    parse_structured_output,  # type: ignore[reportArgumentType]
-                )
-
-            except Exception as e:
-                last_error = e
-                elapsed_seconds = time.perf_counter() - request_start
-                if (
-                    isinstance(e, StructuredOutputParseError)
-                    and not structured_parse_retry_granted
-                ):
-                    structured_parse_retry_granted = True
-                    effective_max_retries += 1
-                self._handle_retry_or_raise(
-                    e,
-                    params,
-                    attempt,
-                    effective_max_retries,
-                    response_format,
-                    elapsed_seconds,
-                )
-            attempt += 1
-
-        raise LiteLLMClientError(
-            f"API call failed after {effective_max_retries} retries: {str(last_error)}"
-        )
+                return _call_and_parse()
+        except Exception as e:
+            self.logger.error(
+                "event=llm_request_end model=%s elapsed_seconds=%.3f success=False error_type=%s error=%s",
+                params.get("model"),
+                time.perf_counter() - request_start,
+                type(e).__name__,
+                e,
+            )
+            raise LiteLLMClientError(f"API call failed: {e}") from e
 
     def _apply_prompt_caching(
         self, messages: list[dict[str, Any]], model: str
@@ -1508,18 +1543,6 @@ class LiteLLMClient:
 
         # Remove trailing commas before } or ]
         return re.sub(r",\s*([}\]])", r"\1", s)
-
-    def _is_non_retryable_error(self, error_str: str) -> bool:
-        """
-        Check if an error is non-retryable.
-
-        Args:
-            error_str: Error message string.
-
-        Returns:
-            True if error should not be retried.
-        """
-        return any(pattern in error_str for pattern in self.NON_RETRYABLE_ERRORS)
 
     def update_config(self, **kwargs) -> None:
         """
