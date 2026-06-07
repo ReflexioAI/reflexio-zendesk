@@ -554,8 +554,9 @@ class RetrievalFloorConfig(BaseModel):
     """Read-path relevance floor: drop search results below a per-arm cross-encoder score.
 
     Floors are RAW cross-encoder logits (ms-marco-MiniLM), not probabilities. On this
-    corpus relevant items score roughly -2..-4 and clear junk -6..-11, so a conservative
-    default of -5 isolates junk. Calibrate per arm on real data.
+    corpus strongly relevant items score roughly 0..-3, weak/marginal items -3..-5,
+    and clear junk -6..-11. A default of -3 keeps strong matches while dropping the
+    weak tail that drives false-positive citations. Calibrate per arm on real data.
     """
 
     enabled: bool = True
@@ -564,9 +565,9 @@ class RetrievalFloorConfig(BaseModel):
         gt=0,
         description="Candidates fetched per arm before flooring + cap to top_k.",
     )
-    profile_floor: float = -5.0
-    user_playbook_floor: float = -5.0
-    agent_playbook_floor: float = -5.0
+    profile_floor: float = -3.0
+    user_playbook_floor: float = -3.0
+    agent_playbook_floor: float = -3.0
 
 
 class PlaybookOptimizerConfig(BaseModel):
