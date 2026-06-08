@@ -179,8 +179,9 @@ def _profiles_to_json(profiles: list[UserProfile]) -> str:
 def _playbooks_to_json(playbooks: list[UserPlaybook]) -> str:
     """Serialize cited playbooks for the reflection prompt.
 
-    Includes ``polarity`` so the reflection model has the current
-    framing context when reasoning about whether a flip is warranted.
+    The prompt reads each rule's orientation directly from its ``content``
+    wording — no derived ``polarity`` hint is injected (that would re-derive
+    polarity, which is retired under LLM-judged orientation).
 
     Args:
         playbooks (list[UserPlaybook]): The cited playbooks to serialize.
@@ -195,7 +196,6 @@ def _playbooks_to_json(playbooks: list[UserPlaybook]) -> str:
             "content": p.content,
             "trigger": p.trigger,
             "rationale": p.rationale,
-            "polarity": p.polarity,
             "source": p.source,
         }
         for p in playbooks

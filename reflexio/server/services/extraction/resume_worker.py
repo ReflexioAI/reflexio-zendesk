@@ -62,6 +62,7 @@ from reflexio.server.services.storage.storage_base import (
     PendingToolCallStatus,
 )
 from reflexio.server.site_var.site_var_manager import SiteVarManager
+from reflexio.server.tracing import sentry_tags
 
 logger = logging.getLogger(__name__)
 
@@ -160,14 +161,12 @@ def _select_current_extractor_config(
             f"Unsupported extractor kind {run.binding.extractor_kind!r}"
         )
 
-    if (
-        config is not None
-        and getattr(config, "extractor_name", None) == run.binding.extractor_name
-        and isinstance(config, ProfileExtractorConfig | PlaybookConfig)
+    if config is not None and isinstance(
+        config, ProfileExtractorConfig | PlaybookConfig
     ):
         return config
     raise ResumeWorkerError(
-        f"Current extractor config not found for {run.binding.extractor_kind}:{run.binding.extractor_name}"
+        f"Current extractor config not found for {run.binding.extractor_kind}"
     )
 
 
@@ -181,10 +180,9 @@ def _log_config_hash_drift(
     ):
         logger.info(
             "event=resumable_extraction_config_hash_drift run_id=%s extractor_kind=%s "
-            "extractor_name=%s stored_hash=%s current_hash=%s",
+            "stored_hash=%s current_hash=%s",
             run.id,
             run.binding.extractor_kind,
-            run.binding.extractor_name,
             run.binding.extractor_config_hash,
             current_hash,
         )
@@ -248,12 +246,17 @@ class ExtractionResumeWorker:
                 )
             items, pending_tool_call_ids = self._resume_run(run, resolved_calls)
         except Exception as exc:
-            logger.exception(
-                "event=resumable_extraction_resume_failed run_id=%s error_type=%s error=%s",
-                run.id,
-                type(exc).__name__,
-                exc,
-            )
+            with sentry_tags(
+                subsystem="extraction",
+                op="resume_run",
+                org_id=self.request_context.org_id,
+                run_id=run.id,
+                error_type=type(exc).__name__,
+            ):
+                logger.exception(
+                    "event=resumable_extraction_resume_failed run_id=%s",
+                    run.id,
+                )
             failed_status = (
                 AgentRunStatus.FAILED
                 if run.resume_attempts >= pending_config.max_resume_attempts
@@ -281,12 +284,17 @@ class ExtractionResumeWorker:
                 pending_tool_call_ids=pending_tool_call_ids,
             )
         except Exception as exc:
-            logger.exception(
-                "event=resumable_extraction_finalization_failed run_id=%s error_type=%s error=%s",
-                run.id,
-                type(exc).__name__,
-                exc,
-            )
+            with sentry_tags(
+                subsystem="extraction",
+                op="finalize_run",
+                org_id=self.request_context.org_id,
+                run_id=run.id,
+                error_type=type(exc).__name__,
+            ):
+                logger.exception(
+                    "event=resumable_extraction_finalization_failed run_id=%s",
+                    run.id,
+                )
             next_attempt_count = run.finalization_attempts + 1
             failed_status = (
                 AgentRunStatus.FAILED
@@ -319,13 +327,17 @@ class ExtractionResumeWorker:
                 pending_tool_call_ids=pending_tool_call_ids,
             )
         except Exception as exc:
-            logger.exception(
-                "event=resumable_extraction_finalization_retry_failed run_id=%s "
-                "error_type=%s error=%s",
-                run.id,
-                type(exc).__name__,
-                exc,
-            )
+            with sentry_tags(
+                subsystem="extraction",
+                op="finalize_run_retry",
+                org_id=self.request_context.org_id,
+                run_id=run.id,
+                error_type=type(exc).__name__,
+            ):
+                logger.exception(
+                    "event=resumable_extraction_finalization_retry_failed run_id=%s",
+                    run.id,
+                )
             next_attempt_count = run.finalization_attempts + 1
             failed_status = (
                 AgentRunStatus.FAILED
@@ -369,7 +381,6 @@ class ExtractionResumeWorker:
             run_id=run.id,
             org_id=self.request_context.org_id,
             extractor_kind=run.binding.extractor_kind,
-            extractor_name=run.binding.extractor_name,
             user_id=run.binding.user_id,
             config=pending_config,
         )
@@ -429,7 +440,6 @@ class ExtractionResumeWorker:
             request_id=run.binding.request_id,
             source=run.binding.source,
             existing_data=existing_profiles,
-            extractor_names=[run.binding.extractor_name],
             auto_run=False,
             force_extraction=True,
         )
@@ -501,7 +511,6 @@ class ExtractionResumeWorker:
             agent_version=run.binding.agent_version or "",
             user_id=run.binding.user_id,
             source=run.binding.source,
-            extractor_names=[run.binding.extractor_name],
             auto_run=False,
             force_extraction=True,
         )
@@ -592,7 +601,6 @@ class ExtractionResumeWorker:
             storage=self.storage,
             org_id=self.request_context.org_id,
             extractor_kind=run.binding.extractor_kind,
-            extractor_name=run.binding.extractor_name,
             extractor_config=extractor_config,
             source=run.binding.source,
             agent_version=run.binding.agent_version,
@@ -676,7 +684,6 @@ class ExtractionResumeWorker:
             request_id=run.binding.request_id,
             source=run.binding.source,
             existing_data=self.storage.get_user_profile(run.binding.user_id),
-            extractor_names=[run.binding.extractor_name],
             auto_run=False,
             force_extraction=True,
         )
@@ -713,7 +720,6 @@ class ExtractionResumeWorker:
             agent_version=run.binding.agent_version or "",
             user_id=run.binding.user_id,
             source=run.binding.source,
-            extractor_names=[run.binding.extractor_name],
             auto_run=False,
             force_extraction=True,
         )
@@ -748,7 +754,6 @@ class ExtractionResumeWorker:
                 user_id=run.binding.user_id or "",
                 request_id=run.binding.request_id,
                 source=run.binding.source,
-                extractor_names=[run.binding.extractor_name],
                 auto_run=False,
                 force_extraction=True,
             )
@@ -764,7 +769,6 @@ class ExtractionResumeWorker:
                 agent_version=run.binding.agent_version or "",
                 user_id=run.binding.user_id,
                 source=run.binding.source,
-                extractor_names=[run.binding.extractor_name],
                 auto_run=False,
                 force_extraction=True,
             )

@@ -26,7 +26,7 @@ app = typer.Typer(
 )
 
 _PROVIDERS: dict[str, dict[str, str]] = {
-    "openai": {"env_var": "OPENAI_API_KEY", "model": "gpt-5-mini", "display": "OpenAI"},
+    "openai": {"env_var": "OPENAI_API_KEY", "model": "gpt-5.4-mini", "display": "OpenAI"},
     "anthropic": {
         "env_var": "ANTHROPIC_API_KEY",
         "model": "claude-sonnet-4-6",
@@ -885,9 +885,8 @@ def openai_codex_setup(
     reads from this file directly — no dependency on OpenClaw or any other
     CLI. The proxy auto-refreshes the access token when it nears expiry.
 
-    Run this once, then start the codex proxy with::
-
-        ./reflexio_ext/scripts/start_with_codex_proxy.sh
+    Run this once; the codex proxy (``codex_proxy.py``) then picks up the
+    stored tokens automatically on start.
 
     Re-run this command if your subscription tier changes or the
     refresh_token gets revoked (rare).

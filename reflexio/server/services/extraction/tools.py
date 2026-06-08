@@ -36,17 +36,13 @@ from reflexio.models.api_schema.retriever_schema import (
     SearchUserPlaybookRequest,
     SearchUserProfileRequest,
 )
-from reflexio.models.config_schema import SearchOptions
+from reflexio.models.config_schema import SINGLETON_USER_PLAYBOOK_NAME, SearchOptions
 from reflexio.server.services.extraction.plan import (
     CreateUserPlaybookOp,
     CreateUserProfileOp,
     DeleteUserPlaybookOp,
     DeleteUserProfileOp,
     ExtractionCtx,
-)
-from reflexio.server.services.polarity_utils import (
-    infer_playbook_polarity,
-    warn_if_polarity_content_mismatch,
 )
 from reflexio.server.services.profile.profile_generation_service_utils import (
     calculate_expiration_timestamp,
@@ -546,8 +542,6 @@ def _handle_search_user_playbooks(
         search_mode=SearchMode.HYBRID,
         threshold=0.4,
     )
-    if ctx.extractor_name:
-        request.playbook_name = ctx.extractor_name
     hits = storage.search_user_playbooks(
         request,
         options=SearchOptions(query_embedding=_maybe_embed_query(storage, args.query)),
@@ -624,8 +618,6 @@ def _handle_search_agent_playbooks(
             search_mode=SearchMode.HYBRID,
             threshold=0.4,
         )
-        if ctx.extractor_name:
-            request.playbook_name = ctx.extractor_name
         for hit in storage.search_agent_playbooks(request, options=options):
             hit_id = str(getattr(hit, "agent_playbook_id", ""))
             if hit_id and hit_id not in seen_ids:
@@ -978,8 +970,7 @@ def apply_plan_op(op: Any, storage: Any, ctx: ExtractionCtx) -> None:
         op (Any): A PlanOp variant (CreateUserProfileOp, DeleteUserProfileOp,
             CreateUserPlaybookOp, DeleteUserPlaybookOp).
         storage (Any): BaseStorage handle.
-        ctx (ExtractionCtx): Per-run state providing user_id, agent_version,
-            extractor_name.
+        ctx (ExtractionCtx): Per-run state providing user_id and agent_version.
 
     Raises:
         TypeError: If ``op`` is not a recognised PlanOp type.
@@ -997,7 +988,7 @@ def apply_plan_op(op: Any, storage: Any, ctx: ExtractionCtx) -> None:
                     profile_time_to_live=ttl,
                     last_modified_timestamp=now_ts,
                     expiration_timestamp=calculate_expiration_timestamp(now_ts, ttl),
-                    source=f"agentic_v2/{ctx.extractor_name or 'default'}",
+                    source="agentic_v2",
                     source_span=op.source_span,
                     generated_from_request_id=ctx.request_id,
                 )
@@ -1011,14 +1002,12 @@ def apply_plan_op(op: Any, storage: Any, ctx: ExtractionCtx) -> None:
             user_id=ctx.user_id,
             agent_version=ctx.agent_version,
             request_id=ctx.request_id,
-            playbook_name=ctx.extractor_name or "default",
+            playbook_name=SINGLETON_USER_PLAYBOOK_NAME,
             content=op.content,
             trigger=op.trigger,
             rationale=op.rationale,
             source_span=op.source_span,
-            polarity=infer_playbook_polarity(op.content, op.rationale),
         )
-        warn_if_polarity_content_mismatch(new_playbook)
         storage.save_user_playbooks([new_playbook])
     elif isinstance(op, DeleteUserPlaybookOp):
         try:

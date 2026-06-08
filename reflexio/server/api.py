@@ -1,8 +1,9 @@
 import asyncio
 import inspect
 import logging
-import threading
+import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 
@@ -21,6 +22,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from reflexio.models.api_schema.braintrust_schema import (
     BraintrustStatusResponse,
@@ -150,7 +152,10 @@ from reflexio.models.api_schema.ui.converters import (
     to_profile_view,
     to_user_playbook_view,
 )
-from reflexio.models.config_schema import Config
+from reflexio.models.config_schema import (
+    SINGLETON_AGENT_SUCCESS_EVALUATION_NAME,
+    Config,
+)
 from reflexio.server._auth import DEFAULT_ORG_ID, default_get_org_id
 from reflexio.server.api_endpoints import (
     account_api,
@@ -191,6 +196,51 @@ SYNC_REQUEST_TIMEOUT_SECONDS = (
 )
 SUSPICIOUS_USER_AGENTS = ["bot", "crawler", "spider", "scraper", "curl", "wget"]
 ALLOWED_EMPTY_UA_PATHS = ["/health", "/"]  # Paths that allow empty user agents
+DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024
+REGENERATE_MAX_WORKERS = 2
+_regen_executor = ThreadPoolExecutor(
+    max_workers=REGENERATE_MAX_WORKERS,
+    thread_name_prefix="reflexio-regen",
+)
+
+
+def _resolve_cors_origins() -> list[str]:
+    """Resolve browser origins allowed to make credentialed CORS requests."""
+    configured_origins = os.getenv("REFLEXIO_ALLOWED_ORIGINS", "").strip()
+    if configured_origins:
+        origins = [
+            origin.strip().rstrip("/")
+            for origin in configured_origins.split(",")
+            if origin.strip()
+        ]
+        return origins or ["http://localhost:8080"]
+
+    frontend_url = os.getenv("FRONTEND_URL", "").strip()
+    if frontend_url:
+        return [frontend_url.rstrip("/")]
+
+    return ["http://localhost:8080"]
+
+
+def _max_body_bytes_from_env() -> int:
+    raw_value = os.getenv("REFLEXIO_MAX_BODY_BYTES", str(DEFAULT_MAX_BODY_BYTES))
+    try:
+        max_bytes = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid REFLEXIO_MAX_BODY_BYTES=%r; using %s",
+            raw_value,
+            DEFAULT_MAX_BODY_BYTES,
+        )
+        return DEFAULT_MAX_BODY_BYTES
+    if max_bytes <= 0:
+        logger.warning(
+            "Ignoring non-positive REFLEXIO_MAX_BODY_BYTES=%r; using %s",
+            raw_value,
+            DEFAULT_MAX_BODY_BYTES,
+        )
+        return DEFAULT_MAX_BODY_BYTES
+    return max_bytes
 
 
 def get_rate_limit_key(request: Request) -> str:
@@ -307,6 +357,82 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 content={"detail": "Request timeout"},
             )
+
+
+class _RequestBodyTooLargeError(Exception):
+    """Raised when the streamed request body exceeds the configured limit."""
+
+
+class BodySizeLimitMiddleware:
+    """Reject requests whose declared or streamed body size exceeds the limit."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        from starlette.responses import JSONResponse
+
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        max_body_bytes = _max_body_bytes_from_env()
+        content_length = None
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"content-length":
+                content_length = value.decode("latin-1")
+                break
+
+        if content_length is not None:
+            try:
+                body_bytes = int(content_length)
+            except ValueError:
+                body_bytes = 0
+            if body_bytes > max_body_bytes:
+                await JSONResponse(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    content={"detail": "Request body too large"},
+                )(scope, receive, send)
+                return
+
+        consumed_bytes = 0
+
+        async def limited_receive() -> Message:
+            nonlocal consumed_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                consumed_bytes += len(message.get("body", b""))
+                if consumed_bytes > max_body_bytes:
+                    raise _RequestBodyTooLargeError
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _RequestBodyTooLargeError:
+            await JSONResponse(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                content={"detail": "Request body too large"},
+            )(scope, receive, send)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Attach conservative browser security headers to every response."""
+
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        if (
+            request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto", "").lower() == "https"
+        ):
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=31536000; includeSubDomains"
+            )
+        return response
 
 
 class CorrelationIdMiddleware(BaseHTTPMiddleware):
@@ -928,7 +1054,9 @@ def delete_user_playbooks_by_ids(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_interactions(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all requests and their associated interactions.
@@ -947,7 +1075,9 @@ def delete_all_interactions(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_profiles(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all profiles.
@@ -966,7 +1096,9 @@ def delete_all_profiles(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_playbooks(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all playbooks (both user and agent).
@@ -985,7 +1117,9 @@ def delete_all_playbooks(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_user_playbooks(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all user playbooks (user only, not agent).
@@ -1004,7 +1138,9 @@ def delete_all_user_playbooks(
     response_model=BulkDeleteResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def delete_all_agent_playbooks(
+    request: Request,
     org_id: str = Depends(default_get_org_id),
 ) -> BulkDeleteResponse:
     """Delete all agent playbooks (agent only, not user).
@@ -1023,8 +1159,10 @@ def delete_all_agent_playbooks(
     response_model=ClearUserDataResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("10/minute")
 def clear_user_data(
-    request: ClearUserDataRequest,
+    request: Request,
+    payload: ClearUserDataRequest,
     org_id: str = Depends(default_get_org_id),
 ) -> ClearUserDataResponse:
     """Delete all rows scoped to a single ``user_id``.
@@ -1043,7 +1181,7 @@ def clear_user_data(
     Returns:
         ClearUserDataResponse: Response with per-entity deletion counts
     """
-    return publisher_api.clear_user_data(org_id=org_id, request=request)
+    return publisher_api.clear_user_data(org_id=org_id, request=payload)
 
 
 @core_router.post(
@@ -1068,7 +1206,9 @@ def get_interactions(
     response_model=GetInteractionsViewResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("30/minute")
 def get_all_interactions(
+    request: Request,
     limit: int = 100,
     org_id: str = Depends(default_get_org_id),
 ) -> GetInteractionsViewResponse:
@@ -1151,7 +1291,9 @@ def get_profiles(
     response_model=GetProfilesViewResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("30/minute")
 def get_all_profiles(
+    request: Request,
     limit: int = 100,
     status_filter: str | None = None,
     org_id: str = Depends(default_get_org_id),
@@ -1227,7 +1369,9 @@ def run_playbook_aggregation(
 
 
 @core_router.post("/api/set_config")
+@limiter.limit("10/minute")
 def set_config(
+    request: Request,
     config: dict[str, Any],
     org_id: str = Depends(default_get_org_id),
 ) -> SetConfigResponse:
@@ -1254,7 +1398,9 @@ def set_config(
 
 
 @core_router.post("/api/update_config")
+@limiter.limit("10/minute")
 def update_config(
+    request: Request,
     partial: dict[str, Any],
     org_id: str = Depends(default_get_org_id),
 ) -> SetConfigResponse:
@@ -1563,8 +1709,10 @@ def update_user_profile_endpoint(
     response_model=GetDashboardStatsResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("30/minute")
 def get_dashboard_stats(
-    request: GetDashboardStatsRequest,
+    request: Request,
+    payload: GetDashboardStatsRequest,
     org_id: str = Depends(default_get_org_id),
 ) -> GetDashboardStatsResponse:
     """Get comprehensive dashboard statistics including counts and time-series data.
@@ -1580,7 +1728,7 @@ def get_dashboard_stats(
     reflexio = get_reflexio(org_id=org_id)
 
     # Get dashboard stats using Reflexio's method
-    return reflexio.get_dashboard_stats(request)
+    return reflexio.get_dashboard_stats(payload)
 
 
 @core_router.post(
@@ -1752,14 +1900,16 @@ def get_evaluation_overview(
     response_model=RegenerateStartResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("5/minute")
 def start_regenerate(
+    request: Request,
     payload: RegenerateRequest,
     org_id: str = Depends(default_get_org_id),
 ) -> RegenerateStartResponse:
-    """Start a regenerate job for one evaluator over a time window.
+    """Start a singleton regenerate job over a time window.
 
     Args:
-        payload (RegenerateRequest): Evaluator name + window bounds.
+        payload (RegenerateRequest): Window bounds plus optional legacy evaluator name.
         org_id (str): Organization ID resolved by the auth dependency.
 
     Returns:
@@ -1767,20 +1917,10 @@ def start_regenerate(
             tuples queued.
 
     Raises:
-        HTTPException: 400 when ``evaluation_name`` is not configured for
-            the org. 409 when a regenerate for the same (org, evaluator)
-            is already running. 503 when storage is not configured.
+        HTTPException: 409 when a regenerate for the same org is already
+            running. 503 when storage is not configured.
     """
     reflexio = get_reflexio(org_id=org_id)
-    config = reflexio.request_context.configurator.get_config()
-    success_config = getattr(config, "agent_success_config", None)
-    known = {success_config.evaluation_name} if success_config else set()
-    if payload.evaluation_name not in known:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown evaluation_name '{payload.evaluation_name}'",
-        )
-
     storage = reflexio.request_context.storage
     if storage is None:
         raise HTTPException(status_code=503, detail="Storage not configured")
@@ -1790,22 +1930,18 @@ def start_regenerate(
     try:
         job = REGEN_JOBS.create(
             org_id=org_id,
-            evaluation_name=payload.evaluation_name,
             from_ts=payload.from_ts,
             to_ts=payload.to_ts,
             total=len(descriptors),
         )
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    threading.Thread(
-        target=run_regen,
-        kwargs={
-            "job": job,
-            "request_context": reflexio.request_context,
-            "llm_client": reflexio.llm_client,
-        },
-        daemon=True,
-    ).start()
+    _regen_executor.submit(
+        run_regen,
+        job=job,
+        request_context=reflexio.request_context,
+        llm_client=reflexio.llm_client,
+    )
     return RegenerateStartResponse(job_id=job.job_id, total=job.total)
 
 
@@ -1904,19 +2040,16 @@ def _grade_on_demand_cache_key(
 ) -> str:
     """Build the operation_state key for the on-demand grading cache.
 
-    The key embeds every dimension that could change the verdict: org_id
-    (multi-tenant scope), session_id (the unit of work), agent_version
-    (eval results are versioned) and evaluation_name (one session can be
-    graded by multiple evaluators). Changing any dimension cuts a fresh
-    cache lane so customers never see a stale verdict from a different
-    evaluator.
+    The key embeds every active singleton dimension that could change the
+    verdict: org_id (multi-tenant scope), session_id (the unit of work),
+    agent_version (eval results are versioned), and evaluation_name (kept as a
+    compatibility/readback discriminator for historical multi-evaluator rows).
 
     Args:
         org_id (str): Tenant identifier from the auth context.
         session_id (str): Target session.
         agent_version (str): Agent version filter.
-        evaluation_name (str): Evaluator config name.
-
+        evaluation_name (str): Evaluator/result namespace to isolate cache rows.
     Returns:
         str: A namespaced key suitable for ``storage.upsert_operation_state``.
     """
@@ -1986,10 +2119,11 @@ def _find_fresh_result_id(
     storage: Any,
     *,
     session_id: str,
-    evaluation_name: str,
     agent_version: str,
+    evaluation_name: str,
+    previous_result_ids: set[int],
 ) -> int | None:
-    """Locate the result_id written by the most-recent grade for this triple.
+    """Locate the result_id written by the most-recent grade for this session.
 
     The runner writes rows but doesn't return the id. Reading back through
     ``get_agent_success_evaluation_results`` matches the pattern used by
@@ -1998,8 +2132,9 @@ def _find_fresh_result_id(
     Args:
         storage: The request's storage backend.
         session_id (str): The graded session.
-        evaluation_name (str): The evaluator that produced the row.
         agent_version (str): The version dimension.
+        evaluation_name (str): Evaluator/result namespace to isolate readback.
+        previous_result_ids (set[int]): Matching rows observed before grading.
 
     Returns:
         int | None: result_id of the latest matching row, or None if the
@@ -2011,7 +2146,9 @@ def _find_fresh_result_id(
     matched = [
         r
         for r in rows
-        if r.session_id == session_id and r.evaluation_name == evaluation_name
+        if r.session_id == session_id
+        and r.evaluation_name == evaluation_name
+        and r.result_id not in previous_result_ids
     ]
     if not matched:
         return None
@@ -2031,22 +2168,20 @@ def grade_on_demand(
     """Grade a single session synchronously; serve cached results within 24h.
 
     Flow:
-      1. Validate ``evaluation_name`` against the configured evaluators
-         (400 on miss — symmetric with /regenerate).
-      2. Read the operation_state cache; if a fresh entry exists, return it
+      1. Read the operation_state cache; if a fresh entry exists, return it
          with ``cached=True``.
-      3. Resolve the session's user_id from storage (skip with ``NO_REQUESTS``
+      2. Resolve the session's user_id from storage (skip with ``NO_REQUESTS``
          when the session is unknown — surfaced as 200 + ``skipped_reason``
          so the frontend's bounded-list click-through can handle stale ids
          locally without polluting 5xx telemetry).
-      4. Invoke ``run_group_evaluation(force_regenerate=True)`` so the
+      3. Invoke ``run_group_evaluation(force_regenerate=True)`` so the
          "already evaluated" short-circuit doesn't suppress a customer's
          explicit click.
-      5. Find the freshly-written result_id and persist it in the cache
+      4. Find the freshly-written result_id and persist it in the cache
          with ``last_graded_at`` so future calls within 24h short-circuit.
 
     Args:
-        payload (GradeOnDemandRequest): Session + version + evaluator triple.
+        payload (GradeOnDemandRequest): Session + version plus optional legacy evaluator name.
         org_id (str): Tenant identifier resolved by the auth dependency.
 
     Returns:
@@ -2055,28 +2190,19 @@ def grade_on_demand(
             (``cached=True``), or a ``skipped_reason`` (NO_REQUESTS).
 
     Raises:
-        HTTPException: 400 when ``evaluation_name`` is not configured
-            for the org. 503 when storage is not configured.
+        HTTPException: 503 when storage is not configured.
     """
     reflexio = get_reflexio(org_id=org_id)
-    config = reflexio.request_context.configurator.get_config()
-    success_config = getattr(config, "agent_success_config", None)
-    known = {success_config.evaluation_name} if success_config else set()
-    if payload.evaluation_name not in known:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown evaluation_name '{payload.evaluation_name}'",
-        )
-
     storage = reflexio.request_context.storage
     if storage is None:
         raise HTTPException(status_code=503, detail="Storage not configured")
 
+    evaluation_name = payload.evaluation_name or SINGLETON_AGENT_SUCCESS_EVALUATION_NAME
     cache_key = _grade_on_demand_cache_key(
         org_id,
         payload.session_id,
         payload.agent_version,
-        payload.evaluation_name,
+        evaluation_name,
     )
     now = int(datetime.now(UTC).timestamp())
 
@@ -2098,6 +2224,14 @@ def grade_on_demand(
             skipped_reason="NO_REQUESTS",
         )
 
+    previous_result_ids = {
+        r.result_id
+        for r in storage.get_agent_success_evaluation_results(
+            limit=1000, agent_version=payload.agent_version
+        )
+        if r.session_id == payload.session_id and r.evaluation_name == evaluation_name
+    }
+
     # Two operation_state rows are intentionally written for this session:
     #   1) `grade_on_demand::{org_id}::{session_id}::{agent_version}::{evaluation_name}`
     #      — our 24h cache, set below after the result_id is resolved.
@@ -2117,14 +2251,14 @@ def grade_on_demand(
         request_context=reflexio.request_context,
         llm_client=reflexio.llm_client,
         force_regenerate=True,
-        evaluation_name=payload.evaluation_name,
     )
 
     result_id = _find_fresh_result_id(
         storage,
         session_id=payload.session_id,
-        evaluation_name=payload.evaluation_name,
         agent_version=payload.agent_version,
+        evaluation_name=evaluation_name,
+        previous_result_ids=previous_result_ids,
     )
 
     storage.upsert_operation_state(
@@ -2622,6 +2756,9 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         validate_llm_availability()
+        from reflexio.server.llm.rerank import prewarm as _prewarm_cross_encoder
+
+        _prewarm_cross_encoder()
         # The scheduler discovers every org with resumable work each tick and
         # drives a per-org worker with org-scoped claims, so it is not limited
         # to the bootstrap org. The bootstrap org is only used to read config
@@ -2660,14 +2797,32 @@ def create_app(
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[reportArgumentType]
 
     # CORS
-    origins = ["*"]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # The locked-down, credentialed allowlist is an enterprise concern: only
+    # hosts that wire in auth (``require_auth=True``) restrict browser origins.
+    # OSS/local runs have no auth and bundle their own docs playground on a
+    # separate port, so they allow any origin (no credentials needed).
+    if require_auth:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=_resolve_cors_origins(),
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    else:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    # Reject oversized requests before they reach endpoint handlers.
+    app.add_middleware(BodySizeLimitMiddleware)
+
+    # Security headers
+    app.add_middleware(SecurityHeadersMiddleware)
 
     # Timeout middleware
     app.add_middleware(TimeoutMiddleware)

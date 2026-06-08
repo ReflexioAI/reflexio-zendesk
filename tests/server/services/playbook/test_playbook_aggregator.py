@@ -12,7 +12,7 @@ Targets coverage gaps in:
          change log exception, full archive delete path, incremental archive delete)
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -22,6 +22,7 @@ from reflexio.models.api_schema.service_schemas import (
     UserPlaybook,
 )
 from reflexio.models.config_schema import (
+    SINGLETON_USER_PLAYBOOK_NAME,
     PlaybookAggregatorConfig,
     PlaybookConfig,
 )
@@ -548,25 +549,29 @@ class TestGetPlaybookAggregatorConfig:
         )
         agg.configurator.get_config.return_value.user_playbook_extractor_config = afc
 
-        result = agg._get_playbook_aggregator_config("my_fb")
+        result = agg._get_playbook_aggregator_config()
 
         assert result is fac
 
-    def test_returns_none_when_no_match(self):
+    def test_returns_config_without_name_matching(self):
         agg = _make_aggregator()
+        fac = PlaybookAggregatorConfig(
+            min_cluster_size=3, reaggregation_trigger_count=5
+        )
         afc = PlaybookConfig(
             extractor_name="other",
             extraction_definition_prompt="prompt",
+            aggregation_config=fac,
         )
         agg.configurator.get_config.return_value.user_playbook_extractor_config = afc
 
-        assert agg._get_playbook_aggregator_config("missing") is None
+        assert agg._get_playbook_aggregator_config() is fac
 
     def test_returns_none_when_no_playbook_configs(self):
         agg = _make_aggregator()
         agg.configurator.get_config.return_value.user_playbook_extractor_config = None
 
-        assert agg._get_playbook_aggregator_config("any") is None
+        assert agg._get_playbook_aggregator_config() is None
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +606,7 @@ class TestRun:
         agg = _make_aggregator()
         agg.configurator.get_config.return_value.user_playbook_extractor_config = None
 
-        req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+        req = PlaybookAggregatorRequest(agent_version="v1")
         agg.run(req)
 
         agg.storage.get_user_playbooks.assert_not_called()
@@ -618,7 +623,7 @@ class TestRun:
         )
         agg.configurator.get_config.return_value.user_playbook_extractor_config = afc
 
-        req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+        req = PlaybookAggregatorRequest(agent_version="v1")
         agg.run(req)
 
         agg.storage.get_user_playbooks.assert_not_called()
@@ -636,50 +641,65 @@ class TestRun:
         agg.configurator.get_config.return_value.user_playbook_extractor_config = afc
         agg.storage.count_user_playbooks.return_value = 1
 
-        req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+        req = PlaybookAggregatorRequest(agent_version="v1")
         agg.run(req)
 
         agg.storage.get_user_playbooks.assert_not_called()
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_rerun_mode_archives_all(self, mock_gen, mock_clust):
         """rerun=True should call archive_agent_playbooks_by_playbook_name."""
         agg = self._make_runnable_aggregator()
-        mock_clust.return_value = {0: [_raw(rid=1)]}
-        mock_gen.return_value = [_agent_playbook(fid=100)]
+        raws = [_raw(rid=1)]
+        mock_clust.return_value = {0: raws}
+        mock_gen.return_value = [(_agent_playbook(fid=100), raws)]
         agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=100)]
 
         req = PlaybookAggregatorRequest(
-            agent_version="v1", playbook_name="fb", rerun=True
+            agent_version="v1", rerun=True
         )
         agg.run(req)
 
-        agg.storage.archive_agent_playbooks_by_playbook_name.assert_called()
+        agg.storage.archive_agent_playbooks_by_playbook_name.assert_has_calls(
+            [
+                call(SINGLETON_USER_PLAYBOOK_NAME, agent_version="v1"),
+                call("test_fb", agent_version="v1"),
+            ],
+            any_order=True,
+        )
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_rerun_deletes_archived_playbooks_after_success(self, mock_gen, mock_clust):
         """After successful rerun, delete_archived_agent_playbooks_by_playbook_name is called."""
         agg = self._make_runnable_aggregator()
-        mock_clust.return_value = {0: [_raw(rid=1)]}
-        mock_gen.return_value = [_agent_playbook(fid=100)]
+        raws = [_raw(rid=1)]
+        mock_clust.return_value = {0: raws}
+        mock_gen.return_value = [(_agent_playbook(fid=100), raws)]
         agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=100)]
 
         req = PlaybookAggregatorRequest(
-            agent_version="v1", playbook_name="fb", rerun=True
+            agent_version="v1", rerun=True
         )
         agg.run(req)
 
-        agg.storage.delete_archived_agent_playbooks_by_playbook_name.assert_called_once()
+        agg.storage.delete_archived_agent_playbooks_by_playbook_name.assert_has_calls(
+            [
+                call(SINGLETON_USER_PLAYBOOK_NAME, agent_version="v1"),
+                call("test_fb", agent_version="v1"),
+            ],
+            any_order=True,
+        )
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_first_run_no_prev_fingerprints_full_archive(self, mock_gen, mock_clust):
         """First run (no previous fingerprints) triggers full archive."""
         agg = self._make_runnable_aggregator()
-        mock_clust.return_value = {0: [_raw(rid=1), _raw(rid=2)]}
-        mock_gen.return_value = [_agent_playbook(fid=100)]
+        raws = [_raw(rid=1), _raw(rid=2)]
+        mock_clust.return_value = {0: raws}
+        mock_gen.return_value = [(_agent_playbook(fid=100), raws)]
         agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=100)]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
@@ -687,7 +707,7 @@ class TestRun:
             mgr.get_cluster_fingerprints.return_value = {}
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
         agg.storage.archive_agent_playbooks_by_playbook_name.assert_called()
@@ -708,21 +728,21 @@ class TestRun:
             }
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
         # Should NOT call _generate_playbooks_from_clusters
         agg.storage.save_agent_playbooks.assert_not_called()
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_incremental_with_changes_archives_selectively(self, mock_gen, mock_clust):
         """Incremental mode with changed clusters archives only affected playbook_ids."""
         agg = self._make_runnable_aggregator()
         raws_new = [_raw(rid=5), _raw(rid=6)]
         agg.storage.get_user_playbooks.return_value = raws_new
         mock_clust.return_value = {0: raws_new}
-        mock_gen.return_value = [_agent_playbook(fid=200)]
+        mock_gen.return_value = [(_agent_playbook(fid=200), raws_new)]
         agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=200)]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
@@ -732,7 +752,7 @@ class TestRun:
             }
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
         agg.storage.archive_agent_playbooks_by_ids.assert_called_once_with([50])
@@ -747,7 +767,7 @@ class TestRun:
         mock_gen.side_effect = RuntimeError("LLM failed")
 
         req = PlaybookAggregatorRequest(
-            agent_version="v1", playbook_name="fb", rerun=True
+            agent_version="v1", rerun=True
         )
 
         with pytest.raises(RuntimeError, match="LLM failed"):
@@ -772,7 +792,7 @@ class TestRun:
             }
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
 
             with pytest.raises(RuntimeError, match="Boom"):
                 agg.run(req)
@@ -782,19 +802,20 @@ class TestRun:
         )
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_change_log_exception_is_caught(self, mock_gen, mock_clust):
         """Exception in add_playbook_aggregation_change_log should be caught, not raised."""
         agg = self._make_runnable_aggregator()
-        mock_clust.return_value = {0: [_raw(rid=1)]}
-        mock_gen.return_value = [_agent_playbook(fid=100)]
+        raws = [_raw(rid=1)]
+        mock_clust.return_value = {0: raws}
+        mock_gen.return_value = [(_agent_playbook(fid=100), raws)]
         agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=100)]
         agg.storage.add_playbook_aggregation_change_log.side_effect = RuntimeError(
             "DB down"
         )
 
         req = PlaybookAggregatorRequest(
-            agent_version="v1", playbook_name="fb", rerun=True
+            agent_version="v1", rerun=True
         )
 
         # Should NOT raise
@@ -804,7 +825,7 @@ class TestRun:
         agg.storage.delete_archived_agent_playbooks_by_playbook_name.assert_called()
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_run_fingerprint_state_updated(self, mock_gen, mock_clust):
         """Fingerprint state should be updated after a successful run."""
         agg = self._make_runnable_aggregator()
@@ -812,7 +833,7 @@ class TestRun:
         mock_clust.return_value = {0: raws}
         saved = _agent_playbook(fid=100)
         saved.agent_playbook_id = 100
-        mock_gen.return_value = [saved]
+        mock_gen.return_value = [(saved, raws)]
         agg.storage.save_agent_playbooks.return_value = [saved]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
@@ -820,7 +841,7 @@ class TestRun:
             mgr.get_cluster_fingerprints.return_value = {}
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
         mgr.update_cluster_fingerprints.assert_called_once()
@@ -835,7 +856,7 @@ class TestRun:
                 assert fp_data["agent_playbook_id"] == 100
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_incremental_changed_clusters_but_no_archived_ids(
         self, mock_gen, mock_clust
     ):
@@ -844,7 +865,7 @@ class TestRun:
         raws_new = [_raw(rid=5), _raw(rid=6)]
         agg.storage.get_user_playbooks.return_value = raws_new
         mock_clust.return_value = {0: raws_new}
-        mock_gen.return_value = [_agent_playbook(fid=200)]
+        mock_gen.return_value = [(_agent_playbook(fid=200), raws_new)]
         agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=200)]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
@@ -856,7 +877,7 @@ class TestRun:
             }
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
         # archive_agent_playbooks_by_ids should NOT be called (no ids to archive)
@@ -865,7 +886,7 @@ class TestRun:
         agg.storage.delete_agent_playbooks_by_ids.assert_not_called()
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_saved_fb_without_playbook_id_skipped_in_fingerprint_assignment(
         self, mock_gen, mock_clust
     ):
@@ -876,7 +897,7 @@ class TestRun:
         # AgentPlaybook with agent_playbook_id=0 (falsy)
         fb_no_id = _agent_playbook(fid=0, content="no id")
         fb_no_id.agent_playbook_id = 0
-        mock_gen.return_value = [fb_no_id]
+        mock_gen.return_value = [(fb_no_id, raws)]
         agg.storage.save_agent_playbooks.return_value = [fb_no_id]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
@@ -884,7 +905,7 @@ class TestRun:
             mgr.get_cluster_fingerprints.return_value = {}
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
         mgr.update_cluster_fingerprints.assert_called_once()
@@ -916,7 +937,7 @@ class TestRun:
             }
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
 
             with pytest.raises(RuntimeError, match="Kaboom"):
                 agg.run(req)
@@ -927,13 +948,13 @@ class TestRun:
         agg.storage.restore_archived_agent_playbooks_by_ids.assert_not_called()
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_run_with_none_saved_playbooks_in_list(self, mock_gen, mock_clust):
         """saved_playbooks list containing None entries should not cause errors."""
         agg = self._make_runnable_aggregator()
         raws = [_raw(rid=1)]
         mock_clust.return_value = {0: raws}
-        mock_gen.return_value = [None]
+        mock_gen.return_value = []
         agg.storage.save_agent_playbooks.return_value = [None]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
@@ -941,12 +962,12 @@ class TestRun:
             mgr.get_cluster_fingerprints.return_value = {}
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             # Should not raise
             agg.run(req)
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_multiple_saved_playbooks_assigned_to_multiple_fingerprints(
         self, mock_gen, mock_clust
     ):
@@ -959,7 +980,7 @@ class TestRun:
         fb1.agent_playbook_id = 100
         fb2 = _agent_playbook(fid=200, content="b")
         fb2.agent_playbook_id = 200
-        mock_gen.return_value = [fb1, fb2]
+        mock_gen.return_value = [(fb1, raws_a), (fb2, raws_b)]
         agg.storage.save_agent_playbooks.return_value = [fb1, fb2]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
@@ -967,7 +988,7 @@ class TestRun:
             mgr.get_cluster_fingerprints.return_value = {}
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
         mgr.update_cluster_fingerprints.assert_called_once()
@@ -985,26 +1006,26 @@ class TestRun:
         assert set(assigned_ids) == {100, 200}
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
-    def test_saved_fb_no_matching_fingerprint_exhausts_loop(self, mock_gen, mock_clust):
-        """Branch 579->576: inner loop exhausts without finding a match (all fps have ids)."""
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
+    def test_generated_playbook_id_maps_to_exact_source_cluster(
+        self, mock_gen, mock_clust
+    ):
+        """A generated playbook after a duplicate cluster keeps the correct fingerprint."""
         agg = self._make_runnable_aggregator()
-        raws = [_raw(rid=1)]
-        mock_clust.return_value = {0: raws}
-        fb1 = _agent_playbook(fid=100, content="a")
-        fb1.agent_playbook_id = 100
-        # Two saved playbooks but only one cluster fingerprint
-        fb2 = _agent_playbook(fid=200, content="b")
-        fb2.agent_playbook_id = 200
-        mock_gen.return_value = [fb1, fb2]
-        agg.storage.save_agent_playbooks.return_value = [fb1, fb2]
+        duplicate_cluster = [_raw(rid=1)]
+        generated_cluster = [_raw(rid=2)]
+        mock_clust.return_value = {0: duplicate_cluster, 1: generated_cluster}
+        saved = _agent_playbook(fid=200, content="b")
+        saved.agent_playbook_id = 200
+        mock_gen.return_value = [(saved, generated_cluster)]
+        agg.storage.save_agent_playbooks.return_value = [saved]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
             mgr.get_cluster_fingerprints.return_value = {}
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
         mgr.update_cluster_fingerprints.assert_called_once()
@@ -1012,17 +1033,17 @@ class TestRun:
         new_fps = call_kwargs.kwargs.get("fingerprints") or call_kwargs[1].get(
             "fingerprints"
         )
-        # Only one fingerprint exists, should have first fb's id
-        assigned_ids = [
-            v["agent_playbook_id"]
-            for v in new_fps.values()
-            if v["agent_playbook_id"] is not None
-        ]
-        assert len(assigned_ids) == 1
-        assert assigned_ids[0] == 100
+        duplicate_fp = PlaybookAggregator._compute_cluster_fingerprint(
+            duplicate_cluster
+        )
+        generated_fp = PlaybookAggregator._compute_cluster_fingerprint(
+            generated_cluster
+        )
+        assert new_fps[duplicate_fp]["agent_playbook_id"] is None
+        assert new_fps[generated_fp]["agent_playbook_id"] == 200
 
     @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_from_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_incremental_carries_forward_unchanged_fingerprints(
         self, mock_gen, mock_clust
     ):
@@ -1036,7 +1057,7 @@ class TestRun:
         all_raws = raws_unchanged + raws_new
         agg.storage.get_user_playbooks.return_value = all_raws
         mock_clust.return_value = {0: raws_unchanged, 1: raws_new}
-        mock_gen.return_value = [_agent_playbook(fid=200)]
+        mock_gen.return_value = [(_agent_playbook(fid=200), raws_new)]
         agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=200)]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
@@ -1048,7 +1069,7 @@ class TestRun:
             mgr.get_cluster_fingerprints.return_value = prev_fps
             mock_csm.return_value = mgr
 
-            req = PlaybookAggregatorRequest(agent_version="v1", playbook_name="fb")
+            req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
         mgr.update_cluster_fingerprints.assert_called_once()
@@ -1210,69 +1231,130 @@ class TestProcessAggregationResponse:
 
 
 # ---------------------------------------------------------------------------
-# _group_playbooks_by_direction — polarity isolation
+# _group_playbooks_by_direction — content-similarity grouping (no polarity gate)
 # ---------------------------------------------------------------------------
 
 
 def _make_pb(
     content: str,
-    polarity: str = "positive",
     rid: int = 1,
+    rationale: str | None = None,
 ) -> UserPlaybook:
-    """Build a UserPlaybook with explicit content and polarity for grouping tests."""
+    """Build a minimal UserPlaybook for grouping/aggregation tests.
+
+    Grouping is now purely content-similarity based (Option B): whole-content
+    polarity is no longer derived or gated. A skill may legitimately hold
+    mixed-orientation rules for different sub-aspects; preserving distinct
+    do/avoid rules when merging is the aggregation prompt's responsibility.
+    """
     return UserPlaybook(
         user_playbook_id=rid,
         agent_version="v1",
         request_id=f"req-{rid}",
         playbook_name="test_fb",
         content=content,
-        polarity=polarity,  # type: ignore[arg-type]
+        rationale=rationale,
     )
 
 
-def test_aggregator_separates_positive_and_negative_polarity():
-    """When a cluster contains both positive and negative playbooks on similar
-    content, the aggregator must group them by polarity."""
-    cluster = [
-        _make_pb(content="Recommend X", polarity="positive", rid=1),
-        _make_pb(content="Recommend X (variant)", polarity="positive", rid=2),
-        _make_pb(content="Avoid X", polarity="negative", rid=3),
-    ]
-    groups = PlaybookAggregator._group_playbooks_by_direction(cluster, threshold=0.6)
-    # Expect 2 groups: one for positive, one for negative
-    polarities_per_group = [{p.polarity for p in g} for g in groups]
-    assert {"positive"} in polarities_per_group
-    assert {"negative"} in polarities_per_group
-    # And no group mixes polarities
-    assert all(len(pset) == 1 for pset in polarities_per_group)
+def test_aggregator_groups_by_content_similarity_not_polarity():
+    """Grouping no longer gates on whole-content polarity.
 
-
-def test_aggregator_splits_identical_content_across_polarities():
-    """Regression: an explicit polarity gate (not a string prefix) is required.
-
-    Previously, polarity was smuggled into ``_get_direction_key`` as a prefix
-    token (``f"{polarity}::{content}"``), but ``_token_overlap`` is set-based
-    over whitespace-split tokens — so two playbooks with identical multi-token
-    content but opposite polarity would still overlap at 3/4 tokens and land
-    in the same group at the default 0.6 threshold. This test ensures the
-    grouping routine gates on ``fb.polarity`` explicitly.
+    Two rows whose tokens overlap above the threshold but carry opposite
+    orientations (a "do" rule and an "avoid" rule) MUST now land in the same
+    similarity group — the retired mechanical whole-content polarity
+    direction-split used to force them apart. Keeping the opposite-orientation
+    rules distinct inside a
+    merged skill is delegated to the aggregation prompt, not to a mechanical
+    pre-LLM split.
     """
-    content = "ask clarifying questions before proceeding"
-    cluster = [
-        _make_pb(content=content, polarity="positive", rid=1),
-        _make_pb(content=content, polarity="negative", rid=2),
-    ]
-    groups = PlaybookAggregator._group_playbooks_by_direction(cluster, threshold=0.6)
-    assert len(groups) == 2, (
-        f"identical content across polarities must split into 2 groups, got {groups}"
+    positive = _make_pb(
+        content="Always ask clarifying questions before proceeding",
+        rid=1,
     )
-    polarities_per_group = [{p.polarity for p in g} for g in groups]
-    assert {"positive"} in polarities_per_group
-    assert {"negative"} in polarities_per_group
+    negative = _make_pb(
+        content="Avoid asking clarifying questions before proceeding",
+        rationale="user pushback observed",
+        rid=2,
+    )
+    # Sanity: the two rows overlap above the grouping threshold.
+    assert PlaybookAggregator._token_overlap(
+        PlaybookAggregator._get_direction_key(positive),
+        PlaybookAggregator._get_direction_key(negative),
+        0.6,
+    )
+    groups = PlaybookAggregator._group_playbooks_by_direction(
+        [positive, negative], threshold=0.6
+    )
+    # No polarity gate: high token overlap => a single similarity group.
+    assert len(groups) == 1, (
+        f"high-overlap content must group together (no polarity gate), got {groups}"
+    )
+    assert len(groups[0]) == 2
+
+
+def test_aggregation_preserves_distinct_do_and_avoid_rules():
+    """Prompt-preserved outcome: a do-rule and an avoid-rule survive
+    aggregation as separate rules rather than being collapsed into one.
+
+    The mechanical polarity-bucketing gate is gone; preserving distinct
+    orientations is now the aggregation prompt's job. Here we drive the
+    behavior through the mocked LLM aggregation output (the prompt's job, made
+    deterministic) and assert that the resulting AgentPlaybook content keeps
+    BOTH the do-rule and the avoid-rule as distinct bullets — the opposite of
+    collapsing them into a single rule.
+    """
+    from reflexio.server.services.playbook.playbook_service_utils import (
+        PlaybookAggregationOutput,
+        StructuredPlaybookContent,
+    )
+
+    agg = _make_aggregator()
+
+    # The cluster contains a do-rule and an avoid-rule on the same broad topic
+    # (different sub-aspects). Under Option B these belong in one skill but as
+    # two distinct rules.
+    cluster = [
+        _make_pb(content="Announce the deploy in the channel first", rid=1),
+        _make_pb(
+            content="Avoid deploying on Friday afternoons",
+            rationale="late-Friday deploys caused weekend incidents",
+            rid=2,
+        ),
+    ]
+
+    # Mocked LLM aggregation output: the prompt is responsible for keeping the
+    # two orientations as separate rules — assert that distinct-rule shape is
+    # carried through into the generated playbook content (not collapsed).
+    merged_content = (
+        "- Announce the deploy in the channel first.\n"
+        "- Avoid deploying on Friday afternoons."
+    )
+    response = PlaybookAggregationOutput(
+        playbook=StructuredPlaybookContent(
+            trigger="When deploying a service.",
+            content=merged_content,
+            rationale="Coordinated, well-timed deploys reduce incidents.",
+        )
+    )
+    agg.client.generate_chat_response.return_value = response
+
+    with patch.dict("os.environ", {"MOCK_LLM_RESPONSE": ""}):
+        result = agg._generate_playbook_from_cluster(cluster, "None")
+
+    assert result is not None
+    # Both orientations survive as DISTINCT rules — not merged into one.
+    assert "Announce the deploy in the channel first" in result.content
+    assert "Avoid deploying on Friday afternoons" in result.content
+    # Two separate bullets => the do-rule and the avoid-rule were not collapsed.
+    bullet_lines = [
+        line for line in result.content.splitlines() if line.strip().startswith("-")
+    ]
+    assert len(bullet_lines) == 2
 
 
 def test_playbook_aggregation_prompt_specifies_structured_format():
-    """Sanity (v2.1.0): aggregator prompt must carry the Agent-Skills
+    """Sanity (v2.2.0): aggregator prompt must carry the Agent-Skills
     formatting discipline — imperative conditional triggers, markdown bullet
     content, one-sentence rationale. Mirrors the extraction prompt v1.4.0
     so the downstream agent sees the same shape across per-user playbooks
@@ -1297,3 +1379,31 @@ def test_playbook_aggregation_prompt_specifies_structured_format():
     assert "- Ask for CLI preference" in out
     # Rationale guidance — one sentence WHY.
     assert "one sentence" in out.lower()
+
+
+def test_playbook_aggregation_prompt_preserves_distinct_orientations():
+    """v2.2.0: the aggregation prompt must carry the preserve-distinct-rules
+    instruction that replaced the retired mechanical polarity-bucketing gate.
+
+    When merging similar playbooks, the model must keep a do-rule and an
+    avoid-rule (opposite orientations) as SEPARATE rules — never collapse them
+    into one. This is the text-first replacement for the retired mechanical
+    whole-content polarity direction-split in the aggregator."""
+    from reflexio.server.prompt.prompt_manager import PromptManager
+
+    pm = PromptManager()
+    out = pm.render_prompt(
+        "playbook_aggregation",
+        variables={
+            "user_playbooks": '[1]\nContent: "x"\nTrigger: "y"',
+            "existing_approved_playbooks": "(none)",
+        },
+    )
+    # The preserve-distinct-orientations instruction must be present.
+    assert "Preserve distinct orientations" in out
+    # It must explicitly forbid collapsing a do-rule and an avoid-rule into one.
+    # (Normalize whitespace so a line-wrapped phrase still matches.)
+    normalized = " ".join(out.split())
+    assert 'never collapse a "do" rule and an "avoid" rule into one' in normalized
+    # Mixed-orientation rules for different sub-aspects are allowed in one skill.
+    assert "separate bullets" in normalized

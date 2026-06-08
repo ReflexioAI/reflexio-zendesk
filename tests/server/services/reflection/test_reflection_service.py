@@ -354,7 +354,10 @@ class TestReplacePlaybook:
                     target_kind="playbook",
                     target_id="1",
                     new_content="new rule",
-                    # new_trigger / new_rationale omitted → fall back to archived
+                    # A content rewrite must carry new_rationale (the prompt
+                    # sets it on every playbook content revision); new_trigger
+                    # omitted → falls back to archived.
+                    new_rationale="rewritten because Y was wrong",
                     reason="rule was wrong",
                 )
             ]
@@ -372,9 +375,9 @@ class TestReplacePlaybook:
         assert len(archived) == 1
         assert current[0].user_playbook_id != 1
         assert current[0].content == "new rule"
-        # Trigger / rationale fall back to archived row's values.
+        # Trigger falls back to archived row's value; rationale is the supplied one.
         assert current[0].trigger == "when X"
-        assert current[0].rationale == "because Y"
+        assert current[0].rationale == "rewritten because Y was wrong"
         assert current[0].user_id == "u1"
         assert current[0].agent_version == "v1"
         assert current[0].playbook_name == "fb"
@@ -403,6 +406,7 @@ class TestReplacePlaybook:
                     target_kind="playbook",
                     target_id="1",
                     new_content="new rule",
+                    new_rationale="rewritten because Y was wrong",
                     reason="rule was wrong",
                 )
             ]
@@ -672,6 +676,7 @@ class TestArchiveAfterInsertFailure:
                     target_kind="playbook",
                     target_id="1",
                     new_content="new rule",
+                    new_rationale="rewritten after the rule misfired",
                     reason="needed update",
                 )
             ]
@@ -702,17 +707,22 @@ class TestArchiveAfterInsertFailure:
         assert "cited_id=1" in caplog.text
 
 
-class TestPolarityFlip:
-    def test_flip_archives_cited_positive_and_inserts_negative(
+class TestLLMReportedFlip:
+    def test_llm_reported_flip_applies_and_counts_as_revision(
         self, request_context, service, llm_client
     ):
-        """Polarity flip: cited positive → new negative row.
+        """LLM-reported flip: cited rule rewritten in the opposite orientation.
+
+        A flip is no longer derived from wording — it is LLM-reported via a
+        ``new_content`` rewrite carrying a ``new_rationale`` that names the
+        motivating failure (per the memory_reflection prompt). It applies and
+        counts as an ordinary revision; there is no separate flip counter.
 
         Verifies:
-        - The cited positive playbook is archived.
-        - The new playbook has polarity="negative".
-        - result.revised_count == 1 and result.flipped_count == 1.
+        - The cited playbook is archived and the rewritten row is current.
+        - result.revised_count == 1 and result.content_revised_count == 1.
         - result.no_change_count == 0.
+        - ReflectionResult has no flipped_count attribute (counter retired).
         """
         _set_config(request_context)
         storage = request_context.storage
@@ -735,7 +745,6 @@ class TestPolarityFlip:
                     target_kind="playbook",
                     target_id="1",
                     new_content="Avoid X when Y.",
-                    new_polarity="negative",
                     new_rationale="user pushed back when X was recommended",
                     reason="evidence of failure",
                 )
@@ -746,8 +755,10 @@ class TestPolarityFlip:
 
         assert result.ran is True
         assert result.revised_count == 1
-        assert result.flipped_count == 1
+        assert result.content_revised_count == 1
         assert result.no_change_count == 0
+        # flipped_count was retired — no flip-specific counter remains.
+        assert not hasattr(result, "flipped_count")
 
         current = storage.get_user_playbooks(user_id="u1", status_filter=[None])
         archived = storage.get_user_playbooks(
@@ -755,15 +766,21 @@ class TestPolarityFlip:
         )
         assert len(current) == 1
         assert len(archived) == 1
-        assert current[0].polarity == "negative"
         assert current[0].content == "Avoid X when Y."
         assert current[0].rationale == "user pushed back when X was recommended"
         assert archived[0].user_playbook_id == 1
 
-    def test_flip_without_rationale_counts_as_failed(
+    def test_content_revision_without_rationale_counts_as_failed(
         self, request_context, service, llm_client
     ):
-        """A polarity flip missing new_rationale is rejected by _validate_decision."""
+        """A playbook content rewrite missing new_rationale is rejected.
+
+        Flip-requires-rationale, expressed without polarity derivation: the
+        prompt sets ``new_rationale`` on every playbook content rewrite
+        (flips and substance rewrites alike), so ``_validate_decision``
+        rejects any ``new_content`` revision that omits it. The rejected
+        decision is counted as failed and the cited row stays current.
+        """
         _set_config(request_context)
         storage = request_context.storage
         _seed_playbook(storage, 1, "u1", content="Do X when Y.")
@@ -785,7 +802,6 @@ class TestPolarityFlip:
                     target_kind="playbook",
                     target_id="1",
                     new_content="Avoid X when Y.",
-                    new_polarity="negative",
                     # new_rationale intentionally omitted — should fail validation
                     reason="evidence of failure",
                 )
@@ -797,16 +813,20 @@ class TestPolarityFlip:
         assert result.ran is True
         assert result.failed_count == 1
         assert result.revised_count == 0
-        assert result.flipped_count == 0
         # Cited playbook must remain current — no archive happened.
         current = storage.get_user_playbooks(user_id="u1", status_filter=[None])
         assert len(current) == 1
         assert current[0].user_playbook_id == 1
 
-    def test_same_polarity_revision_does_not_count_as_flip(
+    def test_trigger_only_revision_does_not_require_rationale(
         self, request_context, service, llm_client
     ):
-        """Revising content while keeping polarity is revised_count++, flipped_count stays 0."""
+        """A trigger-only revision (no new_content) is exempt from the rule.
+
+        The new_rationale invariant gates only ``new_content`` rewrites;
+        narrowing/widening a trigger without touching content applies
+        normally and counts as a revision.
+        """
         _set_config(request_context)
         storage = request_context.storage
         _seed_playbook(storage, 1, "u1", content="Do X when Y.")
@@ -827,8 +847,7 @@ class TestPolarityFlip:
                 ReflectionDecision(
                     target_kind="playbook",
                     target_id="1",
-                    new_content="Do X when Y, unless Z.",
-                    new_polarity="positive",  # same as cited
+                    new_trigger="when Y and not Z",
                     reason="sharpened trigger",
                 )
             ]
@@ -838,7 +857,328 @@ class TestPolarityFlip:
 
         assert result.ran is True
         assert result.revised_count == 1
-        assert result.flipped_count == 0
+        assert result.trigger_revised_count == 1
+        assert result.failed_count == 0
         current = storage.get_user_playbooks(user_id="u1", status_filter=[None])
         assert len(current) == 1
-        assert current[0].polarity == "positive"
+        assert current[0].content == "Do X when Y."
+        assert current[0].trigger == "when Y and not Z"
+
+
+class TestPerPassCap:
+    def test_cap_stops_applying_after_n_and_increments_capped_count(
+        self, request_context, service, llm_client
+    ):
+        """With max_revisions_per_pass=2, only 2 of 3 revisions apply."""
+        from reflexio.models.config_schema import Config, ReflectionConfig
+
+        cfg = Config.model_validate(
+            {
+                "storage_config": {"db_path": None},
+                "window_size": 5,
+                "stride_size": 2,
+                "reflection_config": ReflectionConfig(
+                    max_revisions_per_pass=2
+                ).model_dump(),
+            }
+        )
+        request_context.configurator = MagicMock()
+        request_context.configurator.get_config.return_value = cfg
+
+        storage = request_context.storage
+        _seed_playbook(storage, 1, "u1", content="rule one")
+        _seed_playbook(storage, 2, "u1", content="rule two")
+        _seed_playbook(storage, 3, "u1", content="rule three")
+
+        cites = [
+            Citation(kind="playbook", real_id="1"),
+            Citation(kind="playbook", real_id="2"),
+            Citation(kind="playbook", real_id="3"),
+        ]
+        _seed_request_with_interactions(
+            storage,
+            "u1",
+            "r1",
+            [
+                _make_interaction("u1", "r1", "Assistant", "hello", citations=cites),
+                _make_interaction("u1", "r1", "User", "ok"),
+            ],
+        )
+
+        llm_client.generate_chat_response.return_value = ReflectionOutput(
+            decisions=[
+                ReflectionDecision(
+                    target_kind="playbook",
+                    target_id=str(i),
+                    new_content=f"revised {i}",
+                    new_rationale=f"rewritten rule {i}",
+                    reason="needed update",
+                )
+                for i in (1, 2, 3)
+            ]
+        )
+
+        result = service.run(ReflectionServiceRequest(user_id="u1"))
+
+        assert result.ran is True
+        assert result.revised_count == 2
+        assert result.capped_count == 1
+        # Exactly two archives happened.
+        archived = storage.get_user_playbooks(
+            user_id="u1", status_filter=[Status.ARCHIVED]
+        )
+        assert len(archived) == 2
+
+    def test_no_change_decisions_do_not_count_against_cap(
+        self, request_context, service, llm_client
+    ):
+        """no_change decisions don't consume cap budget or bump capped_count."""
+        from reflexio.models.config_schema import Config, ReflectionConfig
+
+        cfg = Config.model_validate(
+            {
+                "storage_config": {"db_path": None},
+                "window_size": 5,
+                "stride_size": 2,
+                "reflection_config": ReflectionConfig(
+                    max_revisions_per_pass=1
+                ).model_dump(),
+            }
+        )
+        request_context.configurator = MagicMock()
+        request_context.configurator.get_config.return_value = cfg
+
+        storage = request_context.storage
+        _seed_playbook(storage, 1, "u1", content="rule one")
+        _seed_playbook(storage, 2, "u1", content="rule two")
+
+        cites = [
+            Citation(kind="playbook", real_id="1"),
+            Citation(kind="playbook", real_id="2"),
+        ]
+        _seed_request_with_interactions(
+            storage,
+            "u1",
+            "r1",
+            [
+                _make_interaction("u1", "r1", "Assistant", "hello", citations=cites),
+                _make_interaction("u1", "r1", "User", "ok"),
+            ],
+        )
+
+        llm_client.generate_chat_response.return_value = ReflectionOutput(
+            decisions=[
+                ReflectionDecision(
+                    target_kind="playbook",
+                    target_id="1",
+                    reason="still correct",  # no_change
+                ),
+                ReflectionDecision(
+                    target_kind="playbook",
+                    target_id="2",
+                    new_content="revised two",  # revision, within cap
+                    new_rationale="rewritten rule two",
+                    reason="needed update",
+                ),
+            ]
+        )
+
+        result = service.run(ReflectionServiceRequest(user_id="u1"))
+
+        assert result.no_change_count == 1
+        assert result.revised_count == 1
+        assert result.capped_count == 0
+
+
+class TestFieldDerivableCounters:
+    def test_trigger_revision_bumps_trigger_revised_count(
+        self, request_context, service, llm_client
+    ):
+        _set_config(request_context)
+        storage = request_context.storage
+        _seed_playbook(storage, 1, "u1")
+
+        cite = Citation(kind="playbook", real_id="1")
+        _seed_request_with_interactions(
+            storage,
+            "u1",
+            "r1",
+            [
+                _make_interaction("u1", "r1", "User", "hi"),
+                _make_interaction("u1", "r1", "Assistant", "hello", citations=[cite]),
+            ],
+        )
+
+        llm_client.generate_chat_response.return_value = ReflectionOutput(
+            decisions=[
+                ReflectionDecision(
+                    target_kind="playbook",
+                    target_id="1",
+                    new_trigger="when Z instead",
+                    reason="trigger was too broad",
+                )
+            ]
+        )
+
+        result = service.run(ReflectionServiceRequest(user_id="u1"))
+
+        assert result.revised_count == 1
+        assert result.trigger_revised_count == 1
+        assert result.content_revised_count == 0
+        assert result.ttl_changed_count == 0
+
+    def test_content_revision_bumps_content_revised_count(
+        self, request_context, service, llm_client
+    ):
+        _set_config(request_context)
+        storage = request_context.storage
+        _seed_playbook(storage, 1, "u1")
+
+        cite = Citation(kind="playbook", real_id="1")
+        _seed_request_with_interactions(
+            storage,
+            "u1",
+            "r1",
+            [
+                _make_interaction("u1", "r1", "User", "hi"),
+                _make_interaction("u1", "r1", "Assistant", "hello", citations=[cite]),
+            ],
+        )
+
+        llm_client.generate_chat_response.return_value = ReflectionOutput(
+            decisions=[
+                ReflectionDecision(
+                    target_kind="playbook",
+                    target_id="1",
+                    new_content="sharper rule",
+                    new_rationale="rewritten after content proved wrong",
+                    reason="content was wrong",
+                )
+            ]
+        )
+
+        result = service.run(ReflectionServiceRequest(user_id="u1"))
+
+        assert result.revised_count == 1
+        assert result.content_revised_count == 1
+        assert result.trigger_revised_count == 0
+        assert result.ttl_changed_count == 0
+
+    def test_ttl_change_bumps_ttl_changed_count(
+        self, request_context, service, llm_client
+    ):
+        _set_config(request_context)
+        storage = request_context.storage
+        _seed_profile(storage, "u1", "p1")
+
+        cite = Citation(kind="profile", real_id="p1")
+        _seed_request_with_interactions(
+            storage,
+            "u1",
+            "r1",
+            [
+                _make_interaction("u1", "r1", "User", "hi"),
+                _make_interaction("u1", "r1", "Assistant", "hello", citations=[cite]),
+            ],
+        )
+
+        llm_client.generate_chat_response.return_value = ReflectionOutput(
+            decisions=[
+                ReflectionDecision(
+                    target_kind="profile",
+                    target_id="p1",
+                    new_profile_time_to_live=ProfileTimeToLive.ONE_QUARTER,
+                    reason="preference is temporary",
+                )
+            ]
+        )
+
+        result = service.run(ReflectionServiceRequest(user_id="u1"))
+
+        assert result.revised_count == 1
+        assert result.ttl_changed_count == 1
+        assert result.content_revised_count == 0
+        assert result.trigger_revised_count == 0
+
+    def test_combined_revision_bumps_multiple_counters(
+        self, request_context, service, llm_client
+    ):
+        _set_config(request_context)
+        storage = request_context.storage
+        _seed_playbook(storage, 1, "u1")
+
+        cite = Citation(kind="playbook", real_id="1")
+        _seed_request_with_interactions(
+            storage,
+            "u1",
+            "r1",
+            [
+                _make_interaction("u1", "r1", "User", "hi"),
+                _make_interaction("u1", "r1", "Assistant", "hello", citations=[cite]),
+            ],
+        )
+
+        llm_client.generate_chat_response.return_value = ReflectionOutput(
+            decisions=[
+                ReflectionDecision(
+                    target_kind="playbook",
+                    target_id="1",
+                    new_content="sharper rule",
+                    new_trigger="when Z instead",
+                    new_rationale="rewritten after both content and trigger misfired",
+                    reason="both wrong",
+                )
+            ]
+        )
+
+        result = service.run(ReflectionServiceRequest(user_id="u1"))
+
+        assert result.revised_count == 1
+        assert result.content_revised_count == 1
+        assert result.trigger_revised_count == 1
+        assert result.ttl_changed_count == 0
+
+    def test_edit_magnitude_logged_for_applied_revision(
+        self, request_context, service, llm_client, caplog
+    ):
+        _set_config(request_context)
+        storage = request_context.storage
+        _seed_playbook(storage, 1, "u1", content="old rule")
+
+        cite = Citation(kind="playbook", real_id="1")
+        _seed_request_with_interactions(
+            storage,
+            "u1",
+            "r1",
+            [
+                _make_interaction("u1", "r1", "User", "hi"),
+                _make_interaction("u1", "r1", "Assistant", "hello", citations=[cite]),
+            ],
+        )
+
+        llm_client.generate_chat_response.return_value = ReflectionOutput(
+            decisions=[
+                ReflectionDecision(
+                    target_kind="playbook",
+                    target_id="1",
+                    new_content="a much longer replacement rule",
+                    new_rationale="rewritten with a longer rule",
+                    reason="needed update",
+                )
+            ]
+        )
+
+        with caplog.at_level(
+            "INFO",
+            logger="reflexio.server.services.reflection.reflection_service",
+        ):
+            result = service.run(ReflectionServiceRequest(user_id="u1"))
+
+        assert result.revised_count == 1
+        assert "event=reflection_edit_magnitude" in caplog.text
+        assert "target_kind=playbook" in caplog.text
+        assert "target_id=1" in caplog.text
+        # old "old rule" = 8 chars, new = 30 chars, delta = 22.
+        assert "old_len=8" in caplog.text
+        assert "new_len=30" in caplog.text
+        assert "delta=22" in caplog.text

@@ -612,7 +612,7 @@ class TestSupportsToolCallingOverrides:
             "litellm.supports_function_calling",
             lambda model: True,  # noqa: ARG005
         )
-        assert tools_mod.supports_tool_calling("openai/gpt-5-mini") is True
+        assert tools_mod.supports_tool_calling("openai/gpt-5.4-mini") is True
 
     def test_litellm_false_unknown_model_returns_false(self, monkeypatch):
         """litellm says False for a model not in the override list — return False."""
@@ -640,6 +640,8 @@ class TestSupportsToolCallingOverrides:
         # Family override applies to all M2.x variants
         assert tools_mod.supports_tool_calling("minimax/MiniMax-M2") is True
         assert tools_mod.supports_tool_calling("minimax/MiniMax-M2-special") is True
+        # M3 has its own override entry (same registry gap as the M2 family)
+        assert tools_mod.supports_tool_calling("minimax/MiniMax-M3") is True
 
     def test_override_does_not_apply_to_other_minimax_models(self, monkeypatch):
         """The override is prefix-scoped: 'minimax/MiniMax-M2' applies to M2 family

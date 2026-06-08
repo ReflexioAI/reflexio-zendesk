@@ -18,7 +18,7 @@ EMBEDDING_DIMENSIONS = 512
 
 # Default sliding window parameters for extraction
 DEFAULT_WINDOW_SIZE = 10
-DEFAULT_STRIDE_SIZE = 5
+DEFAULT_STRIDE_SIZE = 8
 
 # Deprecated aliases kept for older imports.
 DEFAULT_BATCH_SIZE = DEFAULT_WINDOW_SIZE
@@ -377,6 +377,7 @@ class DeduplicationConfig(BaseModel):
     Args:
         search_threshold: Minimum similarity score for search results (0.0-1.0).
         search_top_k: Maximum number of existing playbooks to retrieve per new playbook.
+        max_unified_content_chars: Soft cap on a unified playbook's content length.
     """
 
     search_threshold: float = Field(
@@ -390,10 +391,26 @@ class DeduplicationConfig(BaseModel):
         ge=1,
         description="Maximum number of existing playbooks to retrieve per new playbook.",
     )
+    max_unified_content_chars: int = Field(
+        default=1200,
+        gt=0,
+        description=(
+            "Soft cap on a unified playbook's content length; unify that would "
+            "exceed it should prefer differentiate/keep-separate. Enforced as a "
+            "warning-only backstop in the consolidator apply path."
+        ),
+    )
+
+
+SINGLETON_PROFILE_EXTRACTOR_NAME = "profile"
+SINGLETON_USER_PLAYBOOK_NAME = "playbook"
+SINGLETON_AGENT_SUCCESS_EVALUATION_NAME = "agent_success"
 
 
 class ProfileExtractorConfig(_ExtractorWindowOverrideCompatMixin, BaseModel):
-    extractor_name: NonEmptyStr
+    # Deprecated: kept for back-compat with stored configs. Extraction is singleton
+    # (one profile extractor per org), so the name is accepted but ignored.
+    extractor_name: NonEmptyStr | None = None
     extraction_definition_prompt: SanitizedNonEmptyStr
     context_prompt: str | None = None
     metadata_definition_prompt: str | None = None
@@ -442,7 +459,9 @@ class PlaybookAggregatorConfig(BaseModel):
 
 
 class UserPlaybookExtractorConfig(_ExtractorWindowOverrideCompatMixin, BaseModel):
-    extractor_name: NonEmptyStr
+    # Deprecated: kept for back-compat with stored configs. Extraction is singleton
+    # (one playbook extractor per org), so the name is accepted but ignored.
+    extractor_name: NonEmptyStr | None = None
     extraction_definition_prompt: SanitizedNonEmptyStr
     context_prompt: str | None = None
     metadata_definition_prompt: str | None = None
@@ -472,7 +491,9 @@ class ToolUseConfig(BaseModel):
 
 # define what success looks like for agent
 class AgentSuccessConfig(_ExtractorWindowOverrideCompatMixin, BaseModel):
-    evaluation_name: NonEmptyStr
+    # Deprecated: kept for back-compat with stored configs. Evaluation is singleton
+    # (one agent-success evaluator per org), so the name is accepted but ignored.
+    evaluation_name: NonEmptyStr | None = None
     success_definition_prompt: SanitizedNonEmptyStr
     metadata_definition_prompt: str | None = None
     sampling_rate: float = Field(
@@ -508,6 +529,10 @@ class ReflectionConfig(BaseModel):
             edge of the window with fewer than this many follow-up turns get a
             'last_chance' judgment with the prompt biased toward no_change.
             Set to 0 to disable the filter (legacy behavior).
+        max_revisions_per_pass (int): Cap on the number of revision decisions
+            applied in a single reflection pass (regularization). Once the cap
+            is hit, remaining revision-intent decisions are skipped and counted
+            in ``ReflectionResult.capped_count``.
     """
 
     enabled: bool = True
@@ -523,6 +548,34 @@ class ReflectionConfig(BaseModel):
         ),
         ge=0,
     )
+    max_revisions_per_pass: int = Field(
+        default=8,
+        gt=0,
+        description=(
+            "Cap on revision decisions applied per reflection pass "
+            "(regularization; excess are skipped)."
+        ),
+    )
+
+
+class RetrievalFloorConfig(BaseModel):
+    """Read-path relevance floor: drop search results below a per-arm cross-encoder score.
+
+    Floors are RAW cross-encoder logits (ms-marco-MiniLM), not probabilities. On this
+    corpus strongly relevant items score roughly 0..-3, weak/marginal items -3..-5,
+    and clear junk -6..-11. A default of -3 keeps strong matches while dropping the
+    weak tail that drives false-positive citations. Calibrate per arm on real data.
+    """
+
+    enabled: bool = True
+    pool_size: int = Field(
+        default=30,
+        gt=0,
+        description="Candidates fetched per arm before flooring + cap to top_k.",
+    )
+    profile_floor: float = -3.0
+    user_playbook_floor: float = -3.0
+    agent_playbook_floor: float = -3.0
 
 
 class PlaybookOptimizerConfig(BaseModel):
@@ -668,7 +721,6 @@ class LLMConfig(BaseModel):
 
 def _default_profile_extractor_config() -> ProfileExtractorConfig:
     return ProfileExtractorConfig(
-        extractor_name="default_profile_extractor",
         extraction_definition_prompt=(
             "Extract key information about the user and their working "
             "environment: name, role, preferences, and stable facts the "
@@ -684,7 +736,6 @@ def _default_profile_extractor_config() -> ProfileExtractorConfig:
 
 def _default_user_playbook_extractor_config() -> UserPlaybookExtractorConfig:
     return UserPlaybookExtractorConfig(
-        extractor_name="default_playbook_extractor",
         extraction_definition_prompt="Extract playbook rules about agent performance, including areas where the agent was helpful, areas for improvement, and any issues encountered during the interaction.",
     )
 
@@ -718,6 +769,8 @@ class Config(BaseModel):
     llm_config: LLMConfig | None = None
     # Post-publish reflection service configuration
     reflection_config: ReflectionConfig = Field(default_factory=ReflectionConfig)
+    # Read-path relevance floor (per-arm cross-encoder score cutoff)
+    retrieval_floor: RetrievalFloorConfig = Field(default_factory=RetrievalFloorConfig)
     # Optional GEPA-backed playbook content optimizer
     playbook_optimizer_config: PlaybookOptimizerConfig = Field(
         default_factory=PlaybookOptimizerConfig
@@ -780,6 +833,7 @@ class Config(BaseModel):
                 "reflection_config",
                 "playbook_optimizer_config",
                 "pending_tool_call_config",
+                "retrieval_floor",
             ):
                 if key in data and data[key] is None:
                     del data[key]

@@ -21,6 +21,7 @@ from reflexio.models.api_schema.service_schemas import (
     agent_playbook_to_snapshot,
 )
 from reflexio.models.config_schema import (
+    SINGLETON_USER_PLAYBOOK_NAME,
     PlaybookAggregatorConfig,
 )
 from reflexio.server.api_endpoints.request_context import RequestContext
@@ -100,9 +101,9 @@ class PlaybookAggregator:
             last_processed_id = bookmark if bookmark is not None else 0
 
         # Count user playbooks with ID greater than last processed using efficient count query
-        # Only count current user playbooks (status=None), not archived or pending ones
+        # Only count current user playbooks (status=None), not archived or pending ones.
+        # Singleton aggregation operates on the user's whole playbook set — no name filter.
         new_count = self.storage.count_user_playbooks(  # type: ignore[reportOptionalMemberAccess]
-            playbook_name=playbook_name,
             min_user_playbook_id=last_processed_id,
             agent_version=self.agent_version,
             status_filter=[None],
@@ -196,20 +197,20 @@ class PlaybookAggregator:
     @staticmethod
     def _get_direction_key(fb: UserPlaybook) -> str:
         """
-        Extract a direction key from a user playbook for similarity grouping.
+        Extract a similarity key from a user playbook for grouping.
 
-        Returns the raw content used for token-overlap comparison. Polarity is
-        intentionally NOT encoded into this key — embedding it as a prefix
-        token (e.g. ``positive::ask clarifying questions``) does not actually
-        prevent cross-polarity grouping because ``_token_overlap`` splits on
-        whitespace and the prefix is only one token out of many. Polarity is
-        gated explicitly in ``_group_playbooks_by_direction``.
+        Returns the raw content used for token-overlap comparison. Grouping is
+        purely content-similarity based: under Option B a skill may legitimately
+        hold mixed-orientation rules (do-rules and avoid-rules for different
+        sub-aspects of one task), so whole-content polarity is NOT derived or
+        gated here. Preserving distinct do/avoid rules when similar items are
+        merged is the aggregation prompt's responsibility.
 
         Args:
             fb: A user playbook item
 
         Returns:
-            str: Content used as the direction key for grouping
+            str: Content used as the similarity key for grouping
         """
         return fb.content or ""
 
@@ -243,14 +244,19 @@ class PlaybookAggregator:
         threshold: float = 0.6,
     ) -> list[list[UserPlaybook]]:
         """
-        Group playbooks by similarity of their content, gated by polarity.
+        Group playbooks by similarity of their content.
 
-        Uses greedy single-linkage: each playbook is assigned to the first existing
-        group that has any member with sufficient token overlap AND the same polarity.
-        Polarity is gated explicitly (not encoded into the comparison string) because
-        ``_token_overlap`` is token-set based and a single prefix token cannot mask
-        same-content cross-polarity matches at typical thresholds. Groups are returned
-        sorted by size descending (largest first).
+        Uses greedy single-linkage: each playbook is assigned to the first
+        existing group that has any member with sufficient token overlap.
+        Groups are returned sorted by size descending (largest first).
+
+        Grouping is purely content-similarity based and does NOT gate on a
+        derived whole-content polarity. Under Option B a skill may hold
+        mixed-orientation rules (do-rules and avoid-rules for different
+        sub-aspects), and whole-content polarity is undefined for such a skill.
+        Keeping a do-rule and an avoid-rule as distinct rules when similar items
+        are merged into one skill is the aggregation prompt's responsibility,
+        not a mechanical split here.
 
         Args:
             cluster_playbooks: List of raw playbooks to group
@@ -266,8 +272,7 @@ class PlaybookAggregator:
             matched = False
             for group in groups:
                 if any(
-                    fb.polarity == group_fb.polarity
-                    and PlaybookAggregator._token_overlap(
+                    PlaybookAggregator._token_overlap(
                         key,
                         PlaybookAggregator._get_direction_key(group_fb),
                         threshold,
@@ -292,9 +297,11 @@ class PlaybookAggregator:
         """
         Format a cluster of playbooks for structured aggregation prompt.
 
-        When all playbooks agree (single direction group), uses the flat-list format.
-        When conflicting directions are detected (multiple groups), uses a grouped format
-        so the LLM can see agreement/disagreement and apply majority-wins resolution.
+        When the cluster forms a single similarity group, uses the flat-list
+        format. When distinct similarity groups are detected (multiple groups),
+        uses a grouped format so the LLM can see which items are similar and
+        preserve distinct rules (e.g. a do-rule and an avoid-rule) as separate
+        rules in the merged skill rather than collapsing them.
 
         Args:
             cluster_playbooks: List of raw playbooks in this cluster
@@ -571,10 +578,13 @@ class PlaybookAggregator:
             "playbooks_generated": 0,
         }
 
+        # Singleton aggregation: one playbook kind per org. The name is a fixed
+        # constant used only for bookmark/archive scoping and telemetry — it is
+        # never a selection filter on the read queries below.
+        playbook_name = SINGLETON_USER_PLAYBOOK_NAME
+
         # get playbook aggregator config
-        playbook_aggregator_config = self._get_playbook_aggregator_config(
-            playbook_aggregator_request.playbook_name
-        )
+        playbook_aggregator_config = self._get_playbook_aggregator_config()
         if (
             not playbook_aggregator_config
             or playbook_aggregator_config.min_cluster_size < 2
@@ -585,14 +595,14 @@ class PlaybookAggregator:
                 event_name="aggregation_gate_evaluated",
                 event_category="aggregation",
                 pipeline="playbook",
-                playbook_name=playbook_aggregator_request.playbook_name,
+                playbook_name=playbook_name,
                 agent_version=self.agent_version,
                 outcome="should_skip",
                 metadata={"skip_reason": skip_reason},
             )
             logger.info(
                 "Skipping user playbook aggregation for '%s' (agent_version=%s): no aggregator config or min_cluster_size < 2, config: %s",
-                playbook_aggregator_request.playbook_name,
+                playbook_name,
                 self.agent_version,
                 playbook_aggregator_config,
             )
@@ -604,12 +614,12 @@ class PlaybookAggregator:
         # Check if we should run aggregation based on new playbooks count
         # For rerun, use all user playbooks (last_processed_id=0) to determine if aggregation is needed
         if not self._should_run_aggregation(
-            playbook_aggregator_request.playbook_name,
+            playbook_name,
             playbook_aggregator_config,
             rerun=playbook_aggregator_request.rerun,
         ):
             new_count = self._get_new_user_playbooks_count(
-                playbook_aggregator_request.playbook_name,
+                playbook_name,
                 rerun=playbook_aggregator_request.rerun,
             )
             trigger_count = (
@@ -619,7 +629,7 @@ class PlaybookAggregator:
             )
             logger.info(
                 "Skipping user playbook aggregation for '%s' (agent_version=%s) - only %d new user playbooks (need %d)",
-                playbook_aggregator_request.playbook_name,
+                playbook_name,
                 self.agent_version,
                 new_count,
                 trigger_count,
@@ -629,7 +639,7 @@ class PlaybookAggregator:
                 event_name="aggregation_gate_evaluated",
                 event_category="aggregation",
                 pipeline="playbook",
-                playbook_name=playbook_aggregator_request.playbook_name,
+                playbook_name=playbook_name,
                 agent_version=self.agent_version,
                 outcome="should_skip",
                 count_value=new_count,
@@ -648,19 +658,19 @@ class PlaybookAggregator:
             event_name="aggregation_gate_evaluated",
             event_category="aggregation",
             pipeline="playbook",
-            playbook_name=playbook_aggregator_request.playbook_name,
+            playbook_name=playbook_name,
             agent_version=self.agent_version,
             outcome="should_run",
         )
         logger.info(
             "Running user playbook aggregation for '%s' (agent_version=%s)",
-            playbook_aggregator_request.playbook_name,
+            playbook_name,
             self.agent_version,
         )
 
-        # Get existing APPROVED and PENDING playbooks before archiving (to pass to LLM for deduplication)
+        # Get existing APPROVED and PENDING playbooks before archiving (to pass to LLM for deduplication).
+        # Singleton aggregation pulls the user's whole set — no name filter.
         existing_playbooks = self.storage.get_agent_playbooks(  # type: ignore[reportOptionalMemberAccess]
-            playbook_name=playbook_aggregator_request.playbook_name,
             status_filter=[None],  # Current playbooks only
             playbook_status_filter=[PlaybookStatus.APPROVED, PlaybookStatus.PENDING],
         )
@@ -671,9 +681,16 @@ class PlaybookAggregator:
 
         # get all user playbooks and generate clusters
         user_playbooks = self.storage.get_user_playbooks(  # type: ignore[reportOptionalMemberAccess]
-            playbook_name=playbook_aggregator_request.playbook_name,
             agent_version=self.agent_version,
             include_embedding=True,
+        )
+        full_archive_playbook_names = sorted(
+            {
+                playbook.playbook_name
+                for playbook in [*existing_playbooks, *user_playbooks]
+                if playbook.playbook_name
+            }
+            | {playbook_name}
         )
         clusters = self.get_clusters(user_playbooks, playbook_aggregator_config)
 
@@ -684,11 +701,8 @@ class PlaybookAggregator:
 
         # Determine which clusters changed (skip for rerun)
         mgr = self._create_state_manager()
-        playbook_name = playbook_aggregator_request.playbook_name
         archived_playbook_ids = []
-        full_archive = (
-            False  # True when archive_agent_playbooks_by_playbook_name was used
-        )
+        full_archive = False
         prev_fingerprints: dict = {}  # Populated for incremental mode
 
         # Deferred-archive flag: full archive is performed AFTER LLM generation,
@@ -762,11 +776,12 @@ class PlaybookAggregator:
                 event_name="aggregation_started",
                 event_category="aggregation",
                 pipeline="playbook",
-                playbook_name=playbook_aggregator_request.playbook_name,
+                playbook_name=playbook_name,
                 agent_version=self.agent_version,
                 outcome="started",
             )
-            # Generate new playbooks only for changed clusters
+            # Generate new playbooks only for changed clusters while preserving
+            # the exact source cluster for each non-duplicate playbook.
             generated_pairs = self._generate_playbooks_with_source_clusters(
                 changed_clusters,
                 existing_playbooks,
@@ -779,13 +794,14 @@ class PlaybookAggregator:
             # PENDING/APPROVED playbooks that the LLM identified as duplicates.
             if pending_full_archive:
                 if new_playbooks:
-                    self.storage.archive_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
-                        playbook_name, agent_version=self.agent_version
-                    )
+                    for name in full_archive_playbook_names:
+                        self.storage.archive_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
+                            name, agent_version=self.agent_version
+                        )
                 else:
                     logger.info(
-                        "Skipping full archive of '%s' (agent_version=%s): LLM produced 0 new playbooks; existing PENDING/APPROVED playbooks preserved",
-                        playbook_name,
+                        "Skipping full archive of %s (agent_version=%s): LLM produced 0 new playbooks; existing PENDING/APPROVED playbooks preserved",
+                        full_archive_playbook_names,
                         self.agent_version,
                     )
                     full_archive = False
@@ -821,21 +837,15 @@ class PlaybookAggregator:
                     }
                 )
 
-            # Map saved playbooks back to changed clusters by order
-            # _generate_playbooks_from_clusters iterates clusters in order and
-            # filters out None results, so we need to track which playbooks
-            # correspond to which clusters
+            # Initialize changed cluster fingerprints before assigning saved IDs
+            # below. ``generated_pairs`` preserves the exact source cluster for
+            # every non-duplicate playbook the LLM produced.
             for cluster_playbooks in changed_clusters.values():
                 fp = self._compute_cluster_fingerprint(cluster_playbooks)
                 raw_ids = sorted(fb.user_playbook_id for fb in cluster_playbooks)
 
-                # Try to match saved playbook - the LLM may return None for some
-                # clusters (duplicates), so not every cluster has a saved playbook
-                playbook_id = None
-                # We can't perfectly map without changing _generate_playbooks_from_clusters,
-                # so store the fingerprint with whatever playbook_id we have
                 new_fingerprints[fp] = {
-                    "agent_playbook_id": playbook_id,
+                    "agent_playbook_id": None,
                     "user_playbook_ids": raw_ids,
                 }
 
@@ -903,9 +913,10 @@ class PlaybookAggregator:
 
             # Delete archived playbooks after successful aggregation
             if full_archive:
-                self.storage.delete_archived_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
-                    playbook_name, agent_version=self.agent_version
-                )
+                for name in full_archive_playbook_names:
+                    self.storage.delete_archived_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
+                        name, agent_version=self.agent_version
+                    )
             elif archived_playbook_ids:
                 self.storage.delete_agent_playbooks_by_ids(archived_playbook_ids)  # type: ignore[reportOptionalMemberAccess]
 
@@ -936,7 +947,7 @@ class PlaybookAggregator:
                 event_name="aggregation_failed",
                 event_category="aggregation",
                 pipeline="playbook",
-                playbook_name=playbook_aggregator_request.playbook_name,
+                playbook_name=playbook_name,
                 agent_version=self.agent_version,
                 outcome="failed",
                 duration_ms=int((time.perf_counter() - aggregation_start) * 1000),
@@ -949,9 +960,10 @@ class PlaybookAggregator:
                 str(e),
             )
             if full_archive:
-                self.storage.restore_archived_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
-                    playbook_name, agent_version=self.agent_version
-                )
+                for name in full_archive_playbook_names:
+                    self.storage.restore_archived_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
+                        name, agent_version=self.agent_version
+                    )
             elif archived_playbook_ids:
                 self.storage.restore_archived_agent_playbooks_by_ids(  # type: ignore[reportOptionalMemberAccess]
                     archived_playbook_ids
@@ -1368,13 +1380,9 @@ class PlaybookAggregator:
             playbook_metadata="",
         )
 
-    def _get_playbook_aggregator_config(
-        self, playbook_name: str
-    ) -> PlaybookAggregatorConfig | None:
+    def _get_playbook_aggregator_config(self) -> PlaybookAggregatorConfig | None:
         root_config = self.configurator.get_config()
         playbook_config = getattr(root_config, "user_playbook_extractor_config", None)
         if not playbook_config:
             return None
-        if playbook_config.extractor_name == playbook_name:
-            return playbook_config.aggregation_config
-        return None
+        return playbook_config.aggregation_config
