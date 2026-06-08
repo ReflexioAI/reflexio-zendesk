@@ -18,7 +18,7 @@ EMBEDDING_DIMENSIONS = 512
 
 # Default sliding window parameters for extraction
 DEFAULT_WINDOW_SIZE = 10
-DEFAULT_STRIDE_SIZE = 5
+DEFAULT_STRIDE_SIZE = 8
 
 # Deprecated aliases kept for older imports.
 DEFAULT_BATCH_SIZE = DEFAULT_WINDOW_SIZE
