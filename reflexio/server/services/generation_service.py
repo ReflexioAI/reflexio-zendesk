@@ -172,9 +172,19 @@ class GenerationService:
         )
 
         try:
-            # Always generate a new UUID for request_id
-            request_id = str(uuid.uuid4())
+            caller_request_id = publish_user_interaction_request.request_id
+            request_id = (
+                caller_request_id
+                if caller_request_id is not None
+                else str(uuid.uuid4())
+            )
             result.request_id = request_id
+
+            if (
+                caller_request_id is not None
+                and self.storage.get_request(request_id) is not None  # type: ignore[reportOptionalMemberAccess]
+            ):
+                raise ValueError(f"request_id {request_id!r} already exists")
 
             new_interactions: list[Interaction] = (
                 GenerationService.get_interaction_from_publish_user_interaction_request(

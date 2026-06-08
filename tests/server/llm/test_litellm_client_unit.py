@@ -10,9 +10,10 @@ import json
 import logging
 import struct
 import tempfile
+import time
 import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import litellm
@@ -1991,7 +1992,10 @@ class TestConfigDefaults:
 
     def test_fallback_models_env_var_is_comma_separated(self, monkeypatch):
         monkeypatch.setenv("REFLEXIO_LLM_FALLBACK_MODELS", "gpt-5.4-mini, gpt-5-nano")
-        assert LiteLLMConfig(model="x").fallback_models == ["gpt-5.4-mini", "gpt-5-nano"]
+        assert LiteLLMConfig(model="x").fallback_models == [
+            "gpt-5.4-mini",
+            "gpt-5-nano",
+        ]
 
     def test_fallback_models_can_be_overridden_at_construction(self):
         cfg = LiteLLMConfig(model="x", fallback_models=["gpt-5.4-mini", "gpt-5-nano"])
@@ -2157,6 +2161,28 @@ class TestLitellmIntegration:
         # Per LiteLLM docs, omitting `fallbacks` is the documented "no
         # fallback" signal; passing [] is undefined behavior.
         assert "fallbacks" not in captured
+
+    def test_completion_has_client_side_hard_timeout(self, monkeypatch):
+        monkeypatch.setenv("REFLEXIO_LLM_HARD_TIMEOUT_GRACE_SECONDS", "0")
+        client = LiteLLMClient(LiteLLMConfig(model="x", timeout=cast(Any, 0.01)))
+
+        def _slow(**_params):
+            time.sleep(1)
+            return _make_completion_response("late")
+
+        monkeypatch.setattr("litellm.completion", _slow)
+
+        start = time.perf_counter()
+        with pytest.raises(LiteLLMClientError, match="hard timeout"):
+            client.generate_chat_response(self._messages())
+        assert time.perf_counter() - start < 0.5
+
+    def test_invalid_hard_timeout_grace_env_falls_back(self, monkeypatch, caplog):
+        monkeypatch.setenv("REFLEXIO_LLM_HARD_TIMEOUT_GRACE_SECONDS", "not-a-float")
+        client = LiteLLMClient(LiteLLMConfig(model="x"))
+
+        assert client._hard_timeout_grace_seconds() == 5.0
+        assert "Invalid REFLEXIO_LLM_HARD_TIMEOUT_GRACE_SECONDS" in caplog.text
 
     def test_parse_failure_triggers_one_explicit_retry(self, monkeypatch):
         """Pre-refactor parse-retry preserved: when client-side Pydantic
