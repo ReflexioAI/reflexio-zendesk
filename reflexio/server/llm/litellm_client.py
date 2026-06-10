@@ -57,9 +57,6 @@ from reflexio.server.llm.providers.nomic_embedding_provider import (
     NomicEmbedder,
 )
 from reflexio.server.llm.providers.nomic_embedding_provider import (
-    is_enabled as _nomic_embedder_enabled,
-)
-from reflexio.server.llm.providers.nomic_embedding_provider import (
     is_nomic_model as _is_nomic_model,
 )
 from reflexio.server.llm.providers.nomic_embedding_provider import (
@@ -149,6 +146,23 @@ def _get_embedding_encoding(model: str) -> tiktoken.Encoding:
         return tiktoken.encoding_for_model(model)
     except KeyError:
         return tiktoken.get_encoding("cl100k_base")
+
+
+def _reject_cloud_mode(embedding_model: str, mode: str) -> None:
+    """
+    Raise when a local-only embedding model is configured for cloud mode.
+
+    Args:
+        embedding_model (str): The resolved embedding model name.
+        mode (str): The resolved embedding provider mode.
+
+    Raises:
+        EmbeddingUnavailableError: If ``mode`` is ``"cloud"``.
+    """
+    if mode == "cloud":
+        raise EmbeddingUnavailableError(
+            f"Local embedding model {embedding_model!r} cannot use cloud mode"
+        )
 
 
 def _truncate_for_embedding(
@@ -732,11 +746,11 @@ class LiteLLMClient:
                 [text], model=embedding_model, dimensions=dimensions
             )[0]
 
-        # local/nomic-embed-* routes to the sentence-transformers Nomic
-        # provider (137M params, 768d Matryoshka-truncated to 512). Higher
-        # quality than the chromadb MiniLM fallback below; preferred when
-        # the dep is installed.
-        if _is_nomic_model(embedding_model) and _nomic_embedder_enabled():
+        # local/nomic-embed-* must stay on the Nomic provider (137M params,
+        # 768d Matryoshka-truncated to 512). Falling through to MiniLM would
+        # mix embedding models inside existing vector stores.
+        if _is_nomic_model(embedding_model):
+            _reject_cloud_mode(embedding_model, mode)
             try:
                 return NomicEmbedder.get().embed([text])[0]
             except Exception as e:
@@ -751,10 +765,7 @@ class LiteLLMClient:
         # ``CLAUDE_SMART_USE_LOCAL_EMBEDDING``) is enforced earlier in the
         # auto-detection layer (see ``model_defaults._auto_detect_model``).
         if embedding_model.startswith("local/"):
-            if mode == "cloud":
-                raise EmbeddingUnavailableError(
-                    f"Local embedding model {embedding_model!r} cannot use cloud mode"
-                )
+            _reject_cloud_mode(embedding_model, mode)
             if not _is_chromadb_importable():
                 raise LiteLLMClientError(
                     f"Embedding model {embedding_model!r} requires chromadb. "
@@ -830,7 +841,8 @@ class LiteLLMClient:
             )
 
         # See matching short-circuits in get_embedding above.
-        if _is_nomic_model(embedding_model) and _nomic_embedder_enabled():
+        if _is_nomic_model(embedding_model):
+            _reject_cloud_mode(embedding_model, mode)
             try:
                 return NomicEmbedder.get().embed(list(texts))
             except Exception as e:
@@ -839,10 +851,7 @@ class LiteLLMClient:
                 ) from e
 
         if embedding_model.startswith("local/"):
-            if mode == "cloud":
-                raise EmbeddingUnavailableError(
-                    f"Local embedding model {embedding_model!r} cannot use cloud mode"
-                )
+            _reject_cloud_mode(embedding_model, mode)
             if not _is_chromadb_importable():
                 raise LiteLLMClientError(
                     f"Embedding model {embedding_model!r} requires chromadb. "
