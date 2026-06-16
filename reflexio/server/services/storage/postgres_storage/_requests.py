@@ -5,7 +5,12 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
+from psycopg2 import sql
+
+from reflexio.models.api_schema.internal_schema import (
+    RequestInteractionDataModel,
+    SessionDescriptor,
+)
 from reflexio.models.api_schema.service_schemas import (
     Interaction,
     Request,
@@ -182,6 +187,34 @@ class RequestMixin(SchemaScopedClient):
             return []
 
         return [response_to_request(item) for item in data]
+
+    @handle_exceptions
+    def get_session_ids_in_window(
+        self, from_ts: int, to_ts: int
+    ) -> list[SessionDescriptor]:
+        from_iso = datetime.fromtimestamp(from_ts, tz=UTC).isoformat()
+        to_iso = datetime.fromtimestamp(to_ts, tz=UTC).isoformat()
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT DISTINCT user_id, session_id, agent_version, source
+                FROM {}
+                WHERE session_id IS NOT NULL
+                  AND created_at BETWEEN %s AND %s
+                ORDER BY session_id, user_id, agent_version
+                """
+            ).format(self._table_identifier("requests")),
+            [from_iso, to_iso],
+        )
+        return [
+            SessionDescriptor(
+                user_id=row["user_id"],
+                session_id=row["session_id"],
+                agent_version=row["agent_version"],
+                source=row["source"],
+            )
+            for row in rows
+        ]
 
     @handle_exceptions
     def get_sessions(

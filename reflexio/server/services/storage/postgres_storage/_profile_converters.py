@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from reflexio.models.api_schema.service_schemas import (
+    Citation,
     Interaction,
     ProfileChangeLog,
     ProfileTimeToLive,
@@ -110,6 +111,12 @@ def response_to_interaction(item: Mapping[str, Any]) -> Interaction:
     tools_used_data = item.get("tools_used")
     if tools_used_data and isinstance(tools_used_data, list):
         tools_used = [ToolUsed(**t) for t in tools_used_data if isinstance(t, dict)]
+    citations_data = item.get("citations")
+    citations = (
+        [Citation(**c) for c in citations_data if isinstance(c, dict)]
+        if citations_data and isinstance(citations_data, list)
+        else []
+    )
 
     return Interaction(
         interaction_id=item["interaction_id"],
@@ -124,6 +131,7 @@ def response_to_interaction(item: Mapping[str, Any]) -> Interaction:
         shadow_content=item.get("shadow_content") or "",
         expert_content=item.get("expert_content") or "",
         tools_used=tools_used,
+        citations=citations,
     )
 
 
@@ -151,6 +159,7 @@ def interaction_to_data(interaction: Interaction) -> dict[str, Any]:
         "shadow_content": interaction.shadow_content,
         "expert_content": interaction.expert_content,
         "tools_used": [t.model_dump() for t in interaction.tools_used],
+        "citations": [c.model_dump() for c in interaction.citations],
         "embedding": interaction.embedding,
     }
     # Only include interaction_id if it's set (non-zero), otherwise let DB auto-generate

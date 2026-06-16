@@ -12,8 +12,14 @@ from reflexio.server.services.storage.postgres_storage._playbook import (
 )
 from reflexio.server.services.storage.postgres_storage._profiles import ProfileMixin
 from reflexio.server.services.storage.postgres_storage._requests import RequestMixin
+from reflexio.server.services.storage.postgres_storage._shadow_verdicts import (
+    PostgresShadowVerdictsMixin,
+)
 from reflexio.server.services.storage.postgres_storage._share_links import (
     PostgresShareLinkMixin,
+)
+from reflexio.server.services.storage.postgres_storage._stall_state import (
+    PostgresStallStateMixin,
 )
 
 from ._base import PostgresStorageBase
@@ -27,6 +33,8 @@ class PostgresStorage(
     OperationMixin,
     ExtrasMixin,
     PostgresShareLinkMixin,
+    PostgresStallStateMixin,
+    PostgresShadowVerdictsMixin,
     PostgresStorageBase,
 ):
     """PostgreSQL storage with direct SQL access."""

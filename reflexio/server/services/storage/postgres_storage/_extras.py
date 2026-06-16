@@ -1,9 +1,19 @@
 """Analytics and change log methods for Supabase storage."""
 
+import json
 import logging
+from collections import defaultdict
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, cast
 
+from psycopg2 import sql
+from psycopg2.extras import Json
+
+from reflexio.models.api_schema.braintrust_schema import (
+    BraintrustConnection,
+    ImportedScore,
+)
+from reflexio.models.api_schema.retriever_schema import PlaybookApplicationStat
 from reflexio.models.api_schema.service_schemas import (
     Interaction,
     PlaybookAggregationChangeLog,
@@ -82,6 +92,33 @@ class ExtrasMixin(SchemaScopedClient):
             .execute()
         )
         return [response_to_interaction(item) for item in _rows(response)]
+
+    @handle_exceptions
+    def get_interactions_by_session(self, session_id: str) -> list[Interaction]:
+        """Return interactions for a session, ordered by creation time."""
+        if not session_id:
+            return []
+        columns = sql.SQL(", ").join(
+            sql.SQL("i.") + sql.Identifier(column.strip())
+            for column in _INTERACTION_COLUMNS.split(",")
+        )
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT {}
+                FROM {} AS i
+                JOIN {} AS r ON i.request_id = r.request_id
+                WHERE r.session_id = %s
+                ORDER BY i.created_at ASC
+                """
+            ).format(
+                columns,
+                self._table_identifier("interactions"),
+                self._table_identifier("requests"),
+            ),
+            [session_id],
+        )
+        return [response_to_interaction(row) for row in rows]
 
     # ==============================
     # Dashboard methods
@@ -345,6 +382,93 @@ class ExtrasMixin(SchemaScopedClient):
             ),
         }
 
+    @handle_exceptions
+    def get_playbook_application_stats(
+        self, days_back: int = 30
+    ) -> list[PlaybookApplicationStat]:
+        """Return per-rule citation counts from the ``interactions`` table."""
+        if days_back <= 0:
+            return []
+        current_time = int(datetime.now(UTC).timestamp())
+        start_iso = _timestamp_to_iso(current_time - days_back * 24 * 60 * 60)
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT interaction_id, created_at, citations
+                FROM {}
+                WHERE created_at >= %s
+                  AND citations IS NOT NULL
+                  AND citations <> '[]'::jsonb
+                ORDER BY created_at DESC, interaction_id DESC
+                """
+            ).format(self._table_identifier("interactions")),
+            [start_iso],
+        )
+        if not rows:
+            return []
+
+        aggregates: dict[tuple[Literal["playbook", "profile"], str], dict[str, Any]] = (
+            defaultdict(
+                lambda: {
+                    "applied_count": 0,
+                    "title": "",
+                    "last_applied_at": None,
+                    "last_interaction_id": None,
+                }
+            )
+        )
+        for row in rows:
+            raw_citations = row.get("citations")
+            citations = (
+                json.loads(raw_citations)
+                if isinstance(raw_citations, str)
+                else raw_citations
+            )
+            if not isinstance(citations, list):
+                continue
+            seen_keys: set[tuple[Literal["playbook", "profile"], str]] = set()
+            for citation in citations:
+                if not isinstance(citation, dict):
+                    continue
+                kind = citation.get("kind")
+                real_id = citation.get("real_id")
+                if kind not in ("playbook", "profile") or not real_id:
+                    continue
+                key = (cast(Literal["playbook", "profile"], kind), str(real_id))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                aggregate = aggregates[key]
+                aggregate["applied_count"] += 1
+                if aggregate["last_applied_at"] is None:
+                    aggregate["last_applied_at"] = self._parse_datetime_to_timestamp(
+                        row["created_at"]
+                    )
+                    aggregate["last_interaction_id"] = row["interaction_id"]
+                if not aggregate["title"]:
+                    title = citation.get("title") or ""
+                    if isinstance(title, str) and title.strip():
+                        aggregate["title"] = title.strip()
+
+        stats = [
+            PlaybookApplicationStat(
+                real_id=real_id,
+                kind=kind,
+                title=aggregate["title"],
+                applied_count=aggregate["applied_count"],
+                last_applied_at=aggregate["last_applied_at"],
+                last_interaction_id=aggregate["last_interaction_id"],
+            )
+            for (kind, real_id), aggregate in aggregates.items()
+        ]
+        stats.sort(
+            key=lambda stat: (
+                -stat.applied_count,
+                -(stat.last_applied_at if stat.last_applied_at is not None else 0),
+            )
+        )
+        return stats
+
     def _group_by_time_bucket(
         self, timestamps: list[int], period_start: int, granularity: str
     ) -> dict:
@@ -400,6 +524,28 @@ class ExtrasMixin(SchemaScopedClient):
             bucket_dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
         return int(bucket_dt.timestamp())
+
+    @handle_exceptions
+    def count_sessions_with_shadow_content(self, from_ts: int, to_ts: int) -> int:
+        """Count distinct sessions with at least one non-empty shadow interaction."""
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT COUNT(DISTINCT r.session_id) AS n
+                FROM {} AS i
+                JOIN {} AS r ON i.request_id = r.request_id
+                WHERE COALESCE(i.shadow_content, '') <> ''
+                  AND COALESCE(r.session_id, '') <> ''
+                  AND i.created_at >= %s
+                  AND i.created_at <= %s
+                """
+            ).format(
+                self._table_identifier("interactions"),
+                self._table_identifier("requests"),
+            ),
+            [_timestamp_to_iso(from_ts), _timestamp_to_iso(to_ts)],
+        )
+        return int(rows[0]["n"] or 0) if rows else 0
 
     # ==============================
     # Statistics methods
@@ -513,3 +659,136 @@ class ExtrasMixin(SchemaScopedClient):
     @handle_exceptions
     def delete_all_playbook_aggregation_change_logs(self) -> None:
         self._table("playbook_aggregation_change_logs").delete().gte("id", 0).execute()
+
+    # ==============================
+    # Braintrust connector storage
+    # ==============================
+
+    @handle_exceptions
+    def save_braintrust_connection(self, connection: BraintrustConnection) -> None:
+        self._fetch_all(
+            sql.SQL(
+                """
+                INSERT INTO {} (
+                    org_id, api_key_enc, workspace_id, workspace_name,
+                    project_ids, last_sync_ts, last_error
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (org_id) DO UPDATE SET
+                    api_key_enc = EXCLUDED.api_key_enc,
+                    workspace_id = EXCLUDED.workspace_id,
+                    workspace_name = EXCLUDED.workspace_name,
+                    project_ids = EXCLUDED.project_ids,
+                    last_sync_ts = EXCLUDED.last_sync_ts,
+                    last_error = EXCLUDED.last_error
+                RETURNING 1
+                """
+            ).format(self._table_identifier("braintrust_connection")),
+            [
+                connection.org_id,
+                connection.api_key_enc,
+                connection.workspace_id,
+                connection.workspace_name,
+                Json(connection.project_ids),
+                connection.last_sync_ts,
+                connection.last_error,
+            ],
+        )
+
+    @handle_exceptions
+    def get_braintrust_connection(self, org_id: str) -> BraintrustConnection | None:
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT api_key_enc, workspace_id, workspace_name, project_ids,
+                       last_sync_ts, last_error
+                FROM {}
+                WHERE org_id = %s
+                """
+            ).format(self._table_identifier("braintrust_connection")),
+            [org_id],
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return BraintrustConnection(
+            org_id=org_id,
+            api_key_enc=row["api_key_enc"],
+            workspace_id=row["workspace_id"],
+            workspace_name=row.get("workspace_name") or "",
+            project_ids=list(row.get("project_ids") or []),
+            last_sync_ts=row.get("last_sync_ts"),
+            last_error=row.get("last_error"),
+        )
+
+    @handle_exceptions
+    def delete_braintrust_connection(self, org_id: str) -> None:
+        self._fetch_all(
+            sql.SQL("DELETE FROM {} WHERE org_id = %s RETURNING 1").format(
+                self._table_identifier("braintrust_connection")
+            ),
+            [org_id],
+        )
+
+    @handle_exceptions
+    def save_imported_scores(self, scores: list[ImportedScore]) -> None:
+        if not scores:
+            return
+        table = self._table_identifier("imported_score")
+        for score in scores:
+            self._fetch_all(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (
+                        org_id, source, source_run_id, session_id,
+                        scorer_name, value, ts
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (org_id, source, source_run_id, scorer_name)
+                    DO UPDATE SET
+                        session_id = EXCLUDED.session_id,
+                        value = EXCLUDED.value,
+                        ts = EXCLUDED.ts
+                    RETURNING 1
+                    """
+                ).format(table),
+                [
+                    score.org_id,
+                    score.source,
+                    score.source_run_id,
+                    score.session_id,
+                    score.scorer_name,
+                    score.value,
+                    score.ts,
+                ],
+            )
+
+    @handle_exceptions
+    def get_imported_scores(
+        self, org_id: str, from_ts: int, to_ts: int
+    ) -> list[ImportedScore]:
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT source, source_run_id, session_id, scorer_name, value, ts
+                FROM {}
+                WHERE org_id = %s
+                  AND ts >= %s
+                  AND ts <= %s
+                ORDER BY ts ASC
+                """
+            ).format(self._table_identifier("imported_score")),
+            [org_id, from_ts, to_ts],
+        )
+        return [
+            ImportedScore(
+                org_id=org_id,
+                source=cast(Literal["braintrust"], row["source"]),
+                source_run_id=row["source_run_id"],
+                session_id=row.get("session_id"),
+                scorer_name=row["scorer_name"],
+                value=float(row["value"]),
+                ts=int(row["ts"]),
+            )
+            for row in rows
+        ]

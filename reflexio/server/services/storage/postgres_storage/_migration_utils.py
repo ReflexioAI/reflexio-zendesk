@@ -26,6 +26,7 @@ from psycopg2 import sql as psycopg2_sql
 from reflexio.models.api_schema.service_schemas import (
     Request,
 )
+from reflexio.server.services.storage.error import require_non_empty_session_id
 
 # ---------------------------------------------------------------------------
 # Re-export playbook converters for backward compatibility
@@ -173,7 +174,7 @@ def response_to_request(item: Mapping[str, Any]) -> Request:
         created_at=_parse_iso_timestamp(item["created_at"]),
         source=item.get("source", ""),
         agent_version=item.get("agent_version", ""),
-        session_id=item.get("session_id"),
+        session_id=require_non_empty_session_id(item.get("session_id")),
     )
 
 

@@ -76,6 +76,7 @@ services:
       discovery.type: single-node
       DISABLE_SECURITY_PLUGIN: "true"
       OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
     healthcheck:
       test:
         [
