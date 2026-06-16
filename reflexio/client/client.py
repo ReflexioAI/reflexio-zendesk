@@ -150,12 +150,12 @@ class ReflexioClient:
 
         Args:
             api_key (str): API key for authentication. Falls back to REFLEXIO_API_KEY env var.
-            url_endpoint (str): Base URL for the API. Falls back to REFLEXIO_API_URL env var,
+            url_endpoint (str): Base URL for the API. Falls back to REFLEXIO_URL env var,
                 then to the default backend URL.
             timeout (int): Default request timeout in seconds (default 300)
         """
         self.base_url = (
-            url_endpoint or os.environ.get("REFLEXIO_API_URL", "") or BACKEND_URL
+            url_endpoint or os.environ.get("REFLEXIO_URL", "") or BACKEND_URL
         )
         self.api_key = api_key or os.environ.get("REFLEXIO_API_KEY", "")
         self.timeout = timeout
@@ -391,8 +391,8 @@ class ReflexioClient:
         wait_for_response: bool = False,
         skip_aggregation: bool = False,
         force_extraction: bool = False,
+        evaluation_only: bool = False,
         override_learning_stall: bool = False,
-        metadata: dict[str, Any] | None = None,
     ) -> PublishUserInteractionResponse:
         """Publish user interactions.
 
@@ -418,7 +418,7 @@ class ReflexioClient:
             interactions: List of interaction data.
             source: The source of the interaction.
             agent_version: The agent version.
-            session_id: Optional session ID for grouping requests.
+            session_id: Required non-empty session ID for grouping requests.
             wait_for_response: If True, the **server** waits for
                 extraction to complete before returning (longer HTTP
                 call, response includes real profile/playbook counts).
@@ -430,15 +430,13 @@ class ReflexioClient:
             force_extraction: If True, bypass all extraction gates
                 (stride_size, cheap pre-filter, LLM should_run) and
                 always run extractors.
+            evaluation_only: If True, store the interaction for
+                session-level evaluation only and permanently exclude it
+                from profile/playbook extraction.
             override_learning_stall: If True, run extraction even when
                 Reflexio has recorded a provider auth/billing stall. Keep
                 this False for automatic hook publishes; use it only for an
                 explicit retry after reauth or limit reset.
-            metadata: Optional per-request annotations stamped by the
-                customer. Mirrored onto the stored ``Request`` row so the
-                eval pipeline can read them back. Conventional key:
-                ``reflexio_retrieval_enabled`` (bool) for F2 group
-                assignment. Values must be JSON-encodable.
 
         Returns:
             PublishUserInteractionResponse: Server response. In
@@ -448,6 +446,9 @@ class ReflexioClient:
                 mode it includes request_id, storage routing, and
                 deltas.
         """
+        if session_id is None or not session_id.strip():
+            raise ValueError("session_id is required and cannot be empty")
+
         interaction_data_list = [
             (
                 InteractionData(**interaction_request)
@@ -464,8 +465,8 @@ class ReflexioClient:
             agent_version=agent_version,
             skip_aggregation=skip_aggregation,
             force_extraction=force_extraction,
+            evaluation_only=evaluation_only,
             override_learning_stall=override_learning_stall,
-            metadata=metadata or {},
         )
         result = self._publish_interaction_sync(
             request, wait_for_response=wait_for_response

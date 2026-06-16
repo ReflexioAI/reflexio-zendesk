@@ -179,11 +179,7 @@ class Request(BaseModel):
     """A user-issued request that begins or continues a session.
 
     A Request is the unit of work the agent reacts to. Multiple Requests
-    share a ``session_id`` to form a multi-turn session. The optional
-    ``metadata`` dict carries per-request key/value annotations stamped by
-    customer integration code — distinct from ``playbook_metadata`` (a
-    JSON-encoded string) used by ``Playbook``-family entities elsewhere in
-    this module.
+    share a ``session_id`` to form a multi-turn session.
 
     Attributes:
         request_id (str): Unique identifier for this request.
@@ -192,22 +188,10 @@ class Request(BaseModel):
             to the current UTC time.
         source (str): Free-form origin tag (integration name, etc.).
         agent_version (str): The agent version that handled this request.
-        session_id (str | None): Session this request belongs to, or None
-            if the request is not part of a multi-turn session.
-        metadata (dict[str, Any]): Free-form per-request annotations.
-            Always a dict — never None. Conventional keys:
-
-            - ``reflexio_retrieval_enabled`` (bool): F2 group-by signal;
-              customer integration code stamps this to indicate whether
-              Reflexio retrieval was active for the session. Read by the
-              ``/api/get_evaluation_overview`` aggregator from the FIRST
-              request of each session for sticky group assignment.
-
-            Distinct from ``playbook_metadata`` on ``Playbook``-family
-            entities (which is a JSON-encoded string, not a dict).
-            On-the-wire serialization assumes JSON-encodable values;
-            non-JSON values like ``datetime`` or ``set`` will fail at
-            the storage / API boundary.
+        session_id (str): Non-empty session this request belongs to.
+        evaluation_only (bool): Whether this request is stored for
+            session-level evaluation only and must be excluded from
+            profile/playbook learning windows.
     """
 
     request_id: str
@@ -215,8 +199,8 @@ class Request(BaseModel):
     created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
     source: str = ""
     agent_version: str = ""
-    session_id: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    session_id: NonEmptyStr
+    evaluation_only: bool = False
 
 
 # information about the user profile generated from the user interaction
@@ -563,26 +547,21 @@ class PublishUserInteractionRequest(BaseModel):
     agent_version: str = (
         ""  # this is used for aggregating interactions for generating agent playbooks
     )
-    session_id: str | None = None  # used for grouping requests together
+    session_id: NonEmptyStr  # used for grouping requests together
     skip_aggregation: bool = (
         False  # when True, extract profiles/playbooks but skip aggregation
     )
     force_extraction: bool = False  # when True, bypass all extraction gates (stride_size, cheap pre-filter, LLM should_run) and always run extractors
+    evaluation_only: bool = False  # when True, store for evaluation and permanently exclude from profile/playbook extraction
     override_learning_stall: bool = False  # when True, run extraction even if a provider auth/billing stall is recorded
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    """Per-request annotations stamped by customer integration code.
 
-    Mirrors ``Request.metadata`` — the publish path copies this dict
-    onto the ``Request`` row it creates so the eval pipeline (and the
-    F2 sticky-group aggregator in particular) can read it back from
-    the first request of each session.
-
-    Conventional keys:
-        - ``reflexio_retrieval_enabled`` (bool): F2 group assignment signal.
-
-    Defaults to ``{}`` (never None) for backward compatibility — existing
-    callers that don't pass ``metadata`` keep working unchanged.
-    """
+    @model_validator(mode="after")
+    def validate_evaluation_only(self) -> Self:
+        if self.evaluation_only and self.force_extraction:
+            raise ValueError("evaluation_only cannot be combined with force_extraction")
+        if self.evaluation_only and not self.session_id:
+            raise ValueError("evaluation_only publishes require session_id")
+        return self
 
 
 # publish user interaction response

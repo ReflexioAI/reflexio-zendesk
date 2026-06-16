@@ -404,6 +404,7 @@ class TestPublishInteraction:
 
         request = PublishUserInteractionRequest(
             user_id="user1",
+            session_id="test_session",
             interaction_data_list=[{"role": "User", "content": "hi"}],
         )
         response = mixin.publish_interaction(request)
@@ -424,6 +425,7 @@ class TestPublishInteraction:
 
         request = PublishUserInteractionRequest(
             user_id="user1",
+            session_id="test_session",
             interaction_data_list=[{"role": "User", "content": "hi"}],
         )
         response = mixin.publish_interaction(request)
@@ -450,6 +452,7 @@ class TestPublishInteraction:
         response = mixin.publish_interaction(
             {
                 "user_id": "user1",
+                "session_id": "test_session",
                 "interaction_data_list": [{"role": "User", "content": "hi"}],
             }
         )
@@ -474,6 +477,7 @@ class TestPublishInteraction:
         response = mixin.publish_interaction(
             PublishUserInteractionRequest(
                 user_id="user1",
+                session_id="test_session",
                 interaction_data_list=[{"role": "User", "content": "hi"}],
             )
         )
@@ -505,6 +509,7 @@ class TestPublishInteraction:
         response = mixin.publish_interaction(
             PublishUserInteractionRequest(
                 user_id="user1",
+                session_id="test_session",
                 interaction_data_list=[{"role": "User", "content": "hi"}],
             )
         )
@@ -525,6 +530,7 @@ class TestPublishInteraction:
 
         request = PublishUserInteractionRequest(
             user_id="user1",
+            session_id="test_session",
             interaction_data_list=[{"role": "User", "content": "hi"}],
         )
         response = mixin.publish_interaction(request)

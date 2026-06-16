@@ -279,7 +279,10 @@ class TestResolveModelName:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
         monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: None)
-        assert resolve_model_name(ModelRole.EMBEDDING) == _PROVIDER_DEFAULTS["local"].embedding
+        assert (
+            resolve_model_name(ModelRole.EMBEDDING)
+            == _PROVIDER_DEFAULTS["local"].embedding
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +530,7 @@ class TestMinimaxOnlyEnvRegression:
     ) -> None:
         """An empty ``OPENAI_API_KEY=`` placeholder line must NOT promote OpenAI.
 
-        The bundled ``.env.example`` ships with ``OPENAI_API_KEY=`` (no
+        A bundled ``.env`` template may ship ``OPENAI_API_KEY=`` (no
         value); ``load_dotenv`` interprets this as
         ``os.environ['OPENAI_API_KEY'] = ''``. ``detect_available_providers``
         relies on truthiness, so an empty string must be treated as

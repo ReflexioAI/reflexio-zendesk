@@ -11,6 +11,7 @@ Covers:
 """
 
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -185,7 +186,7 @@ class TestSSRFPrevention:
                 }
             )
 
-    def test_azure_endpoint_allows_valid_url(self):
+    def test_azure_endpoint_allows_valid_url(self, non_strict_mode):
         """Valid Azure endpoints are accepted."""
         config = AzureOpenAIConfig.model_validate(
             {
@@ -564,7 +565,21 @@ class TestListMinLength:
     def test_publish_interaction_requires_data(self):
         """PublishUserInteractionRequest requires at least one interaction."""
         with pytest.raises(ValidationError):
-            PublishUserInteractionRequest(user_id="test", interaction_data_list=[])
+            PublishUserInteractionRequest(
+                user_id="test", session_id="session", interaction_data_list=[]
+            )
+
+    def test_publish_interaction_requires_non_empty_session_id(self):
+        """PublishUserInteractionRequest requires a non-empty session id."""
+        interaction = InteractionData(content="hello")
+        invalid_session_ids: tuple[Any, ...] = (None, "", "   ")
+        for value in invalid_session_ids:
+            with pytest.raises(ValidationError):
+                PublishUserInteractionRequest(
+                    user_id="test",
+                    session_id=value,
+                    interaction_data_list=[interaction],
+                )
 
     def test_add_user_playbook_requires_data(self):
         """AddUserPlaybookRequest requires at least one user playbook."""
@@ -669,7 +684,7 @@ class TestCrossFieldValidators:
         config = OpenAIConfig(api_key="sk-test")
         assert config.api_key == "sk-test"
 
-    def test_openai_config_with_azure(self):
+    def test_openai_config_with_azure(self, non_strict_mode):
         """OpenAIConfig with only azure_config is valid."""
         config = OpenAIConfig(
             azure_config=AzureOpenAIConfig.model_validate(

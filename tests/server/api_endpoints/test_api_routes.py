@@ -6,6 +6,7 @@ fixture from conftest to isolate tests from real storage/LLM calls.
 """
 
 import tempfile
+from inspect import iscoroutinefunction
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -36,6 +37,11 @@ class TestHealthEndpoints:
         assert response.status_code == 200
         assert response.json()["status"] == "healthy"
 
+    def test_health_check_is_async(self, client):
+        """Keep container healthchecks off the shared sync worker threadpool."""
+        route = next(route for route in client.app.routes if route.path == "/health")
+        assert iscoroutinefunction(route.endpoint)
+
 
 class TestPublishInteraction:
     """Tests for POST /api/publish_interaction."""
@@ -44,6 +50,7 @@ class TestPublishInteraction:
     def _publish_payload():
         return {
             "user_id": "user-1",
+            "session_id": "sess-1",
             "interaction_data_list": [
                 {
                     "user_id": "user-1",
@@ -83,6 +90,35 @@ class TestPublishInteraction:
         data = response.json()
         assert data["success"] is True
         assert "queued" in data["message"].lower()
+
+    def test_async_publish_does_not_wait_forever_for_limiter_capacity(
+        self, client, patched_reflexio
+    ):
+        captured: dict[str, bool] = {}
+
+        def _fake_run_with_limit(**kwargs):
+            captured["wait_forever"] = kwargs["wait_forever"]
+            return kwargs["fn"]()
+
+        with (
+            patch(
+                "reflexio.server.api.run_with_operation_limit",
+                side_effect=_fake_run_with_limit,
+            ),
+            patch(
+                "reflexio.server.api_endpoints.publisher_api.add_user_interaction",
+                return_value=PublishUserInteractionResponse(
+                    success=True, message="Interaction processed"
+                ),
+            ),
+        ):
+            response = client.post(
+                "/api/publish_interaction",
+                json=self._publish_payload(),
+            )
+
+        assert response.status_code == 200
+        assert captured["wait_forever"] is False
 
     def test_publish_missing_body_returns_422(self, client):
         response = client.post("/api/publish_interaction")

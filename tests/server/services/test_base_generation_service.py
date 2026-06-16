@@ -352,6 +352,7 @@ class TestFilterConfigByStride:
         request = Request(
             request_id="req1",
             user_id="test_user",
+            session_id="test_session",
             created_at=1000,
             source="api",
         )
@@ -440,7 +441,7 @@ class TestFilterConfigByStride:
 
     def test_passes_config_when_stride_size_met(self, llm_client, request_context):
         """Verify config passes through when new interaction count >= stride_size."""
-        service = self._setup_stride_size_service(llm_client, request_context, 6)
+        service = self._setup_stride_size_service(llm_client, request_context, 8)
         service.service_config = MockServiceConfig(auto_run=True, source="api")
 
         config = MockExtractorConfig(extractor_name="ext1")
@@ -2132,7 +2133,11 @@ class TestCheapShouldRunReject:
         return [
             RequestInteractionDataModel(
                 session_id="s",
-                request=Request(request_id="r", user_id="u"),
+                request=Request(
+                    request_id="r",
+                    user_id="u",
+                    session_id="test_session",
+                ),
                 interactions=[
                     Interaction(user_id="u", request_id="r", role="User", content=c)
                     for c in contents

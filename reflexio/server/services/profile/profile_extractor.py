@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -12,11 +13,11 @@ from reflexio.models.api_schema.service_schemas import (
 from reflexio.models.config_schema import ProfileExtractorConfig
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient
+from reflexio.server.llm.token_accounting import RunTokenTotals, sum_trace_tokens
 from reflexio.server.services.extraction.outcome import ExtractionOutcome
 from reflexio.server.services.extraction.resumable_agent import (
     run_resumable_extraction_agent,
 )
-from reflexio.server.services.extraction.tools import new_profile_id
 from reflexio.server.services.extractor_config_utils import get_extractor_name
 from reflexio.server.services.extractor_interaction_utils import (
     get_effective_source_filter,
@@ -48,6 +49,19 @@ PROFILE_EXTRACTION_MAX_RETRIES = 2
 
 # Maximum number of existing profiles to include in extraction prompt for context
 MAX_EXISTING_PROFILES_FOR_CONTEXT = 5
+
+
+def new_profile_id() -> str:
+    """Generate a short (12-char hex) profile id.
+
+    Format chosen for LLM copy fidelity: full ``str(uuid.uuid4())`` is 36
+    characters of hex+dashes, error-prone for smaller LLMs to copy verbatim.
+    Twelve hex chars is short enough for high-fidelity copy and long enough
+    that birthday-paradox collision probability is vanishingly small at any
+    realistic per-user scale (16^12 ~= 2.8e14 unique values; PRIMARY KEY
+    constraint catches the rare collision).
+    """
+    return uuid.uuid4().hex[:12]
 
 
 class ProfileExtractor:
@@ -83,6 +97,7 @@ class ProfileExtractor:
         self.service_config: ProfileGenerationServiceConfig = service_config
         self.agent_context = agent_context
         self._last_resumable_run_id: str | None = None
+        self._last_resumable_token_totals: RunTokenTotals | None = None
 
         # Get LLM config overrides from configuration
         config = self.request_context.configurator.get_config()
@@ -230,16 +245,6 @@ class ProfileExtractor:
             ) from e
 
         logger.info("Generated raw profiles: %s", raw_profiles)
-        if isinstance(raw_profiles, ExtractionOutcome):
-            user_profiles = self._convert_raw_to_user_profiles(
-                raw_profiles=raw_profiles.items,
-                user_id=self.service_config.user_id,
-                request_id=self.service_config.request_id,
-            )
-            self._update_operation_state(request_interaction_data_models)
-            return ExtractionOutcome.completed(
-                user_profiles, run_id=raw_profiles.run_id
-            )
         user_profiles = self._convert_raw_to_user_profiles(
             raw_profiles=raw_profiles or [],
             user_id=self.service_config.user_id,
@@ -258,6 +263,7 @@ class ProfileExtractor:
             return ExtractionOutcome.completed(
                 user_profiles,
                 run_id=self._last_resumable_run_id,
+                token_totals=self._last_resumable_token_totals,
             )
         return user_profiles or None
 
@@ -392,6 +398,7 @@ class ProfileExtractor:
             log_label="Profile extraction",
         )
         self._last_resumable_run_id = result.run_id
+        self._last_resumable_token_totals = sum_trace_tokens(result.trace)
         if not isinstance(result.output, StructuredProfilesOutput):
             logger.warning(
                 "Profile extraction did not finish: %s", result.finished_reason

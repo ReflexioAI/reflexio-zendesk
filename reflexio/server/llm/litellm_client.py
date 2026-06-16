@@ -57,9 +57,6 @@ from reflexio.server.llm.providers.nomic_embedding_provider import (
     NomicEmbedder,
 )
 from reflexio.server.llm.providers.nomic_embedding_provider import (
-    is_enabled as _nomic_embedder_enabled,
-)
-from reflexio.server.llm.providers.nomic_embedding_provider import (
     is_nomic_model as _is_nomic_model,
 )
 from reflexio.server.llm.providers.nomic_embedding_provider import (
@@ -149,6 +146,23 @@ def _get_embedding_encoding(model: str) -> tiktoken.Encoding:
         return tiktoken.encoding_for_model(model)
     except KeyError:
         return tiktoken.get_encoding("cl100k_base")
+
+
+def _reject_cloud_mode(embedding_model: str, mode: str) -> None:
+    """
+    Raise when a local-only embedding model is configured for cloud mode.
+
+    Args:
+        embedding_model (str): The resolved embedding model name.
+        mode (str): The resolved embedding provider mode.
+
+    Raises:
+        EmbeddingUnavailableError: If ``mode`` is ``"cloud"``.
+    """
+    if mode == "cloud":
+        raise EmbeddingUnavailableError(
+            f"Local embedding model {embedding_model!r} cannot use cloud mode"
+        )
 
 
 def _truncate_for_embedding(
@@ -244,6 +258,15 @@ class LiteLLMConfig:
             if m.strip()
         ]
     )
+
+
+# Reasoning models that routinely exceed the default 120s provider timeout on
+# large extraction contexts. Values are floors, not overrides: the effective
+# timeout is max(configured, floor), and an explicit per-call timeout kwarg
+# always wins.
+_MODEL_TIMEOUT_FLOOR_SECONDS: dict[str, int] = {
+    "minimax/MiniMax-M3": 240,
+}
 
 
 @dataclass
@@ -732,11 +755,11 @@ class LiteLLMClient:
                 [text], model=embedding_model, dimensions=dimensions
             )[0]
 
-        # local/nomic-embed-* routes to the sentence-transformers Nomic
-        # provider (137M params, 768d Matryoshka-truncated to 512). Higher
-        # quality than the chromadb MiniLM fallback below; preferred when
-        # the dep is installed.
-        if _is_nomic_model(embedding_model) and _nomic_embedder_enabled():
+        # local/nomic-embed-* must stay on the Nomic provider (137M params,
+        # 768d Matryoshka-truncated to 512). Falling through to MiniLM would
+        # mix embedding models inside existing vector stores.
+        if _is_nomic_model(embedding_model):
+            _reject_cloud_mode(embedding_model, mode)
             try:
                 return NomicEmbedder.get().embed([text])[0]
             except Exception as e:
@@ -751,10 +774,7 @@ class LiteLLMClient:
         # ``CLAUDE_SMART_USE_LOCAL_EMBEDDING``) is enforced earlier in the
         # auto-detection layer (see ``model_defaults._auto_detect_model``).
         if embedding_model.startswith("local/"):
-            if mode == "cloud":
-                raise EmbeddingUnavailableError(
-                    f"Local embedding model {embedding_model!r} cannot use cloud mode"
-                )
+            _reject_cloud_mode(embedding_model, mode)
             if not _is_chromadb_importable():
                 raise LiteLLMClientError(
                     f"Embedding model {embedding_model!r} requires chromadb. "
@@ -830,7 +850,8 @@ class LiteLLMClient:
             )
 
         # See matching short-circuits in get_embedding above.
-        if _is_nomic_model(embedding_model) and _nomic_embedder_enabled():
+        if _is_nomic_model(embedding_model):
+            _reject_cloud_mode(embedding_model, mode)
             try:
                 return NomicEmbedder.get().embed(list(texts))
             except Exception as e:
@@ -839,10 +860,7 @@ class LiteLLMClient:
                 ) from e
 
         if embedding_model.startswith("local/"):
-            if mode == "cloud":
-                raise EmbeddingUnavailableError(
-                    f"Local embedding model {embedding_model!r} cannot use cloud mode"
-                )
+            _reject_cloud_mode(embedding_model, mode)
             if not _is_chromadb_importable():
                 raise LiteLLMClientError(
                     f"Embedding model {embedding_model!r} requires chromadb. "
@@ -946,7 +964,9 @@ class LiteLLMClient:
         params: dict[str, Any] = {
             "model": actual_model,
             "messages": messages,
-            "timeout": kwargs.pop("timeout", self.config.timeout),
+            "timeout": kwargs.pop(
+                "timeout", self._effective_timeout_for_model(actual_model)
+            ),
         }
 
         # Drop any fallback entry that points back at the primary — sending the
@@ -1144,6 +1164,18 @@ class LiteLLMClient:
         finally:
             result_queue.close()
             result_queue.join_thread()
+
+    def _effective_timeout_for_model(self, model: str) -> int:
+        """Return the configured timeout, raised to the model's floor if one exists.
+
+        Args:
+            model: Resolved model name (e.g. 'minimax/MiniMax-M3').
+
+        Returns:
+            int: max(config.timeout, per-model floor). Callers that pass an
+            explicit timeout kwarg bypass this entirely.
+        """
+        return max(self.config.timeout, _MODEL_TIMEOUT_FLOOR_SECONDS.get(model, 0))
 
     def _hard_timeout_grace_seconds(self) -> float:
         raw = os.environ.get("REFLEXIO_LLM_HARD_TIMEOUT_GRACE_SECONDS", "5") or "5"
@@ -1346,6 +1378,15 @@ class LiteLLMClient:
                 # mitigation.
                 self.logger.warning(
                     "event=llm_parse_retry model=%s — primary returned malformed structured output, retrying once",
+                    params.get("model"),
+                )
+                return _call_and_parse()
+            except LLMHardTimeoutError:
+                # The hard timeout kills the litellm subprocess, so litellm's
+                # num_retries never gets a chance — we owe one explicit retry
+                # at this level to cover transient provider hangs.
+                self.logger.warning(
+                    "event=llm_hard_timeout_retry model=%s — request hit hard timeout, retrying once",
                     params.get("model"),
                 )
                 return _call_and_parse()
@@ -1595,20 +1636,75 @@ class LiteLLMClient:
         """
         content = content.strip()
 
+        # Prefer a balanced JSON container first. Structured JSON may contain
+        # markdown fences inside string values; grabbing the first code block
+        # would extract the inner snippet instead of the response object.
+        json_container = self._extract_first_json_container(content)
+        if json_container is not None:
+            return json_container
+
         # Try to extract from markdown code blocks
         json_block_pattern = r"```(?:json)?\s*([\s\S]*?)```"
         matches = re.findall(json_block_pattern, content)
         if matches:
             return matches[0].strip()
 
-        # Try to find JSON object or array
-        for start_char, end_char in [("{", "}"), ("[", "]")]:
-            start_idx = content.find(start_char)
-            end_idx = content.rfind(end_char)
-            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                return content[start_idx : end_idx + 1]
-
         return content
+
+    def _extract_first_json_container(self, content: str) -> str | None:
+        """Return the first balanced JSON-like object/array in ``content``."""
+        for start_idx, ch in enumerate(content):
+            if ch not in "{[":
+                continue
+            end_idx = self._find_json_container_end(content, start_idx)
+            if end_idx is None:
+                continue
+            candidate = content[start_idx : end_idx + 1]
+            if self._is_parseable_json_candidate(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _find_json_container_end(content: str, start_idx: int) -> int | None:
+        """Find the matching end of a JSON container, respecting strings."""
+        pairs = {"{": "}", "[": "]"}
+        stack = [pairs[content[start_idx]]]
+        in_str = False
+        escape = False
+
+        for idx in range(start_idx + 1, len(content)):
+            ch = content[idx]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_str:
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch in pairs:
+                stack.append(pairs[ch])
+            elif ch in ("}", "]"):
+                if not stack or stack.pop() != ch:
+                    return None
+                if not stack:
+                    return idx
+        return None
+
+    def _is_parseable_json_candidate(self, candidate: str) -> bool:
+        """Return True if a balanced candidate can parse after normal sanitizing."""
+        try:
+            json.loads(candidate)
+            return True
+        except Exception:
+            try:
+                json.loads(self._sanitize_json_string(candidate))
+                return True
+            except Exception:
+                return False
 
     def _looks_truncated_json(self, json_str: str) -> bool:
         """

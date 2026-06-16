@@ -11,8 +11,9 @@
 [![Downloads](https://static.pepy.tech/badge/reflexio-ai/month)](https://pepy.tech/project/reflexio-ai)
 [![Search p50 57ms](https://img.shields.io/badge/search-57ms%20p50-brightgreen)](reflexio/benchmarks/retrieval_latency/results/report.md)
 [![GitHub stars](https://img.shields.io/github/stars/ReflexioAI/reflexio)](https://github.com/ReflexioAI/reflexio/stargazers)
+[![Discord](https://img.shields.io/badge/Discord-Join%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/7fnCxahase)
 
-[Quick Start](#quick-start) · [Features](#features) · [Integrations](#integrations) · [SDK](#sdk-usage) · [CLI](reflexio/cli/README.md) · [Architecture](#architecture) · [Docs](https://www.reflexio.ai/docs) · [Contributing](#contributing)
+[Quick Start](#quick-start) · [Features](#features) · [Integrations](#integrations) · [SDK](#sdk-usage) · [CLI](reflexio/cli/README.md) · [Architecture](#architecture) · [Docs](https://www.reflexio.ai/docs) · [Community](#community) · [Contributing](#contributing)
 
 </div>
 
@@ -85,6 +86,7 @@ Publish conversations from your agent, and Reflexio closes the self-improvement 
 - [SDK Usage](#sdk-usage)
 - [Architecture](#architecture)
 - [Documentation](#documentation)
+- [Community](#community)
 - [Contributing](#contributing)
 - [Star History](#star-history)
 - [License](#license)
@@ -227,7 +229,7 @@ Reflexio will automatically generate profiles and extract playbooks in the backg
 - Session-level evaluation triggered automatically (10 min after last request)
 - Shadow comparison mode: A/B test regular vs shadow agent responses
 - Tool usage analysis for blocking issue detection
-- **Causal measurement of Reflexio's impact** — session-level A/B grouping on the Evaluation page driven by `Request.metadata.reflexio_retrieval_enabled` (with per-turn shadow comparison in development)
+- **Causal measurement of Reflexio's impact** — source-set comparison on the Evaluation page groups evaluated sessions by the first request's `source`
 
 [Read more about evaluation →](https://www.reflexio.ai/docs/examples/agent-evaluation)
 
@@ -270,7 +272,7 @@ client.publish_interaction(
         {"role": "assistant", "content": "..."},
     ],
     agent_version="v1",       # optional: track agent versions
-    session_id="session-abc", # optional: group requests into sessions
+    session_id="session-abc", # required: stable conversation/session id
 )
 
 # Search profiles
@@ -329,6 +331,10 @@ See [developer.md](developer.md) for project structure, supported LLM providers,
 For comprehensive guides, examples, and API reference, visit the **[Reflexio Documentation](https://www.reflexio.ai/docs)**.
 
 For coding agents adding Reflexio to another agent, see **[Integrating an AI Agent with Reflexio](AI_AGENT_INTEGRATION.md)**.
+
+## Community
+
+Join the Reflexio community on Discord: [discord.gg/7fnCxahase](https://discord.gg/7fnCxahase).
 
 ## Contributing
 

@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from reflexio.server.services.storage.storage_base import (
-    PendingToolCallRecord,
-    PendingToolCallStatus,
-)
+if TYPE_CHECKING:
+    from reflexio.server.services.storage.storage_base import PendingToolCallRecord
+
+
+class PendingToolCallStatus(StrEnum):
+    PENDING = "pending"
+    RESOLVED = "resolved"
+    EXPIRED = "expired"
+    SUPERSEDED = "superseded"
+    CANCELLED = "cancelled"
 
 
 class PendingToolCallResponse(BaseModel):

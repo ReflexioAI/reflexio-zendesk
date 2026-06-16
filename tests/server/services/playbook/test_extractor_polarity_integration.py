@@ -62,6 +62,9 @@ def request_context(temp_storage_dir, worker_id):
     org_id = f"polarity_int_{worker_id}"
     context = RequestContext(org_id=org_id, storage_base_dir=temp_storage_dir)
     context.storage = MagicMock()
+    context.storage.update_agent_run_status.side_effect = (
+        lambda _run_id, status, **_kwargs: MagicMock(status=status)
+    )
     # Mock prompt manager so the extractor can render the extraction prompt
     # without depending on the on-disk prompt registry.
     context.prompt_manager = MagicMock()
@@ -111,6 +114,7 @@ def neutral_request_interaction_models():
     request = Request(
         request_id="req_neutral",
         user_id="user_neutral",
+        session_id="test_session",
         created_at=1000,
         source="api",
     )
@@ -155,6 +159,7 @@ def failure_request_interaction_models():
     request = Request(
         request_id="req_failure",
         user_id="user_failure",
+        session_id="test_session",
         created_at=2000,
         source="api",
     )
@@ -308,7 +313,8 @@ def test_classic_extractor_emits_positive_when_no_failure_evidence(
     # MOCK_LLM_RESPONSE=false ensures the mock_llm_client return value is used
     # instead of the extractor's deterministic mock branch.
     with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
-        result = extractor.run().items
+        extracted = extractor.run()
+        result = extracted if isinstance(extracted, list) else extracted.items
 
     assert len(result) == 2, "Expected two playbooks from the neutral window"
     assert all(
@@ -359,7 +365,8 @@ def test_classic_extractor_emits_negative_on_clear_failure(
     )
 
     with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
-        result = extractor.run().items
+        extracted = extractor.run()
+        result = extracted if isinstance(extracted, list) else extracted.items
 
     assert len(result) == 2, "Expected both playbook entries to be emitted"
 

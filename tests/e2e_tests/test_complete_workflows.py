@@ -24,6 +24,7 @@ from reflexio.models.api_schema.service_schemas import (
     RerunProfileGenerationRequest,
     Status,
 )
+from reflexio.models.config_schema import SINGLETON_USER_PLAYBOOK_NAME
 from reflexio.server.services.agent_success_evaluation.group_evaluation_runner import (
     run_group_evaluation,
 )
@@ -57,6 +58,7 @@ def test_complete_workflow_end_to_end(
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
             "agent_version": "test_agent_complete",
+            "session_id": "test_session_complete_workflow",
         }
     )
     assert publish_response.success is True
@@ -186,6 +188,7 @@ def test_error_handling_end_to_end(
     empty_response = reflexio_instance.publish_interaction(
         {
             "user_id": "test_user_empty",
+            "session_id": "e2e_test_session",
             "interaction_data_list": [],
         }
     )
@@ -297,6 +300,7 @@ def test_profile_status_filtering(
     publish_response = reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_source",
             "agent_version": "v1",
@@ -356,6 +360,7 @@ def test_profile_upgrade_downgrade_workflow(
     publish_response = reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_source",
             "agent_version": "v1",
@@ -441,6 +446,7 @@ def test_time_filtering_and_pagination(
     publish_response = reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_source",
             "agent_version": "v1",
@@ -504,6 +510,7 @@ def test_dashboard_statistics(
     publish_response = reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_source",
             "agent_version": "v1",
@@ -548,6 +555,7 @@ def test_rerun_profile_generation_with_filters(
     publish_response_1 = reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests[:2],
             "source": "source_a",
             "agent_version": "v1",
@@ -558,6 +566,7 @@ def test_rerun_profile_generation_with_filters(
     publish_response_2 = reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests[2:4],
             "source": "source_b",
             "agent_version": "v1",
@@ -606,6 +615,7 @@ def test_get_all_operations(
         publish_response = reflexio_instance.publish_interaction(
             {
                 "user_id": user_id,
+                "session_id": "e2e_test_session",
                 "interaction_data_list": sample_interaction_requests[:2],
                 "source": "test_source",
                 "agent_version": "v1",
@@ -698,7 +708,7 @@ def test_full_workflow_with_all_features(
 
     # Step 3: Verify playbooks were generated
     user_playbooks = reflexio_instance.request_context.storage.get_user_playbooks(
-        playbook_name="test_playbook"
+        playbook_name=SINGLETON_USER_PLAYBOOK_NAME
     )
     assert len(user_playbooks) > 0, "User playbooks should be generated"
     assert user_playbooks[0].content.strip() != ""

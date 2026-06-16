@@ -22,6 +22,7 @@ from reflexio.models.api_schema.eval_overview_schema import (
     BraintrustTileRow,
     BucketLiteral,
     ContextTile,
+    EvaluationSourceSetRequest,
     GetEvaluationOverviewRequest,
     GetEvaluationOverviewResponse,
     HeroBlock,
@@ -31,15 +32,13 @@ from reflexio.models.api_schema.eval_overview_schema import (
     RuleAttributionRow,
     ScoreDistribution,
     ShadowWinRateTrend,
-    SuccessRateTrendByGroup,
+    SourceSetComparison,
+    SourceSetEvaluationMetrics,
 )
 from reflexio.models.config_schema import Config
 from reflexio.server.services.evaluation_overview.distribution import (
     BUCKET_LABELS,
     bucket_corrections,
-)
-from reflexio.server.services.evaluation_overview.group_aggregation import (
-    compute_trend_by_group,
 )
 from reflexio.server.services.evaluation_overview.hero_state import (
     compute_hero_state,
@@ -103,6 +102,13 @@ class EvaluationOverviewService:
         results_prev_7d = [
             r for r in all_results if prev_from <= r.created_at < prev_to
         ]
+        session_sources = self._build_first_request_sources(
+            [
+                r.session_id
+                for r in (*results, *results_current_7d, *results_prev_7d)
+                if r.session_id
+            ]
+        )
 
         earliest_eval_ts = min((r.created_at for r in all_results), default=None)
         hero = self._build_hero(request, results, earliest_eval_ts)
@@ -112,16 +118,23 @@ class EvaluationOverviewService:
         braintrust_tiles = self._build_braintrust_tiles(
             cur_7d_from, request.to_ts, prev_from, prev_to
         )
-        # F2: group-aware success-rate trend curves. Joins each eval result
-        # with its session's first request metadata to bucket sessions into
-        # treatment / control / untagged, then time-buckets each curve at
-        # the same granularity as the hero chart.
-        success_rate_trend_by_group = self._build_group_trend(results, request.bucket)
         # F1: per-turn shadow win-rate trend. Filters verdicts to the org's
         # pinned judge prompt version so a future rubric bump doesn't
         # silently mix epochs into the headline.
         shadow_win_rate_trend = self._build_shadow_win_rate_trend(
             request.from_ts, request.to_ts
+        )
+        source_set_comparison = self._build_source_set_comparison(
+            source_sets=request.source_sets,
+            results=results,
+            current=results_current_7d,
+            previous=results_prev_7d,
+            session_sources=session_sources,
+            bucket=request.bucket,
+            current_from=cur_7d_from,
+            current_to=request.to_ts,
+            previous_from=prev_from,
+            previous_to=prev_to,
         )
 
         return GetEvaluationOverviewResponse(
@@ -130,8 +143,8 @@ class EvaluationOverviewService:
             rule_attribution=attribution,
             score_distribution=distribution,
             braintrust_tiles=braintrust_tiles,
-            success_rate_trend_by_group=success_rate_trend_by_group,
             shadow_win_rate_trend=shadow_win_rate_trend,
+            source_set_comparison=source_set_comparison,
         )
 
     # --- private helpers ---
@@ -254,7 +267,12 @@ class EvaluationOverviewService:
         return citations_by_session, rule_titles
 
     def _build_braintrust_tiles(
-        self, from_ts: int, to_ts: int, prev_from: int, prev_to: int
+        self,
+        from_ts: int,
+        to_ts: int,
+        prev_from: int,
+        prev_to: int,
+        session_ids: set[str] | None = None,
     ) -> list[BraintrustTileRow]:
         """Aggregate imported_score rows per scorer_name for current + prior windows.
 
@@ -266,9 +284,13 @@ class EvaluationOverviewService:
         if not org_id:
             return []
         current = self.storage.get_imported_scores(org_id, from_ts, to_ts)  # type: ignore[attr-defined]
+        if session_ids is not None:
+            current = [s for s in current if s.session_id in session_ids]
         if not current:
             return []
         prior = self.storage.get_imported_scores(org_id, prev_from, prev_to)  # type: ignore[attr-defined]
+        if session_ids is not None:
+            prior = [s for s in prior if s.session_id in session_ids]
         cur_agg = _aggregate_imported_scores(current)
         prior_agg = _aggregate_imported_scores(prior)
         rows: list[BraintrustTileRow] = []
@@ -287,6 +309,80 @@ class EvaluationOverviewService:
                 )
             )
         return rows
+
+    def _build_source_set_comparison(
+        self,
+        *,
+        source_sets: list[EvaluationSourceSetRequest],
+        results: list[AgentSuccessEvaluationResult],
+        current: list[AgentSuccessEvaluationResult],
+        previous: list[AgentSuccessEvaluationResult],
+        session_sources: dict[str, str],
+        bucket: BucketLiteral,
+        current_from: int,
+        current_to: int,
+        previous_from: int,
+        previous_to: int,
+    ) -> SourceSetComparison:
+        """Build request-source cohort metrics for the evaluation page."""
+        available_sources = sorted(
+            {session_sources.get(r.session_id or "", "") for r in results}
+        )
+        if not source_sets:
+            return SourceSetComparison(available_sources=available_sources)
+
+        requested_sources = {source for s in source_sets for source in s.sources}
+        unmatched = sum(
+            1
+            for r in results
+            if session_sources.get(r.session_id or "", "") not in requested_sources
+        )
+        rows: list[SourceSetEvaluationMetrics] = []
+        for source_set in source_sets:
+            source_values = set(source_set.sources)
+            set_results = [
+                r
+                for r in results
+                if session_sources.get(r.session_id or "", "") in source_values
+            ]
+            set_current = [
+                r
+                for r in current
+                if session_sources.get(r.session_id or "", "") in source_values
+            ]
+            set_previous = [
+                r
+                for r in previous
+                if session_sources.get(r.session_id or "", "") in source_values
+            ]
+            session_ids = {r.session_id for r in set_results if r.session_id}
+            rows.append(
+                SourceSetEvaluationMetrics(
+                    label=source_set.label,
+                    sources=list(source_set.sources),
+                    session_count=len(set_results),
+                    session_ids=sorted(session_ids),
+                    success_rate_pp=_success_rate(set_results) * 100,
+                    buckets=_buckets(set_results, bucket),
+                    context_tiles=self._build_tiles(set_current, set_previous),
+                    score_distribution=self._build_distribution(
+                        set_current, set_previous
+                    ),
+                    rule_attribution=self._build_attribution(set_results),
+                    braintrust_tiles=self._build_braintrust_tiles(
+                        current_from,
+                        current_to,
+                        previous_from,
+                        previous_to,
+                        session_ids=session_ids,
+                    ),
+                )
+            )
+        return SourceSetComparison(
+            available_sources=available_sources,
+            sets=rows,
+            unmatched_session_count=unmatched,
+        )
 
     def _org_id(self) -> str:
         """Resolve org_id from request_context when available; else empty string."""
@@ -331,71 +427,19 @@ class EvaluationOverviewService:
             verdicts, judge_prompt_version=pinned_version
         )
 
-    def _build_group_trend(
-        self,
-        results: list[AgentSuccessEvaluationResult],
-        bucket: str,
-    ) -> SuccessRateTrendByGroup:
-        """Build the dual+untagged-curve trend payload for the window.
-
-        Joins each eval result with the first request of its session to read
-        ``metadata.reflexio_retrieval_enabled``, then delegates to the pure
-        ``compute_trend_by_group`` aggregator. Returns the default empty
-        ``SuccessRateTrendByGroup`` when ``results`` is empty.
-
-        Args:
-            results (list[AgentSuccessEvaluationResult]): Eval results in the
-                trend window.
-            bucket (str): Bucket granularity literal (``"week"`` or ``"day"``).
-
-        Returns:
-            SuccessRateTrendByGroup: Three curves (any of which may be empty).
-        """
-        if not results:
-            return SuccessRateTrendByGroup()
-        bucket_seconds = _WEEK_SECONDS if bucket == "week" else _DAY_SECONDS
-        outcomes = self._build_group_outcomes(results)
-        return compute_trend_by_group(outcomes, bucket_seconds)
-
-    def _build_group_outcomes(
-        self,
-        results: list[AgentSuccessEvaluationResult],
-    ) -> list[tuple[str, int, bool, dict]]:
-        """Pair each eval result with its session's first-request metadata.
-
-        Caches ``session_id → first_request_metadata`` so storage is hit
-        once per distinct session, not once per result. Sessions without a
-        matching request fall through with an empty-dict metadata, which the
-        downstream aggregator routes to the UNTAGGED bucket.
-
-        Args:
-            results (list[AgentSuccessEvaluationResult]): Eval results to
-                annotate with their session's first-request metadata.
-
-        Returns:
-            list[tuple[str, int, bool, dict]]: Tuples of
-            ``(session_id, created_at, is_success, first_request_metadata)``
-            suitable for :func:`compute_trend_by_group`.
-        """
-        session_ids = {r.session_id for r in results if r.session_id}
-        first_request_metadata: dict[str, dict] = {}
-        for sid in session_ids:
+    def _build_first_request_sources(
+        self, session_ids: Iterable[str]
+    ) -> dict[str, str]:
+        """Map each session to its earliest request's source."""
+        sources: dict[str, str] = {}
+        for sid in set(session_ids):
             reqs = self._get_session_requests(sid)
             if reqs:
                 first = min(reqs, key=lambda r: r.created_at)
-                first_request_metadata[sid] = first.metadata or {}
+                sources[sid] = first.source or ""
             else:
-                first_request_metadata[sid] = {}
-
-        return [
-            (
-                r.session_id or "",
-                r.created_at,
-                r.is_success,
-                first_request_metadata.get(r.session_id or "", {}),
-            )
-            for r in results
-        ]
+                sources[sid] = ""
+        return sources
 
     def _get_session_requests(self, session_id: str) -> list[Request]:
         """Return every request in ``session_id`` regardless of user.

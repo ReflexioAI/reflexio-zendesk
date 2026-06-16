@@ -156,7 +156,12 @@ from reflexio.models.config_schema import (
     SINGLETON_AGENT_SUCCESS_EVALUATION_NAME,
     Config,
 )
-from reflexio.server._auth import DEFAULT_ORG_ID, default_get_org_id
+from reflexio.server._auth import (
+    DEFAULT_ORG_ID,
+    default_billing_gate,
+    default_get_caller_type,
+    default_get_org_id,
+)
 from reflexio.server.api_endpoints import (
     account_api,
     health_api,
@@ -181,13 +186,20 @@ from reflexio.server.services.agent_success_evaluation.regen_jobs import (
     REGEN_JOBS,
     run_regen,
 )
+from reflexio.server.tracing import profile_step
 
 logger = logging.getLogger(__name__)
 
 # Re-exported for backwards compatibility — callers that did
 # ``from reflexio.server.api import default_get_org_id`` or ``DEFAULT_ORG_ID``
 # continue to work.
-__all__ = ["DEFAULT_ORG_ID", "create_app", "default_get_org_id"]
+__all__ = [
+    "DEFAULT_ORG_ID",
+    "create_app",
+    "default_billing_gate",
+    "default_get_caller_type",
+    "default_get_org_id",
+]
 
 # Bot protection configuration
 REQUEST_TIMEOUT_SECONDS = 60
@@ -255,8 +267,41 @@ def get_rate_limit_key(request: Request) -> str:
     return get_remote_address(request)
 
 
+def _storage_backend_name(limiter_obj: Limiter) -> str:
+    storage = getattr(limiter_obj, "_storage", None)
+    if storage is None:
+        return "unknown"
+    return storage.__class__.__name__
+
+
+def _trace_external_rate_limit_backend(limiter_obj: Limiter) -> None:
+    """Trace rate-limit storage hits when the backend is an external service."""
+    backend = _storage_backend_name(limiter_obj)
+    if backend == "MemoryStorage":
+        return
+
+    strategy = getattr(limiter_obj, "limiter", None)
+    if strategy is None or getattr(strategy, "_reflexio_traced", False):
+        return
+
+    original_hit = strategy.hit
+
+    def traced_hit(item: Any, *identifiers: str, cost: int = 1) -> bool:
+        with profile_step(
+            "rate_limit.backend_hit",
+            storage_backend=backend,
+            strategy=strategy.__class__.__name__,
+            cost=cost,
+        ):
+            return original_hit(item, *identifiers, cost=cost)
+
+    strategy.hit = traced_hit
+    strategy._reflexio_traced = True
+
+
 # Initialize rate limiter
 limiter = Limiter(key_func=get_rate_limit_key)
+_trace_external_rate_limit_backend(limiter)
 
 
 def _run_limited_api[T](
@@ -456,6 +501,49 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
 core_router = APIRouter()
 
 
+def _meter_applied_learnings(
+    *,
+    org_id: str,
+    caller_type: str,
+    surfaced_count: int,
+    request_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Emit the ③ Application event via the OSS emission helper.
+
+    No-op unless a production-agent caller surfaced >= 1 result.  The cheap
+    caller-type and count guard runs first so the get_reflexio / config lookup
+    is skipped on the free paths (dashboard / empty result).
+
+    Args:
+        org_id: Organization ID for the requesting caller.
+        caller_type: Resolved caller classification (e.g. ``"production_agent"``).
+        surfaced_count: Total number of learnings returned to the caller.
+        request_id: Optional request correlation ID from the payload.
+        session_id: Optional session ID from the payload.
+    """
+    if caller_type != "production_agent" or surfaced_count <= 0:
+        return
+    try:
+        from reflexio.server.billing_meter import record_applied_learnings
+        from reflexio.server.billing_signals import platform_llm_from_config
+
+        config = get_reflexio(org_id=org_id).request_context.configurator.get_config()
+        record_applied_learnings(
+            org_id=org_id,
+            surfaced_count=surfaced_count,
+            caller_type=caller_type,
+            platform_llm=platform_llm_from_config(config),
+            platform_storage=None,  # resolved enterprise-side at rollup (Phase 1)
+            request_id=request_id,
+            session_id=session_id,
+        )
+    except Exception:
+        logger.warning(
+            "applied-learnings metering failed for org %s", org_id, exc_info=True
+        )
+
+
 @core_router.get("/")
 def root() -> dict[str, str]:
     return {
@@ -466,7 +554,7 @@ def root() -> dict[str, str]:
 
 
 @core_router.get("/health")
-def health_check() -> dict[str, str]:
+async def health_check() -> dict[str, str]:
     """Health check endpoint for ECS/container orchestration."""
     return {"status": "healthy"}
 
@@ -534,6 +622,7 @@ def publish_user_interaction(
     background_tasks: BackgroundTasks,
     org_id: str = Depends(default_get_org_id),
     wait_for_response: bool = False,
+    _gate: None = Depends(default_billing_gate("learnings_generated")),  # noqa: B008
 ) -> PublishUserInteractionResponse:
     if wait_for_response:
         # Process synchronously so the caller gets the real result
@@ -551,6 +640,7 @@ def publish_user_interaction(
                 fn=lambda: publisher_api.add_user_interaction(
                     org_id=org_id, request=payload
                 ),
+                wait_forever=False,
             )
         except TimeoutError:
             logger.warning(
@@ -647,17 +737,27 @@ def search_user_profiles(
     request: Request,
     payload: SearchUserProfileRequest,
     org_id: str = Depends(default_get_org_id),
+    caller_type: str = Depends(default_get_caller_type),
+    _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
 ) -> SearchProfilesViewResponse:
     response = _run_limited_api(
         org_id,
         "search",
         lambda: get_reflexio(org_id=org_id).search_user_profiles(payload),
     )
-    return SearchProfilesViewResponse(
+    resp = SearchProfilesViewResponse(
         success=response.success,
         user_profiles=[to_profile_view(p) for p in response.user_profiles],
         msg=response.msg,
     )
+    _meter_applied_learnings(
+        org_id=org_id,
+        caller_type=caller_type,
+        surfaced_count=len(resp.user_profiles),
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
+    return resp
 
 
 @core_router.post(
@@ -757,6 +857,8 @@ def search_user_playbooks_endpoint(
     request: Request,
     payload: SearchUserPlaybookRequest,
     org_id: str = Depends(default_get_org_id),
+    caller_type: str = Depends(default_get_caller_type),
+    _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
 ) -> SearchUserPlaybooksViewResponse:
     """Search user playbooks with semantic search and advanced filtering.
 
@@ -767,6 +869,7 @@ def search_user_playbooks_endpoint(
         request (Request): The HTTP request object (for rate limiting)
         payload (SearchUserPlaybookRequest): The search request
         org_id (str): Organization ID
+        caller_type (str): Billing caller classification (injected via dependency).
 
     Returns:
         SearchUserPlaybooksViewResponse: Response containing matching user playbooks
@@ -776,11 +879,19 @@ def search_user_playbooks_endpoint(
         "search",
         lambda: get_reflexio(org_id=org_id).search_user_playbooks(payload),
     )
-    return SearchUserPlaybooksViewResponse(
+    resp = SearchUserPlaybooksViewResponse(
         success=response.success,
         user_playbooks=[to_user_playbook_view(rf) for rf in response.user_playbooks],
         msg=response.msg,
     )
+    _meter_applied_learnings(
+        org_id=org_id,
+        caller_type=caller_type,
+        surfaced_count=len(resp.user_playbooks),
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
+    return resp
 
 
 @core_router.post(
@@ -793,6 +904,8 @@ def search_agent_playbooks_endpoint(
     request: Request,
     payload: SearchAgentPlaybookRequest,
     org_id: str = Depends(default_get_org_id),
+    caller_type: str = Depends(default_get_caller_type),
+    _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
 ) -> SearchAgentPlaybooksViewResponse:
     """Search agent playbooks with semantic search and advanced filtering.
 
@@ -803,6 +916,7 @@ def search_agent_playbooks_endpoint(
         request (Request): The HTTP request object (for rate limiting)
         payload (SearchAgentPlaybookRequest): The search request
         org_id (str): Organization ID
+        caller_type (str): Billing caller classification (injected via dependency).
 
     Returns:
         SearchAgentPlaybooksViewResponse: Response containing matching agent playbooks
@@ -812,11 +926,19 @@ def search_agent_playbooks_endpoint(
         "search",
         lambda: get_reflexio(org_id=org_id).search_agent_playbooks(payload),
     )
-    return SearchAgentPlaybooksViewResponse(
+    resp = SearchAgentPlaybooksViewResponse(
         success=response.success,
         agent_playbooks=[to_agent_playbook_view(fb) for fb in response.agent_playbooks],
         msg=response.msg,
     )
+    _meter_applied_learnings(
+        org_id=org_id,
+        caller_type=caller_type,
+        surfaced_count=len(resp.agent_playbooks),
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
+    return resp
 
 
 @core_router.post(
@@ -829,6 +951,8 @@ def unified_search_endpoint(
     request: Request,
     payload: UnifiedSearchRequest,
     org_id: str = Depends(default_get_org_id),
+    caller_type: str = Depends(default_get_caller_type),
+    _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
 ) -> UnifiedSearchViewResponse:
     """Search across all entity types (profiles, agent playbooks, user playbooks).
 
@@ -840,25 +964,50 @@ def unified_search_endpoint(
         request (Request): The HTTP request object (for rate limiting)
         payload (UnifiedSearchRequest): The unified search request
         org_id (str): Organization ID
+        caller_type (str): Billing caller classification (injected via dependency).
 
     Returns:
         UnifiedSearchViewResponse: Combined search results
     """
-    response = _run_limited_api(
-        org_id,
-        "search",
-        lambda: get_reflexio(org_id=org_id).unified_search(payload, org_id=org_id),
-    )
-    return UnifiedSearchViewResponse(
-        success=response.success,
-        profiles=[to_profile_view(p) for p in response.profiles],
-        agent_playbooks=[to_agent_playbook_view(fb) for fb in response.agent_playbooks],
-        user_playbooks=[to_user_playbook_view(rf) for rf in response.user_playbooks],
-        reformulated_query=response.reformulated_query,
-        msg=response.msg,
-        agent_trace=response.agent_trace,
-        rehydrated_text=response.rehydrated_text,
-    )
+    with profile_step(
+        "search.endpoint",
+        enabled=bool(payload.enable_reformulation),
+        has_conversation_history=bool(payload.conversation_history),
+        search_mode=payload.search_mode,
+    ):
+
+        def run_search() -> Any:
+            with profile_step("search.reflexio_cache"):
+                reflexio = get_reflexio(org_id=org_id)
+            return reflexio.unified_search(payload, org_id=org_id)
+
+        response = _run_limited_api(org_id, "search", run_search)
+        with profile_step("search.response_view"):
+            resp = UnifiedSearchViewResponse(
+                success=response.success,
+                profiles=[to_profile_view(p) for p in response.profiles],
+                agent_playbooks=[
+                    to_agent_playbook_view(fb) for fb in response.agent_playbooks
+                ],
+                user_playbooks=[
+                    to_user_playbook_view(rf) for rf in response.user_playbooks
+                ],
+                reformulated_query=response.reformulated_query,
+                msg=response.msg,
+                agent_trace=response.agent_trace,
+                rehydrated_text=response.rehydrated_text,
+            )
+        with profile_step("search.meter_applied_learnings"):
+            _meter_applied_learnings(
+                org_id=org_id,
+                caller_type=caller_type,
+                surfaced_count=len(resp.profiles)
+                + len(resp.agent_playbooks)
+                + len(resp.user_playbooks),
+                request_id=getattr(payload, "request_id", None),
+                session_id=getattr(payload, "session_id", None),
+            )
+    return resp
 
 
 @core_router.get("/api/profile_change_log", response_model=ProfileChangeLogViewResponse)
@@ -1568,26 +1717,40 @@ def get_user_playbooks(
     response_model=GetAgentPlaybooksViewResponse,
     response_model_exclude_none=True,
 )
+@limiter.limit("120/minute")  # Rate limit for read operations
 def get_agent_playbooks(
-    request: GetAgentPlaybooksRequest,
+    request: Request,
+    payload: GetAgentPlaybooksRequest,
     org_id: str = Depends(default_get_org_id),
+    caller_type: str = Depends(default_get_caller_type),
+    _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
 ) -> GetAgentPlaybooksViewResponse:
     """Get agent playbooks with internal fields filtered out.
 
     Args:
-        request (GetAgentPlaybooksRequest): The get request
+        request (Request): The HTTP request object (for rate limiting)
+        payload (GetAgentPlaybooksRequest): The get request
         org_id (str): Organization ID
+        caller_type (str): Billing caller classification (injected via dependency).
 
     Returns:
         GetAgentPlaybooksViewResponse: Response containing agent playbooks without internal fields
     """
     reflexio = get_reflexio(org_id=org_id)
-    response = reflexio.get_agent_playbooks(request)
-    return GetAgentPlaybooksViewResponse(
+    response = reflexio.get_agent_playbooks(payload)
+    resp = GetAgentPlaybooksViewResponse(
         success=response.success,
         agent_playbooks=[to_agent_playbook_view(fb) for fb in response.agent_playbooks],
         msg=response.msg,
     )
+    _meter_applied_learnings(
+        org_id=org_id,
+        caller_type=caller_type,
+        surfaced_count=len(resp.agent_playbooks),
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
+    return resp
 
 
 @core_router.post(
@@ -2714,6 +2877,9 @@ def create_app(
     additional_routers: list[APIRouter] | None = None,
     middleware_config: dict | None = None,
     require_auth: bool = False,
+    get_caller_type: Callable[..., str] | None = None,
+    get_billing_gate: Callable[[str], Callable[..., None]] | None = None,
+    mount_data_plane: bool = True,
 ) -> FastAPI:
     """Factory to create a FastAPI app.
 
@@ -2724,6 +2890,23 @@ def create_app(
         middleware_config: Optional middleware overrides (not used yet, reserved for future).
         require_auth: When True, declares a Bearer security scheme in the OpenAPI spec
             so Swagger UI shows lock icons and the Authorize button works.
+        get_caller_type: Custom dependency for classifying the caller (e.g., production
+            agent vs dashboard).  When provided, overrides the default_get_caller_type
+            dependency globally, exactly mirroring the get_org_id override.
+        get_billing_gate: Optional factory ``(line: str) -> FastAPI dependency`` that
+            replaces the default no-op gate for each billable billing line.  When
+            provided, for every line used in the app (``"application"`` and
+            ``"learnings_generated"``) the returned dependency overrides the
+            ``default_billing_gate(line)`` sentinel in ``dependency_overrides``,
+            exactly mirroring the ``get_caller_type`` override pattern.
+        mount_data_plane: When True (default), include the data-plane routers
+            (core, stall-state, pending-tool-call) and run the data-plane
+            lifespan work (LLM availability check, cross-encoder prewarm,
+            resume scheduler). When False, skip both so a control-plane host
+            can build an app without requiring LLM/storage or starting the
+            scheduler, while keeping all other scaffolding (middleware, CORS,
+            auth overrides, OpenAPI security, health, ``/meta/version``,
+            ``additional_routers``).
 
     Returns:
         Configured FastAPI application.
@@ -2731,7 +2914,11 @@ def create_app(
     from collections.abc import AsyncIterator
     from contextlib import asynccontextmanager
 
-    from reflexio.server._auth import default_get_org_id
+    from reflexio.server._auth import (
+        default_billing_gate,
+        default_get_caller_type,
+        default_get_org_id,
+    )
     from reflexio.server.api_endpoints.request_context import RequestContext
     from reflexio.server.llm.model_defaults import validate_llm_availability
     from reflexio.server.services.extraction.resume_scheduler import (
@@ -2755,18 +2942,20 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
-        validate_llm_availability()
-        from reflexio.server.llm.rerank import prewarm as _prewarm_cross_encoder
+        scheduler = None
+        if mount_data_plane:
+            validate_llm_availability()
+            from reflexio.server.llm.rerank import prewarm as _prewarm_cross_encoder
 
-        _prewarm_cross_encoder()
-        # The scheduler discovers every org with resumable work each tick and
-        # drives a per-org worker with org-scoped claims, so it is not limited
-        # to the bootstrap org. The bootstrap org is only used to read config
-        # and to seed cross-org discovery.
-        scheduler = maybe_start_resume_scheduler(
-            lambda org_id: RequestContext(org_id=org_id),
-            bootstrap_org_id=_lifespan_org_id(),
-        )
+            _prewarm_cross_encoder()
+            # The scheduler discovers every org with resumable work each tick and
+            # drives a per-org worker with org-scoped claims, so it is not limited
+            # to the bootstrap org. The bootstrap org is only used to read config
+            # and to seed cross-org discovery.
+            scheduler = maybe_start_resume_scheduler(
+                lambda org_id: RequestContext(org_id=org_id),
+                bootstrap_org_id=_lifespan_org_id(),
+            )
         try:
             yield
         finally:
@@ -2837,6 +3026,21 @@ def create_app(
     if get_org_id is not None:
         app.dependency_overrides[default_get_org_id] = get_org_id
 
+    # Override get_caller_type dependency if custom one provided
+    if get_caller_type is not None:
+        app.dependency_overrides[default_get_caller_type] = get_caller_type
+
+    # Override billing gate dependencies if a custom gate factory is provided.
+    # Each billing line needs its own override because dependency_overrides is
+    # keyed by callable identity.  ``default_billing_gate`` uses lru_cache so
+    # the same sentinel object is returned for the same line — which is why
+    # the overrides reliably fire at request time.
+    if get_billing_gate is not None:
+        for line in ("application", "learnings_generated"):
+            app.dependency_overrides[default_billing_gate(line)] = get_billing_gate(
+                line
+            )
+
     # When a custom get_org_id is provided together with require_auth,
     # auth is enforced on every route — mark this app instance so the
     # token-gated my_config endpoint becomes reachable. Using
@@ -2845,14 +3049,18 @@ def create_app(
     # multi-tenant embeddings) can coexist without leaking state.
     app.state.my_config_enabled = bool(get_org_id is not None and require_auth)
 
-    # Include core routes
-    app.include_router(core_router)
+    # Include data-plane routes (core, stall-state, pending-tool-call). A
+    # control-plane host sets mount_data_plane=False to skip these while
+    # keeping every other piece of scaffolding below.
+    if mount_data_plane:
+        # Include core routes
+        app.include_router(core_router)
 
-    # Include stall_state routes
-    app.include_router(stall_state_api.router)
+        # Include stall_state routes
+        app.include_router(stall_state_api.router)
 
-    # Include pending tool call routes
-    app.include_router(pending_tool_call_api.router)
+        # Include pending tool call routes
+        app.include_router(pending_tool_call_api.router)
 
     # Include additional routers
     for router in additional_routers or []:

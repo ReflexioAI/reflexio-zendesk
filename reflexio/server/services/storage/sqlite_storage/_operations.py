@@ -9,6 +9,7 @@ from reflexio.models.api_schema.service_schemas import (
     Interaction,
     Request,
 )
+from reflexio.server.services.storage.error import require_non_empty_session_id
 
 from ._base import (
     SQLiteStorageBase,
@@ -86,10 +87,11 @@ class OperationMixin:
         sql = """
             SELECT i.*, r.request_id as r_request_id, r.user_id as r_user_id,
                    r.created_at as r_created_at, r.source as r_source,
-                   r.agent_version as r_agent_version, r.session_id as r_session_id
+                   r.agent_version as r_agent_version, r.session_id as r_session_id,
+                   r.evaluation_only as r_evaluation_only
             FROM interactions i
             JOIN requests r ON i.request_id = r.request_id
-            WHERE 1=1
+            WHERE r.evaluation_only = 0
         """
         params: list[Any] = []
 
@@ -128,7 +130,8 @@ class OperationMixin:
                     created_at=_iso_to_epoch(d["r_created_at"]),
                     source=d.get("r_source") or "",
                     agent_version=d.get("r_agent_version") or "",
-                    session_id=d.get("r_session_id"),
+                    session_id=require_non_empty_session_id(d.get("r_session_id")),
+                    evaluation_only=bool(d.get("r_evaluation_only", 0)),
                 )
                 interactions_by_request[req_id] = []
             interactions_by_request[req_id].append(_row_to_interaction(row))
@@ -167,10 +170,11 @@ class OperationMixin:
         sql = """
             SELECT i.*, r.request_id as r_request_id, r.user_id as r_user_id,
                    r.created_at as r_created_at, r.source as r_source,
-                   r.agent_version as r_agent_version, r.session_id as r_session_id
+                   r.agent_version as r_agent_version, r.session_id as r_session_id,
+                   r.evaluation_only as r_evaluation_only
             FROM interactions i
             JOIN requests r ON i.request_id = r.request_id
-            WHERE 1=1
+            WHERE r.evaluation_only = 0
         """
         params: list[Any] = []
 
@@ -210,7 +214,8 @@ class OperationMixin:
                     created_at=_iso_to_epoch(d["r_created_at"]),
                     source=d.get("r_source") or "",
                     agent_version=d.get("r_agent_version") or "",
-                    session_id=d.get("r_session_id"),
+                    session_id=require_non_empty_session_id(d.get("r_session_id")),
+                    evaluation_only=bool(d.get("r_evaluation_only", 0)),
                 )
                 interactions_by_request[req_id] = []
 

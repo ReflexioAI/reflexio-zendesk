@@ -21,6 +21,7 @@ from reflexio.models.api_schema.service_schemas import (
     UpgradeProfilesRequest,
     UserProfile,
 )
+from reflexio.models.config_schema import SINGLETON_USER_PLAYBOOK_NAME
 from tests.e2e_tests.conftest import scenario_batch_to_interactions
 from tests.server.test_utils import skip_in_precommit, skip_low_priority
 
@@ -31,7 +32,7 @@ pytestmark = pytest.mark.e2e
 def test_publish_interaction_profile_only(
     reflexio_instance_profile_only: Reflexio,
     sample_interaction_requests: list[InteractionData],
-    cleanup_after_test: Callable[[], None],
+    cleanup_profile_only: Callable[[], None],
 ):
     """Test interaction publishing with only profile extraction enabled."""
     user_id = "test_user_profile_only"
@@ -44,6 +45,7 @@ def test_publish_interaction_profile_only(
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
             "agent_version": agent_version,
+            "session_id": "test_session_profile_only",
         }
     )
 
@@ -73,7 +75,7 @@ def test_publish_interaction_profile_only(
     # Verify NO playbooks were generated (since playbook config is not enabled)
     user_playbooks = (
         reflexio_instance_profile_only.request_context.storage.get_user_playbooks(
-            playbook_name="test_playbook"
+            user_id=user_id, playbook_name=SINGLETON_USER_PLAYBOOK_NAME
         )
     )
     assert len(user_playbooks) == 0
@@ -98,6 +100,7 @@ def test_search_profiles_end_to_end(
     reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -155,6 +158,7 @@ def test_get_profiles_end_to_end(
     reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -196,6 +200,7 @@ def test_delete_profile_end_to_end(
     response = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -244,6 +249,7 @@ def test_get_profile_change_logs_end_to_end(
     response = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -291,6 +297,7 @@ def test_rerun_profile_generation_end_to_end(
     response = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -382,6 +389,7 @@ def test_rerun_profile_generation_with_time_filters(
     response = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -460,6 +468,7 @@ def test_rerun_profile_generation_with_source_filter(
     response_a = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_source_a",
         }
@@ -470,6 +479,7 @@ def test_rerun_profile_generation_with_source_filter(
     response_b = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": [
                 InteractionData(
                     content="Just a test message for source B",
@@ -539,6 +549,7 @@ def test_status_filter_in_get_all_profiles(
     response = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -587,6 +598,7 @@ def test_status_filter_in_search_user_profiles(
     response = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -641,6 +653,7 @@ def test_status_filter_in_get_profiles_request(
     response = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -992,6 +1005,7 @@ def test_manual_profile_generation_end_to_end(
     publish_response = reflexio_instance_manual_profile.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_manual_source",
         }
@@ -1048,6 +1062,7 @@ def test_manual_profile_generation_no_window_size(
     publish_response = reflexio_instance_profile_only.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_source",
         }
@@ -1084,6 +1099,7 @@ def test_manual_profile_generation_with_source_filter(
     response_a = reflexio_instance_manual_profile.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "source_a",
         }
@@ -1094,6 +1110,7 @@ def test_manual_profile_generation_with_source_filter(
     response_b = reflexio_instance_manual_profile.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": [
                 InteractionData(
                     content="Simple message for source B",
@@ -1137,6 +1154,7 @@ def test_manual_profile_generation_with_dict_input(
     publish_response = reflexio_instance_manual_profile.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_source",
         }
@@ -1171,6 +1189,7 @@ def test_rerun_profile_generation_with_extractor_names_filter(
         reflexio_instance_multiple_profile_extractors.publish_interaction(
             {
                 "user_id": user_id,
+                "session_id": "e2e_test_session",
                 "interaction_data_list": sample_interaction_requests,
                 "source": "test_source",
             }
@@ -1222,6 +1241,7 @@ def test_rerun_profile_generation_with_single_extractor(
         reflexio_instance_multiple_profile_extractors.publish_interaction(
             {
                 "user_id": user_id,
+                "session_id": "e2e_test_session",
                 "interaction_data_list": sample_interaction_requests,
                 "source": "test_source",
             }
@@ -1263,6 +1283,7 @@ def test_rerun_profile_generation_with_nonexistent_extractor_name(
         reflexio_instance_multiple_profile_extractors.publish_interaction(
             {
                 "user_id": user_id,
+                "session_id": "e2e_test_session",
                 "interaction_data_list": sample_interaction_requests,
                 "source": "test_source",
             }
@@ -1363,6 +1384,7 @@ def test_profile_dedup_resolves_contradiction(
     response = reflexio_instance_lifestyle_profile.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": batch_1,
             "source": "contradiction_test",
         }
@@ -1387,6 +1409,7 @@ def test_profile_dedup_resolves_contradiction(
     response = reflexio_instance_lifestyle_profile.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": batch_2,
             "source": "contradiction_test",
         }
