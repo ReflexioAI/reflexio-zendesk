@@ -267,8 +267,41 @@ def get_rate_limit_key(request: Request) -> str:
     return get_remote_address(request)
 
 
+def _storage_backend_name(limiter_obj: Limiter) -> str:
+    storage = getattr(limiter_obj, "_storage", None)
+    if storage is None:
+        return "unknown"
+    return storage.__class__.__name__
+
+
+def _trace_external_rate_limit_backend(limiter_obj: Limiter) -> None:
+    """Trace rate-limit storage hits when the backend is an external service."""
+    backend = _storage_backend_name(limiter_obj)
+    if backend == "MemoryStorage":
+        return
+
+    strategy = getattr(limiter_obj, "limiter", None)
+    if strategy is None or getattr(strategy, "_reflexio_traced", False):
+        return
+
+    original_hit = strategy.hit
+
+    def traced_hit(item: Any, *identifiers: str, cost: int = 1) -> bool:
+        with profile_step(
+            "rate_limit.backend_hit",
+            storage_backend=backend,
+            strategy=strategy.__class__.__name__,
+            cost=cost,
+        ):
+            return original_hit(item, *identifiers, cost=cost)
+
+    strategy.hit = traced_hit
+    strategy._reflexio_traced = True
+
+
 # Initialize rate limiter
 limiter = Limiter(key_func=get_rate_limit_key)
+_trace_external_rate_limit_backend(limiter)
 
 
 def _run_limited_api[T](
@@ -521,7 +554,7 @@ def root() -> dict[str, str]:
 
 
 @core_router.get("/health")
-def health_check() -> dict[str, str]:
+async def health_check() -> dict[str, str]:
     """Health check endpoint for ECS/container orchestration."""
     return {"status": "healthy"}
 
@@ -607,7 +640,7 @@ def publish_user_interaction(
                 fn=lambda: publisher_api.add_user_interaction(
                     org_id=org_id, request=payload
                 ),
-                wait_forever=True,
+                wait_forever=False,
             )
         except TimeoutError:
             logger.warning(
