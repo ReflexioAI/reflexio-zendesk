@@ -11,6 +11,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from reflexio.models.api_schema.pending_tool_call_schema import PendingToolCallStatus
+
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -25,14 +27,6 @@ class AgentRunStatus(StrEnum):
     FINALIZATION_FAILED = "finalization_failed"
     FAILED = "failed"
     EXPIRED = "expired"
-    CANCELLED = "cancelled"
-
-
-class PendingToolCallStatus(StrEnum):
-    PENDING = "pending"
-    RESOLVED = "resolved"
-    EXPIRED = "expired"
-    SUPERSEDED = "superseded"
     CANCELLED = "cancelled"
 
 

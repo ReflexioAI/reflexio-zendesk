@@ -85,7 +85,13 @@ verify-client-dist:
 	@actual=$$(grep -E '^version = ' $(CLIENT_PYPROJECT) | head -1 | cut -d'"' -f2); \
 	  ls $(CLIENT_DIR)/dist/*-$$actual* >/dev/null 2>&1 \
 	    || { echo "error: $(CLIENT_DIR)/dist/ has no artifacts for version $$actual" >&2; exit 1; }; \
-	  echo "✓ $(CLIENT_DIR)/dist/ contains artifacts for version $$actual"
+	  wheel=$$(ls $(CLIENT_DIR)/dist/reflexio_client-$$actual-*.whl | head -1); \
+	  [ -n "$$wheel" ] \
+	    || { echo "error: $(CLIENT_DIR)/dist/ has no wheel artifact for version $$actual" >&2; exit 1; }; \
+	  uv run python -c 'import sys, zipfile; names=zipfile.ZipFile(sys.argv[1]).namelist(); has_client=any(n.startswith("reflexio/client/") for n in names); has_models=any(n.startswith("reflexio/models/") for n in names); has_server=any(n.startswith("reflexio/server/") for n in names); raise SystemExit("error: client wheel is missing reflexio/client" if not has_client else "error: client wheel is missing reflexio/models" if not has_models else "error: client wheel must not include reflexio/server" if has_server else 0)' "$$wheel"; \
+	  uv run --no-project --with "$$wheel" python -c "from reflexio import ReflexioClient" \
+	    || { echo "error: client wheel fails to import in isolation (likely a reflexio/models module importing reflexio/server)" >&2; exit 1; }; \
+	  echo "✓ $(CLIENT_DIR)/dist/ contains client-only artifacts for version $$actual"
 
 clean: ## Remove build artifacts
 	rm -rf dist/ build/ *.egg-info
@@ -144,11 +150,13 @@ client-publish: client-clean ## Build and publish reflexio-client to PyPI
 client-publish-dry: client-clean ## Build reflexio-client only; inspect dist/ without uploading
 	@echo "→ uv build $(CLIENT_DIR) (dry: inspect $(CLIENT_DIR)/dist/ manually)"
 	cd $(CLIENT_DIR) && uv build
+	@$(MAKE) verify-client-dist
 	@ls -la $(CLIENT_DIR)/dist/
 
 client-test-pypi: client-clean ## Build and publish reflexio-client to TestPyPI
 	@echo "→ uv build $(CLIENT_DIR)"
 	cd $(CLIENT_DIR) && uv build
+	@$(MAKE) verify-client-dist
 	@echo "→ uv publish --publish-url https://test.pypi.org/legacy/"
 	cd $(CLIENT_DIR) && uv publish --publish-url https://test.pypi.org/legacy/ dist/*
 
