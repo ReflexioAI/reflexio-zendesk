@@ -26,7 +26,10 @@ from ._base import SQLiteStorageBase, _json_dumps, _json_loads
 def _dt(value: str | None) -> datetime | None:
     if value is None:
         return None
-    return datetime.fromisoformat(value)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _dt_str(value: datetime | None) -> str | None:
@@ -42,7 +45,6 @@ def _row_to_agent_run(row: sqlite3.Row) -> AgentRunRecord:
     binding = AgentBinding(
         org_id=data["org_id"],
         extractor_kind=data["extractor_kind"],
-        extractor_name=data["extractor_name"],
         user_id=data.get("user_id"),
         request_id=data["request_id"],
         agent_version=data.get("agent_version"),
@@ -270,7 +272,7 @@ class SQLiteAgentRunMixin:
             self.conn.execute(
                 """
                 INSERT INTO _agent_runs (
-                    id, org_id, extractor_kind, extractor_name, user_id,
+                    id, org_id, extractor_kind, user_id,
                     request_id, agent_version, source, source_interaction_ids,
                     window_start_interaction_id, window_end_interaction_id,
                     extractor_config_hash, status, generation_request_snapshot,
@@ -279,13 +281,12 @@ class SQLiteAgentRunMixin:
                     resume_attempts, finalization_attempts, next_resume_at,
                     claimed_by, claimed_at, agent_completed_at, finalized_at,
                     expires_at, last_error
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.id,
                     binding.org_id,
                     binding.extractor_kind,
-                    binding.extractor_name,
                     binding.user_id,
                     binding.request_id,
                     binding.agent_version,
@@ -335,6 +336,7 @@ class SQLiteAgentRunMixin:
         next_resume_at: datetime | None = None,
         last_error: str | None = None,
         increment_finalization_attempts: bool = False,
+        expected_statuses: tuple[AgentRunStatus, ...] | None = None,
     ) -> AgentRunRecord | None:
         current_timestamp = self._current_timestamp()
         assignments = ["status = ?", "updated_at = ?"]
@@ -363,13 +365,57 @@ class SQLiteAgentRunMixin:
             assignments.append("finalized_at = ?")
             params.append(current_timestamp)
         params.append(run_id)
+        status_filter = ""
+        if expected_statuses:
+            placeholders = ",".join("?" for _ in expected_statuses)
+            status_filter = f" AND status IN ({placeholders})"
+            params.extend(expected.value for expected in expected_statuses)
         with self._lock:
             self.conn.execute(
-                f"UPDATE _agent_runs SET {', '.join(assignments)} WHERE id = ?",
+                f"UPDATE _agent_runs SET {', '.join(assignments)} WHERE id = ?{status_filter}",
                 params,
             )
             self.conn.commit()
         return self.get_agent_run(run_id)
+
+    @SQLiteStorageBase.handle_exceptions
+    def fail_running_agent_runs_for_request(
+        self,
+        *,
+        org_id: str,
+        extractor_kind: str,
+        user_id: str | None,
+        request_id: str,
+        last_error: str,
+    ) -> int:
+        current_timestamp = self._current_timestamp()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE _agent_runs
+                SET status = ?,
+                    updated_at = ?,
+                    last_error = ?
+                WHERE org_id = ?
+                  AND extractor_kind = ?
+                  AND user_id IS ?
+                  AND request_id = ?
+                  AND status IN (?, ?)
+                """,
+                (
+                    AgentRunStatus.FAILED.value,
+                    current_timestamp,
+                    last_error,
+                    org_id,
+                    extractor_kind,
+                    user_id,
+                    request_id,
+                    AgentRunStatus.RUNNING.value,
+                    AgentRunStatus.RESUMING.value,
+                ),
+            )
+            self.conn.commit()
+            return cursor.rowcount
 
     @SQLiteStorageBase.handle_exceptions
     def create_pending_tool_call(
@@ -787,7 +833,6 @@ class SQLiteAgentRunMixin:
         *,
         org_id: str,
         extractor_kind: str,
-        extractor_name: str,
         tool_name: str,
     ) -> int:
         row = self._fetchone(
@@ -798,7 +843,6 @@ class SQLiteAgentRunMixin:
             JOIN _pending_tool_calls p ON p.id = d.pending_tool_call_id
             WHERE r.org_id = ?
               AND r.extractor_kind = ?
-              AND r.extractor_name = ?
               AND p.tool_name = ?
               AND p.status = ?
               AND d.resolved_at IS NULL
@@ -807,7 +851,6 @@ class SQLiteAgentRunMixin:
             (
                 org_id,
                 extractor_kind,
-                extractor_name,
                 tool_name,
                 PendingToolCallStatus.PENDING.value,
             ),
@@ -1077,7 +1120,6 @@ class SQLiteAgentRunMixin:
                 ORDER BY
                     r.org_id ASC,
                     r.extractor_kind ASC,
-                    r.extractor_name ASC,
                     COALESCE(r.user_id, '') ASC,
                     COALESCE(r.window_start_interaction_id, 0) ASC,
                     r.updated_at ASC
@@ -1149,7 +1191,6 @@ class SQLiteAgentRunMixin:
                 ORDER BY
                     org_id ASC,
                     extractor_kind ASC,
-                    extractor_name ASC,
                     COALESCE(user_id, '') ASC,
                     COALESCE(window_start_interaction_id, 0) ASC,
                     updated_at ASC

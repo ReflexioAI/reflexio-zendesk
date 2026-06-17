@@ -1,4 +1,6 @@
 import json
+import logging
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -6,6 +8,7 @@ from pydantic import BaseModel
 
 from reflexio.server.llm.litellm_client import (
     LiteLLMClient,
+    LiteLLMClientError,
     LiteLLMConfig,
     ToolCallingChatResponse,
 )
@@ -271,6 +274,65 @@ def test_run_tool_loop_records_async_accepted_and_continues(
     assert "ptc_1" in tool_messages[0]["content"]
 
 
+def test_run_tool_loop_sends_plain_dict_tool_calls_in_followup_request(monkeypatch):
+    """Provider tool-call objects should not be reused in the next request."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+
+    emit_call = MagicMock()
+    emit_call.id = "call_emit"
+    emit_call.type = "function"
+    emit_call.function = MagicMock()
+    emit_call.function.name = "emit"
+    emit_call.function.arguments = json.dumps({"value": "hello"})
+
+    finish_call = MagicMock()
+    finish_call.id = "call_finish"
+    finish_call.type = "function"
+    finish_call.function = MagicMock()
+    finish_call.function.name = "finish"
+    finish_call.function.arguments = "{}"
+
+    calls: list[list[dict]] = []
+
+    def fake_generate_chat_response(**kwargs):
+        calls.append(deepcopy(kwargs["messages"]))
+        tool_calls = [emit_call] if len(calls) == 1 else [finish_call]
+        return ToolCallingChatResponse(
+            content=None,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls",
+        )
+
+    config = LiteLLMConfig(model="claude-sonnet-4-6")
+    client = LiteLLMClient(config)
+    monkeypatch.setattr(client, "generate_chat_response", fake_generate_chat_response)
+    ctx = LoopCtx()
+
+    result = run_tool_loop(
+        client=client,
+        messages=[{"role": "user", "content": "go"}],
+        registry=_make_registry(ctx),
+        model_role=ModelRole.EXTRACTION_AGENT,
+        ctx=ctx,
+    )
+
+    assert result.finished_reason == "finish_tool"
+    assistant_history = calls[1][-2]
+    assert assistant_history["role"] == "assistant"
+    assert assistant_history["tool_calls"] == [
+        {
+            "id": "call_emit",
+            "type": "function",
+            "function": {
+                "name": "emit",
+                "arguments": json.dumps({"value": "hello"}),
+            },
+        }
+    ]
+    assert assistant_history["tool_calls"][0] is not emit_call
+
+
 def test_run_tool_loop_honours_max_steps(monkeypatch, tool_call_completion):
     """With max_steps=3 and unlimited emit responses, the loop caps at 3 turns."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
@@ -372,6 +434,50 @@ def test_run_tool_loop_returns_error_on_client_exception(
     assert result.finished_reason == "error"
     assert result.trace.finished is False
     assert result.trace.turns == []
+
+
+def test_run_tool_loop_logs_llm_client_error_as_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """LiteLLMClientError (timeouts, provider errors after retries) is a known
+    failure mode: finished_reason='error' but logged at WARNING, not ERROR."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+
+    ctx = LoopCtx()
+
+    def _emit_handler(args: BaseModel, c: LoopCtx) -> dict:
+        c.emitted.append(args.value)  # type: ignore[attr-defined]
+        return {"ok": True}
+
+    reg = ToolRegistry([Tool(name="emit", args_model=EmitArgs, handler=_emit_handler)])
+
+    client = LiteLLMClient(LiteLLMConfig(model="claude-sonnet-4-6"))
+
+    def boom(**_kwargs):
+        raise LiteLLMClientError("API call failed: hard timeout")
+
+    monkeypatch.setattr(client, "generate_chat_response", boom)
+
+    with caplog.at_level(logging.WARNING, logger="reflexio.server.llm.tools"):
+        result = run_tool_loop(
+            client=client,
+            messages=[{"role": "user", "content": "go"}],
+            registry=reg,
+            model_role=ModelRole.EXTRACTION_AGENT,
+            max_steps=5,
+            ctx=ctx,
+            finish_tool_name="finish",
+        )
+
+    assert result.finished_reason == "error"
+    assert result.trace.finished is False
+    tool_loop_records = [
+        r for r in caplog.records if r.name == "reflexio.server.llm.tools"
+    ]
+    assert any("tool_loop_llm_error" in r.getMessage() for r in tool_loop_records)
+    assert all(r.levelno < logging.ERROR for r in tool_loop_records)
 
 
 # ---------------- log_label (llm_io.log) integration ---------------- #
@@ -612,7 +718,7 @@ class TestSupportsToolCallingOverrides:
             "litellm.supports_function_calling",
             lambda model: True,  # noqa: ARG005
         )
-        assert tools_mod.supports_tool_calling("openai/gpt-5-mini") is True
+        assert tools_mod.supports_tool_calling("openai/gpt-5.4-mini") is True
 
     def test_litellm_false_unknown_model_returns_false(self, monkeypatch):
         """litellm says False for a model not in the override list — return False."""
@@ -640,6 +746,8 @@ class TestSupportsToolCallingOverrides:
         # Family override applies to all M2.x variants
         assert tools_mod.supports_tool_calling("minimax/MiniMax-M2") is True
         assert tools_mod.supports_tool_calling("minimax/MiniMax-M2-special") is True
+        # M3 has its own override entry (same registry gap as the M2 family)
+        assert tools_mod.supports_tool_calling("minimax/MiniMax-M3") is True
 
     def test_override_does_not_apply_to_other_minimax_models(self, monkeypatch):
         """The override is prefix-scoped: 'minimax/MiniMax-M2' applies to M2 family

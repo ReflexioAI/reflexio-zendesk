@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import random
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -22,6 +21,7 @@ from reflexio.server.services.agent_success_evaluation.agent_success_evaluation_
 from reflexio.server.services.agent_success_evaluation.agent_success_evaluation_utils import (
     construct_agent_success_evaluation_messages_from_sessions,
 )
+from reflexio.server.services.extractor_config_utils import get_extractor_name
 from reflexio.server.services.extractor_interaction_utils import (
     filter_interactions_by_source,
     get_effective_source_filter,
@@ -103,7 +103,7 @@ class AgentSuccessEvaluator:
 
         Treats all request_interaction_data_models as a single conversation.
         Applies source filtering based on extractor config.
-        Applies sampling rate once per group.
+        Sampling is handled by callers before invoking the evaluator.
 
         Returns:
             List of AgentSuccessEvaluationResult objects (single result for the group)
@@ -128,19 +128,6 @@ class AgentSuccessEvaluator:
         if not request_interaction_data_models:
             # No matching interactions after source filter
             return []
-
-        # Check sampling rate once per group
-        if self.config.sampling_rate < 1.0:
-            random_value = random.random()  # noqa: S311
-            if random_value >= self.config.sampling_rate:
-                logger.info(
-                    "Skipping evaluation for session %s due to sampling rate. "
-                    "sampling_rate=%s, random_value=%.3f",
-                    self.service_config.session_id,
-                    self.config.sampling_rate,
-                    random_value,
-                )
-                return []
 
         result = self._evaluate_group(request_interaction_data_models)
         return [result] if result else []
@@ -222,7 +209,7 @@ class AgentSuccessEvaluator:
             "event=agent_success_eval_llm_start session_id=%s evaluation_name=%s "
             "requests=%d interactions=%d model=%s",
             self.service_config.session_id,
-            self.config.evaluation_name,
+            get_extractor_name(self.config),
             session_request_count,
             interaction_count,
             self.default_evaluate_model_name,
@@ -289,7 +276,7 @@ class AgentSuccessEvaluator:
         return AgentSuccessEvaluationResult(
             session_id=self.service_config.session_id,
             agent_version=self.service_config.agent_version,
-            evaluation_name=self.config.evaluation_name,
+            evaluation_name=get_extractor_name(self.config),
             is_success=evaluation_response.is_success,
             failure_type=evaluation_response.failure_type or "",
             failure_reason=evaluation_response.failure_reason or "",

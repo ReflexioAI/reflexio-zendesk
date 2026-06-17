@@ -20,6 +20,7 @@ from reflexio.models.api_schema.internal_schema import RequestInteractionDataMod
 from reflexio.models.api_schema.service_schemas import Status
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient
+from reflexio.server.llm.token_accounting import RunTokenTotals
 from reflexio.server.services.extraction.outcome import ExtractionOutcome
 from reflexio.server.services.extractor_config_utils import (
     filter_extractor_configs,
@@ -165,6 +166,10 @@ class BaseGenerationService(
     ABC,
     Generic[TExtractorConfig, TExtractor, TGenerationServiceConfig, TRequest],  # noqa: UP046
 ):
+    # Only profile/playbook GENERATION services bill the ② Learning line;
+    # reflection/consolidation/aggregation/evaluation are bundled, not metered.
+    # Default is False so any future subclass is safe by default (opt-IN).
+    EMITS_LEARNING_BILLING: bool = False
     """
     Base class for generation services that run one configured extractor.
 
@@ -209,6 +214,11 @@ class BaseGenerationService(
             "timed_out": 0,
         }
         self._last_extraction_run_ids: list[str] = []
+        self._last_token_totals: RunTokenTotals | None = None
+        # Window fetched by the should-run gate (_collect_scoped_interactions_for_precheck),
+        # stashed so the billing path (_extraction_input_text) can reuse it instead of
+        # re-querying storage. None when the gate did not run (bypass paths).
+        self._last_precheck_sessions: list[Any] | None = None
 
     def _usage_pipeline(self) -> str | None:
         service_name = self._get_service_name()
@@ -251,6 +261,139 @@ class BaseGenerationService(
             error_kind=error_kind,
             metadata=metadata,
         )
+
+    def _extraction_input_text(self, prepared: "PreparedGenerationRun[Any]") -> str:
+        """Return the interaction content fed to the extractor as a single string.
+
+        Replays the same storage query the extractor uses (same user_id, source,
+        window params) so ``count_input_tokens`` sees the same text the LLM saw.
+        Returns an empty string when storage is unavailable or no interactions exist.
+
+        Args:
+            prepared: The prepared generation run, used to access extractor_config
+                for window/source parameters.
+
+        Returns:
+            str: Formatted interaction history string, or "" if nothing is found.
+        """
+        from reflexio.server.services.service_utils import (
+            format_sessions_to_history_string,
+        )
+
+        if self.storage is None or self.service_config is None:
+            return ""
+        # Reuse the window the should-run gate already fetched
+        # (_collect_scoped_interactions_for_precheck stashed it). Same query params,
+        # so the token count is byte-identical — and we avoid a second storage read.
+        if self._last_precheck_sessions is not None:
+            return format_sessions_to_history_string(self._last_precheck_sessions)
+        # Fallback storage read: used ONLY when the gate did not pre-fetch
+        # (bypass paths: auto_run=False, force_extraction, skip_should_run_check,
+        # mock mode). Re-fetches the extractor's input window so billing token
+        # counting sees exactly the text the LLM saw.
+        try:
+            root_config = self.request_context.configurator.get_config()
+            global_window_size = (
+                getattr(root_config, "window_size", None) if root_config else None
+            )
+            global_stride_size = (
+                getattr(root_config, "stride_size", None) if root_config else None
+            )
+            window_size, _ = get_extractor_window_params(
+                prepared.extractor_config, global_window_size, global_stride_size
+            )
+            should_skip, effective_source = get_effective_source_filter(
+                prepared.extractor_config, getattr(self.service_config, "source", None)
+            )
+            if should_skip:
+                return ""
+            session_data_models, _ = self.storage.get_last_k_interactions_grouped(
+                user_id=getattr(self.service_config, "user_id", None),
+                k=window_size,
+                sources=effective_source,
+                start_time=getattr(self.service_config, "rerun_start_time", None),
+                end_time=getattr(self.service_config, "rerun_end_time", None),
+                **self._get_precheck_interaction_query_kwargs(),
+            )
+            return format_sessions_to_history_string(session_data_models)
+        except Exception:
+            logger.warning(
+                "_extraction_input_text failed; billing_input_tokens will be 0",
+                exc_info=True,
+            )
+            return ""
+
+    def _record_billing_learning_events(
+        self, *, prepared: "PreparedGenerationRun[Any]", generated_count: int
+    ) -> None:
+        """Emit the ② Learning billing events. Called ONLY when extraction fired.
+
+        Emits ``learnings_generated`` (value facet) and ``extraction_tokens``
+        (cost facet) via the OSS emission helpers. ``platform_storage`` is left
+        ``None`` here and resolved enterprise-side at rollup (Phase 1).
+
+        Gated by ``EMITS_LEARNING_BILLING`` — only profile/playbook generation
+        services opt in. Evaluation, reflection, consolidation and aggregation
+        are bundled and must NOT separately meter the ② Learning line.
+
+        Args:
+            prepared: The prepared generation run (used for input-text computation).
+            generated_count: Number of learnings produced by this extraction run.
+        """
+        if not self.EMITS_LEARNING_BILLING:
+            return
+
+        try:
+            from reflexio.server.billing_meter import (
+                record_extraction_tokens,
+                record_learnings_generated,
+            )
+            from reflexio.server.billing_signals import (
+                count_input_tokens,
+                platform_llm_from_config,
+            )
+
+            config = self.request_context.configurator.get_config()
+            platform_llm = platform_llm_from_config(config)
+            ctx = self._usage_context()
+
+            # session_id is intentionally not passed: the generation path has no
+            # session_id source. _usage_context() never includes it, and neither
+            # the Profile/Playbook service configs nor their requests carry a
+            # session_id (unlike the Application-line path in server/api.py, which
+            # reads request_id/session_id off the search request payload). Learning
+            # events therefore meter without session attribution by design.
+
+            # ② Learning — value: learnings generated (helper no-ops on count <= 0).
+            record_learnings_generated(
+                org_id=ctx["org_id"],
+                count=generated_count,
+                platform_llm=platform_llm,
+                platform_storage=None,
+                pipeline=ctx.get("pipeline"),
+                request_id=ctx.get("request_id"),
+            )
+
+            # ② Learning — cost: input-anchored extraction tokens + real provider tokens.
+            totals = self._last_token_totals or RunTokenTotals()
+            billing_input_tokens = count_input_tokens(
+                self._extraction_input_text(prepared)
+            )
+            record_extraction_tokens(
+                org_id=ctx["org_id"],
+                billing_input_tokens=billing_input_tokens,
+                prompt_tokens=totals.prompt_tokens,
+                completion_tokens=totals.completion_tokens,
+                platform_llm=platform_llm,
+                platform_storage=None,
+                pipeline=ctx.get("pipeline"),
+                request_id=ctx.get("request_id"),
+            )
+        except Exception:
+            logger.warning(
+                "_record_billing_learning_events failed; billing learning events not emitted",
+                exc_info=True,
+            )
 
     @staticmethod
     def _count_generated_results(result: Any) -> int:
@@ -369,14 +512,12 @@ class BaseGenerationService(
         service_config: TGenerationServiceConfig,
     ) -> TExtractorConfig | None:
         """
-        Filter the extractor config based on request_sources_enabled, manual_trigger,
-        and explicit extractor name filters.
+        Filter the extractor config based on request_sources_enabled and manual_trigger.
         """
         filtered = filter_extractor_configs(
             extractor_configs=[extractor_config],
             source=getattr(service_config, "source", None),
             allow_manual_trigger=getattr(service_config, "allow_manual_trigger", False),
-            extractor_names=getattr(service_config, "extractor_names", None),
         )
         return filtered[0] if filtered else None
 
@@ -494,7 +635,7 @@ class BaseGenerationService(
         reproduce the original publish (user_id, request_id, agent_version,
         source, force_extraction, etc.). Without this, the rerun runs with the
         wrong holder's request and the queued user's interactions are silently
-        skipped (R2 / reflexio-enterprise#59).
+        skipped (R2).
 
         Returns ``None`` to opt out — the queue then stores only the
         request_id and the rerun falls back to the original holder's request,
@@ -582,7 +723,7 @@ class BaseGenerationService(
 
         # Try to acquire lock — pass the serialized payload so blocked
         # publishes land in the queue with their own data attached. This is
-        # the fix for R2 / reflexio-enterprise#59: without the payload, the
+        # the fix for R2: without the payload, the
         # rerun re-uses the holder's request and the queued users' batches
         # never get extracted.
         my_payload = self._serialize_request_for_queue(request)
@@ -677,6 +818,7 @@ class BaseGenerationService(
                 },
             )
             self._last_extraction_run_ids = []
+            self._last_token_totals = None
             result = self._execute_extractor(
                 prepared.extractor_config, prepared.identifier
             )
@@ -705,6 +847,9 @@ class BaseGenerationService(
                         self._last_extractor_run_stats.get("timed_out")
                     ),
                 },
+            )
+            self._record_billing_learning_events(
+                prepared=prepared, generated_count=generated_count
             )
 
         except Exception as e:
@@ -739,6 +884,13 @@ class BaseGenerationService(
         Returns:
             PreparedGenerationRun when generation should proceed, otherwise None.
         """
+        # Reset BEFORE the should-run gate runs. The gate
+        # (_collect_scoped_interactions_for_precheck) stashes its fetched window
+        # here for the billing path to reuse. On bypass paths (auto_run=False,
+        # force_extraction, skip_should_run_check, mock mode) the gate never runs,
+        # so this stays None and billing falls back to its own fetch.
+        self._last_precheck_sessions = None
+
         self.service_config = self._load_generation_service_config(request)
 
         extractor_config = self._load_extractor_config()
@@ -836,6 +988,7 @@ class BaseGenerationService(
             if isinstance(result, ExtractionOutcome):
                 if result.run_id:
                     self._last_extraction_run_ids.append(result.run_id)
+                self._last_token_totals = result.token_totals
                 if result.status == "completed" and result.items:
                     return result.items
                 logger.info(
@@ -859,6 +1012,10 @@ class BaseGenerationService(
                 f"for {self._get_service_name()} identifier={identifier}"
             )
             logger.error(error_msg)
+            self._fail_active_extraction_runs(
+                extractor_kind=get_extractor_name(extractor_config),
+                last_error=error_msg,
+            )
             raise ExtractorExecutionError(error_msg) from exc
         except Exception as exc:
             self._last_extractor_run_stats = {"total": 1, "failed": 1, "timed_out": 0}
@@ -871,6 +1028,44 @@ class BaseGenerationService(
         finally:
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
+
+    def _fail_active_extraction_runs(
+        self,
+        *,
+        extractor_kind: str,
+        last_error: str,
+    ) -> None:
+        """Mark active agent-run rows failed when the service timeout fires."""
+        if self.storage is None or self.service_config is None:
+            return
+        request_id = getattr(self.service_config, "request_id", None)
+        if not request_id:
+            return
+        user_id = getattr(self.service_config, "user_id", None)
+        try:
+            failed_count = self.storage.fail_running_agent_runs_for_request(
+                org_id=self.request_context.org_id,
+                extractor_kind=extractor_kind,
+                user_id=user_id,
+                request_id=request_id,
+                last_error=last_error,
+            )
+        except NotImplementedError:
+            return
+        except Exception as exc:  # noqa: BLE001 - keep timeout error primary
+            logger.warning(
+                "Failed to mark timed-out %s agent runs failed: %s",
+                extractor_kind,
+                exc,
+            )
+            return
+        if failed_count:
+            logger.warning(
+                "Marked %d timed-out %s agent run(s) failed for request_id=%s",
+                failed_count,
+                extractor_kind,
+                request_id,
+            )
 
     def _finalize_extraction_runs(self) -> None:
         if self.storage is None:
@@ -1088,6 +1283,8 @@ class BaseGenerationService(
             extractor_config, getattr(self.service_config, "source", None)
         )
         if should_skip:
+            # Stash for the billing path to reuse (same window the gate saw).
+            self._last_precheck_sessions = []
             return [], extractor_config
 
         window_size, _ = get_extractor_window_params(
@@ -1102,6 +1299,9 @@ class BaseGenerationService(
             **extra_kwargs,
         )
 
+        # Stash for the billing path (_extraction_input_text) to reuse instead of
+        # re-querying storage for billing_input_tokens.
+        self._last_precheck_sessions = session_data_models
         return session_data_models, extractor_config
 
     def _get_precheck_interaction_query_kwargs(self) -> dict:

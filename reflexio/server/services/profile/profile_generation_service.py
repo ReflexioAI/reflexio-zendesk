@@ -38,6 +38,7 @@ from reflexio.server.services.profile.profile_generation_service_utils import (
 from reflexio.server.services.service_utils import (
     format_sessions_to_history_string,
 )
+from reflexio.server.tracing import sentry_tags
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,6 @@ class ProfileGenerationServiceConfig:
         existing_data: Existing profiles for the user
         allow_manual_trigger: Whether to allow extractors with manual_trigger=True
         output_pending_status: Whether to output profiles with PENDING status
-        extractor_names: Optional list of extractor names to filter which extractor runs
         rerun_start_time: Optional start time filter for rerun flows (Unix timestamp)
         rerun_end_time: Optional end time filter for rerun flows (Unix timestamp)
         auto_run: True for regular flow (checks stride_size), False for rerun/manual (skips stride_size)
@@ -65,7 +65,6 @@ class ProfileGenerationServiceConfig:
     existing_data: Any = None
     allow_manual_trigger: bool = False
     output_pending_status: bool = False
-    extractor_names: list[str] | None = None
     rerun_start_time: int | None = None
     rerun_end_time: int | None = None
     auto_run: bool = True
@@ -81,6 +80,9 @@ class ProfileGenerationService(
     ]
 ):
     """Service to generate user profiles from interactions"""
+
+    # Profile generation produces learnings — opt in to ② Learning billing.
+    EMITS_LEARNING_BILLING: bool = True
 
     def __init__(
         self,
@@ -131,7 +133,6 @@ class ProfileGenerationService(
             existing_data=existing_profiles,
             allow_manual_trigger=self.allow_manual_trigger,
             output_pending_status=self.output_pending_status,
-            extractor_names=getattr(request, "extractor_names", None),
             rerun_start_time=request.rerun_start_time,
             rerun_end_time=request.rerun_end_time,
             auto_run=request.auto_run,
@@ -191,12 +192,18 @@ class ProfileGenerationService(
             try:
                 self.storage.add_user_profile(user_id, all_new_profiles)  # type: ignore[reportOptionalMemberAccess]
             except Exception as e:
-                logger.error(
-                    "Failed to save profiles for user id: %s due to %s, exception type: %s",
-                    user_id,
-                    str(e),
-                    type(e).__name__,
-                )
+                with sentry_tags(
+                    subsystem="profile_generation",
+                    op="save_profiles",
+                    org_id=self.org_id,
+                    user_id=user_id,
+                    request_id=request_id,
+                    error_type=type(e).__name__,
+                ):
+                    logger.exception(
+                        "Failed to save profiles for user id: %s",
+                        user_id,
+                    )
                 return
 
         # Delete superseded existing profiles
@@ -210,12 +217,20 @@ class ProfileGenerationService(
                         )
                     )
                 except Exception as e:  # noqa: PERF203
-                    logger.error(
-                        "Failed to delete superseded profile %s for user %s: %s",
-                        profile_id,
-                        user_id,
-                        str(e),
-                    )
+                    with sentry_tags(
+                        subsystem="profile_generation",
+                        op="delete_superseded_profile",
+                        org_id=self.org_id,
+                        user_id=user_id,
+                        request_id=request_id,
+                        profile_id=profile_id,
+                        error_type=type(e).__name__,
+                    ):
+                        logger.exception(
+                            "Failed to delete superseded profile %s for user %s",
+                            profile_id,
+                            user_id,
+                        )
 
         # Create profile changelog post-deduplication
         if all_new_profiles or superseded_profiles:
@@ -231,11 +246,18 @@ class ProfileGenerationService(
                 )
                 self.storage.add_profile_change_log(profile_change_log)  # type: ignore[reportOptionalMemberAccess]
             except Exception as e:
-                logger.error(
-                    "Failed to add profile change log for user %s: %s",
-                    user_id,
-                    str(e),
-                )
+                with sentry_tags(
+                    subsystem="profile_generation",
+                    op="add_profile_change_log",
+                    org_id=self.org_id,
+                    user_id=user_id,
+                    request_id=request_id,
+                    error_type=type(e).__name__,
+                ):
+                    logger.exception(
+                        "Failed to add profile change log for user %s",
+                        user_id,
+                    )
 
     def check_and_update_profiles(self, profiles: list[UserProfile]) -> None:
         """check if the profiles are expired and update them if they are"""
@@ -415,7 +437,6 @@ class ProfileGenerationService(
             ),
             "end_time": request.end_time.isoformat() if request.end_time else None,
             "source": request.source,
-            "extractor_names": request.extractor_names,
         }
 
     def _create_run_request_for_item(
@@ -440,7 +461,6 @@ class ProfileGenerationService(
                 user_id=user_id,
                 request_id=f"rerun_{uuid.uuid4().hex[:8]}",
                 source=request.source,
-                extractor_names=request.extractor_names,
                 rerun_start_time=(
                     int(request.start_time.timestamp()) if request.start_time else None
                 ),
@@ -454,7 +474,6 @@ class ProfileGenerationService(
             user_id=user_id,
             request_id=f"manual_{uuid.uuid4().hex[:8]}",
             source=request.source,
-            extractor_names=request.extractor_names,
             auto_run=False,
         )
 
@@ -676,7 +695,6 @@ class ProfileGenerationService(
             request_params = {
                 "user_id": request.user_id,
                 "source": request.source,
-                "extractor_names": request.extractor_names,
                 "mode": "manual_regular",
             }
             users_processed, _ = self._run_batch_with_progress(

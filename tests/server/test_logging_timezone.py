@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 import re
 
-from reflexio.server import _LLMIOFormatter, _TZAwareFormatter
+from reflexio.server import (
+    _debug_log_to_console_enabled,
+    _LLMIOFormatter,
+    _TZAwareFormatter,
+)
 
 _TZ_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}(?: [A-Z]{1,5})?"
@@ -48,3 +52,51 @@ class TestLLMIOFormatter:
         record = _make_record("full message payload")
         out = formatter.format(record)
         assert _TZ_PATTERN.search(out), f"header missing TZ offset: {out!r}"
+
+
+class TestConsoleDebugPolicy:
+    def test_debug_console_enabled_in_development(self, monkeypatch) -> None:
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("SENTRY_ENVIRONMENT", "acme-dev")
+        monkeypatch.setenv("DEBUG_LOG_TO_CONSOLE", "true")
+        monkeypatch.delenv("REFLEXIO_ALLOW_PRODUCTION_DEBUG_LOGS", raising=False)
+
+        assert _debug_log_to_console_enabled() is True
+
+    def test_debug_console_disabled_in_production_by_default(self, monkeypatch) -> None:
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("SENTRY_ENVIRONMENT", "acme-corp")
+        monkeypatch.setenv("DEBUG_LOG_TO_CONSOLE", "true")
+        monkeypatch.delenv("REFLEXIO_ALLOW_PRODUCTION_DEBUG_LOGS", raising=False)
+
+        assert _debug_log_to_console_enabled() is False
+
+    def test_debug_console_allows_explicit_production_override(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("SENTRY_ENVIRONMENT", "acme-corp")
+        monkeypatch.setenv("DEBUG_LOG_TO_CONSOLE", "true")
+        monkeypatch.setenv("REFLEXIO_ALLOW_PRODUCTION_DEBUG_LOGS", "true")
+
+        assert _debug_log_to_console_enabled() is True
+
+    def test_debug_console_rejects_ambiguous_production_override(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("SENTRY_ENVIRONMENT", "acme-corp")
+        monkeypatch.setenv("DEBUG_LOG_TO_CONSOLE", "true")
+        monkeypatch.setenv("REFLEXIO_ALLOW_PRODUCTION_DEBUG_LOGS", "foo")
+
+        assert _debug_log_to_console_enabled() is False
+
+    def test_sentry_environment_does_not_define_production(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        monkeypatch.setenv("SENTRY_ENVIRONMENT", "production")
+        monkeypatch.setenv("DEBUG_LOG_TO_CONSOLE", "true")
+        monkeypatch.delenv("REFLEXIO_ALLOW_PRODUCTION_DEBUG_LOGS", raising=False)
+
+        assert _debug_log_to_console_enabled() is True

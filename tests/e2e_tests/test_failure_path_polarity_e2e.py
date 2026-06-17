@@ -153,7 +153,6 @@ def _seed_failure_window_negative_playbook(storage, user_id: str) -> UserPlayboo
         content="Avoid suggesting product X — the user said no twice.",
         trigger="user has previously declined product X",
         rationale="User pushed back: 'Stop suggesting X, I told you no twice.'",
-        polarity="negative",
         source="api",
     )
     storage.save_user_playbooks([pb])
@@ -179,6 +178,7 @@ def _seed_citation_window(storage, user_id: str, playbook_id: int) -> None:
         Request(
             request_id=request_id,
             user_id=user_id,
+            session_id="test_session",
             source="api",
             agent_version="v1",
         )
@@ -242,8 +242,9 @@ def test_failure_path_produces_negative_rule_reflection_keeps_it(
     # negative playbook. We persist it directly; the extractor-side
     # polarity threading is covered by D6/C3 integration tests.
     seeded = _seed_failure_window_negative_playbook(storage, user_id)
-    assert seeded.polarity == "negative", (
-        f"Setup failure — seeded playbook must be negative; got {seeded.polarity!r}"
+    assert seeded.content.lstrip().startswith("Avoid"), (
+        "Setup failure — seeded playbook must use avoidance wording; got "
+        f"{seeded.content!r}"
     )
 
     # Phase 2 — seed a citation window so reflection has something to consider.
@@ -277,15 +278,14 @@ def test_failure_path_produces_negative_rule_reflection_keeps_it(
         f"The cited playbook should have been considered; result={result}"
     )
 
-    # No revision applied — and crucially, no flip.
+    # No revision applied — and crucially, no flip. Flips are now LLM-reported
+    # and counted as ordinary revisions, so revised_count == 0 is the
+    # load-bearing invariant that no flip (or any other revision) occurred.
     assert result.no_change_count == 1, (
         f"Reflection should have recorded one no_change; result={result}"
     )
     assert result.revised_count == 0, (
-        f"Reflection must not revise on no_change; result={result}"
-    )
-    assert result.flipped_count == 0, (
-        "Reflection must not flip polarity on no_change — this is the "
+        "Reflection must not revise (or flip) on no_change — this is the "
         f"load-bearing invariant; result={result}"
     )
     assert result.failed_count == 0, (
@@ -302,9 +302,9 @@ def test_failure_path_produces_negative_rule_reflection_keeps_it(
     assert current[0].user_playbook_id == seeded.user_playbook_id, (
         "The same row must remain — reflection must not have replaced it"
     )
-    assert current[0].polarity == "negative", (
-        "Polarity must stay negative across extraction + reflection; "
-        f"got {current[0].polarity!r}"
+    assert current[0].content.lstrip().startswith("Avoid"), (
+        "Avoidance wording must survive extraction + reflection; "
+        f"got {current[0].content!r}"
     )
     assert current[0].content == seeded.content, (
         f"Content must be unchanged on a no_change decision; got {current[0].content!r}"

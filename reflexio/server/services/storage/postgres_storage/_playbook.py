@@ -1887,6 +1887,37 @@ class PlaybookMixin(SchemaScopedClient):
             "result_id", 0
         ).execute()
 
+    @handle_exceptions
+    def delete_agent_success_evaluation_results_for_session(
+        self,
+        session_id: str,
+        evaluation_name: str,
+        agent_version: str,
+    ) -> int:
+        response = (
+            self._table("agent_success_evaluation_result")
+            .delete()
+            .eq("session_id", session_id)
+            .eq("evaluation_name", evaluation_name)
+            .eq("agent_version", agent_version)
+            .execute()
+        )
+        return len(_rows(response))
+
+    @handle_exceptions
+    def delete_agent_success_evaluation_results_by_ids(
+        self, result_ids: list[int]
+    ) -> int:
+        if not result_ids:
+            return 0
+        response = (
+            self._table("agent_success_evaluation_result")
+            .delete()
+            .in_("result_id", result_ids)
+            .execute()
+        )
+        return len(_rows(response))
+
 
 def _order_by_ids(items: list[Any], ids: Sequence[Any], id_attr: str) -> list[Any]:
     by_id = {str(getattr(item, id_attr)): item for item in items}

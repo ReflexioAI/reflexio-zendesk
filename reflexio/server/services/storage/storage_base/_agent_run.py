@@ -11,6 +11,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from reflexio.models.api_schema.pending_tool_call_schema import PendingToolCallStatus
+
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -28,14 +30,6 @@ class AgentRunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
-class PendingToolCallStatus(StrEnum):
-    PENDING = "pending"
-    RESOLVED = "resolved"
-    EXPIRED = "expired"
-    SUPERSEDED = "superseded"
-    CANCELLED = "cancelled"
-
-
 NOT_APPLICABLE_ANSWER = "User does not have information about this question."
 
 
@@ -49,7 +43,6 @@ class AgentBinding:
 
     org_id: str
     extractor_kind: str
-    extractor_name: str
     user_id: str | None
     request_id: str
     agent_version: str | None
@@ -221,7 +214,19 @@ class AgentRunMixin:
         next_resume_at: datetime | None = None,
         last_error: str | None = None,
         increment_finalization_attempts: bool = False,
+        expected_statuses: tuple[AgentRunStatus, ...] | None = None,
     ) -> AgentRunRecord | None:
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def fail_running_agent_runs_for_request(
+        self,
+        *,
+        org_id: str,
+        extractor_kind: str,
+        user_id: str | None,
+        request_id: str,
+        last_error: str,
+    ) -> int:
         raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
 
     def create_pending_tool_call(
@@ -298,7 +303,6 @@ class AgentRunMixin:
         *,
         org_id: str,
         extractor_kind: str,
-        extractor_name: str,
         tool_name: str,
     ) -> int:
         raise NotImplementedError(f"{type(self).__name__} does not support agent runs")

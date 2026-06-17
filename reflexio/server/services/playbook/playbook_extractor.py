@@ -10,10 +10,12 @@ from reflexio.models.config_schema import PlaybookConfig
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient
 from reflexio.server.llm.model_defaults import ModelRole, resolve_model_name
+from reflexio.server.llm.token_accounting import RunTokenTotals, sum_trace_tokens
 from reflexio.server.services.extraction.outcome import ExtractionOutcome
 from reflexio.server.services.extraction.resumable_agent import (
     run_resumable_extraction_agent,
 )
+from reflexio.server.services.extractor_config_utils import get_extractor_name
 from reflexio.server.services.extractor_interaction_utils import (
     get_effective_source_filter,
     get_extractor_window_params,
@@ -27,7 +29,6 @@ from reflexio.server.services.playbook.playbook_service_utils import (
     ensure_playbook_content,
     has_expert_content,
 )
-from reflexio.server.services.polarity_utils import infer_playbook_polarity
 from reflexio.server.services.service_utils import (
     extract_interactions_from_request_interaction_data_models,
     log_llm_messages,
@@ -79,6 +80,7 @@ class PlaybookExtractor:
         self.service_config: PlaybookGenerationServiceConfig = service_config
         self.agent_context: str = agent_context
         self._last_resumable_run_id: str | None = None
+        self._last_resumable_token_totals: RunTokenTotals | None = None
 
         # Get LLM config overrides from configuration
         config = self.request_context.configurator.get_config()
@@ -184,7 +186,7 @@ class PlaybookExtractor:
         )
         mgr = self._create_state_manager()
         mgr.update_extractor_bookmark(
-            extractor_name=self.config.extractor_name,
+            extractor_name=get_extractor_name(self.config),
             processed_interactions=all_interactions,
             user_id=self.service_config.user_id,
         )
@@ -223,6 +225,7 @@ class PlaybookExtractor:
             return ExtractionOutcome.completed(
                 user_playbooks,
                 run_id=self._last_resumable_run_id,
+                token_totals=self._last_resumable_token_totals,
             )
         return user_playbooks
 
@@ -305,7 +308,6 @@ class PlaybookExtractor:
             request_context=self.request_context,
             client=self.client,
             extractor_kind="playbook",
-            extractor_name=self.config.extractor_name,
             user_id=self.service_config.user_id,
             request_id=self.service_config.request_id,
             agent_version=self.service_config.agent_version,
@@ -319,6 +321,7 @@ class PlaybookExtractor:
             log_label="Playbook extraction",
         )
         self._last_resumable_run_id = result.run_id
+        self._last_resumable_token_totals = sum_trace_tokens(result.trace)
         if not isinstance(result.output, StructuredPlaybookList):
             logger.warning(
                 "Playbook extraction did not finish: %s",
@@ -426,13 +429,12 @@ class PlaybookExtractor:
         playbook_content = ensure_playbook_content(entry.content, entry)
 
         return UserPlaybook(
-            playbook_name=self.config.extractor_name,
+            playbook_name=get_extractor_name(self.config),
             user_id=self.service_config.user_id,
             agent_version=self.service_config.agent_version,
             request_id=self.service_config.request_id,
             content=playbook_content,
             trigger=entry.trigger,
             rationale=entry.rationale,
-            polarity=infer_playbook_polarity(playbook_content, entry.rationale),
             source_interaction_ids=source_interaction_ids,
         )

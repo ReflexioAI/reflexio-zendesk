@@ -14,7 +14,7 @@ import math
 import re
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -53,7 +53,10 @@ from reflexio.server.llm.model_defaults import (
 from reflexio.server.llm.providers.embedding_service_provider import (
     EmbeddingUnavailableError,
 )
-from reflexio.server.services.storage.error import StorageError
+from reflexio.server.services.storage.error import (
+    StorageError,
+    require_non_empty_session_id,
+)
 from reflexio.server.services.storage.retention import RetentionTarget
 from reflexio.server.services.storage.retention_mixin import (
     RETENTION_DELETE_CHUNK,
@@ -182,10 +185,10 @@ def _effective_search_mode(
 
 
 def _vector_rank_rows(
-    rows: list[sqlite3.Row],
+    rows: Sequence[Any],
     query_embedding: list[float],
     match_count: int,
-) -> list[sqlite3.Row]:
+) -> list[Any]:
     """Rank rows by cosine similarity to the query embedding.
 
     Args:
@@ -196,7 +199,7 @@ def _vector_rank_rows(
     Returns:
         Top ``match_count`` rows sorted by cosine similarity descending.
     """
-    scored: list[tuple[sqlite3.Row, float]] = []
+    scored: list[tuple[Any, float]] = []
     for row in rows:
         raw_emb = row["embedding"] if "embedding" in row.keys() else None  # noqa: SIM118
         emb = _json_loads(raw_emb) if raw_emb else None
@@ -225,14 +228,14 @@ def _vector_rank_rows(
 
 
 def _true_rrf_merge(
-    fts_rows: list[sqlite3.Row],
-    vec_rows: list[sqlite3.Row],
+    fts_rows: Sequence[Any],
+    vec_rows: Sequence[Any],
     id_column: str,
     match_count: int,
     rrf_k: int = 60,
     vector_weight: float = 1.0,
     fts_weight: float = 1.0,
-) -> list[sqlite3.Row]:
+) -> list[Any]:
     """Merge independent FTS and vector result sets via Reciprocal Rank Fusion.
 
     Unlike ``_rrf_rerank`` (which re-ranks FTS results only), this function
@@ -255,7 +258,7 @@ def _true_rrf_merge(
         return []
 
     # Collect unique rows by ID (first-seen wins for the Row object)
-    row_by_id: dict[str | int, sqlite3.Row] = {}
+    row_by_id: dict[str | int, Any] = {}
     for row in (*fts_rows, *vec_rows):
         rid = row[id_column]
         if rid not in row_by_id:
@@ -271,7 +274,7 @@ def _true_rrf_merge(
     fts_penalty = len(fts_rows) + 1
     vec_penalty = len(vec_rows) + 1
 
-    scored: list[tuple[sqlite3.Row, float]] = []
+    scored: list[tuple[Any, float]] = []
     for rid, row in row_by_id.items():
         f_rank = fts_rank.get(rid, fts_penalty)
         v_rank = vec_rank.get(rid, vec_penalty)
@@ -340,7 +343,10 @@ def _iso_to_epoch(iso_str: str | None) -> int:
         return _epoch_now()
     try:
         cleaned = iso_str.replace("Z", "+00:00")
-        return int(datetime.fromisoformat(cleaned).timestamp())
+        parsed = datetime.fromisoformat(cleaned)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return int(parsed.timestamp())
     except (ValueError, TypeError):
         return _epoch_now()
 
@@ -409,24 +415,14 @@ def _row_to_interaction(row: sqlite3.Row) -> Interaction:
 
 def _row_to_request(row: sqlite3.Row) -> Request:
     d = dict(row)
-    metadata_raw = d.get("metadata") or "{}"
-    try:
-        parsed = _json_loads(metadata_raw)
-        metadata = parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        logger.warning(
-            "Malformed metadata JSON for request %s; defaulting to empty dict",
-            d.get("request_id"),
-        )
-        metadata = {}
     return Request(
         request_id=d["request_id"],
         user_id=d["user_id"],
         created_at=_iso_to_epoch(d["created_at"]),
         source=d.get("source") or "",
         agent_version=d.get("agent_version") or "",
-        session_id=d.get("session_id"),
-        metadata=metadata,
+        session_id=require_non_empty_session_id(d.get("session_id")),
+        evaluation_only=bool(d.get("evaluation_only", 0)),
     )
 
 
@@ -460,7 +456,6 @@ def _row_to_user_playbook(
         source_span=d.get("source_span"),
         notes=d.get("notes"),
         reader_angle=d.get("reader_angle"),
-        polarity=d.get("polarity") or "positive",
     )
 
 
@@ -666,7 +661,8 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         self._migrate_expanded_terms()
         self._migrate_agentic_signals()
         self._migrate_agent_playbook_source_windows()
-        self._migrate_request_metadata()
+        self._migrate_request_evaluation_only()
+        self._migrate_request_session_id_required()
         self._migrate_shadow_comparison_verdicts()
         self._migrate_user_playbook_polarity()
         init_stall_state_table(self.conn)
@@ -1161,10 +1157,12 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         self.conn.commit()
 
     def _migrate_user_playbook_polarity(self) -> None:
-        """Add the ``polarity`` column to ``user_playbooks`` if missing.
+        """Drop the legacy ``polarity`` column from ``user_playbooks`` if present.
 
-        Backfill-safe: existing rows default to ``'positive'``. Required for
-        databases created before per-rule polarity was introduced.
+        Polarity is retired under Option B (orientation lives in rule wording and
+        is LLM-judged, never a stored field). This mirrors the Supabase drop
+        migration and brings databases created while the column existed back in
+        line with the current schema, which no longer defines it.
         """
         cols = {
             row["name"]
@@ -1172,12 +1170,9 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         }
         if not cols:
             return
-        if "polarity" not in cols:
-            self.conn.execute(
-                "ALTER TABLE user_playbooks "
-                "ADD COLUMN polarity TEXT NOT NULL DEFAULT 'positive'"
-            )
-            logger.info("Added polarity column to user_playbooks")
+        if "polarity" in cols:
+            self.conn.execute("ALTER TABLE user_playbooks DROP COLUMN polarity")
+            logger.info("Dropped legacy polarity column from user_playbooks")
         self.conn.commit()
 
     def _migrate_agent_playbook_source_windows(self) -> None:
@@ -1205,33 +1200,106 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         )
         self.conn.commit()
 
-    def _migrate_request_metadata(self) -> None:
-        """Add metadata column to requests for databases created before F2.
-
-        The column stores a JSON-encoded dict per request (see Request.metadata
-        in the Pydantic model). Backfill-safe: existing rows pick up the
-        ``'{}'`` default and round-trip as an empty dict.
-        """
+    def _migrate_request_evaluation_only(self) -> None:
+        """Add evaluation_only column to requests for learning exclusion."""
         cols = {
             row["name"]
             for row in self.conn.execute("PRAGMA table_info(requests)").fetchall()
         }
         if not cols:
             return
-        if "metadata" not in cols:
+        if "evaluation_only" not in cols:
             self.conn.execute(
-                "ALTER TABLE requests ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"
+                "ALTER TABLE requests ADD COLUMN evaluation_only INTEGER NOT NULL DEFAULT 0"
             )
-            logger.info("Added metadata column to requests")
+            logger.info("Added evaluation_only column to requests")
         self.conn.commit()
+
+    def _migrate_request_session_id_required(self) -> None:
+        """Require non-empty session ids on ``requests``.
+
+        SQLite cannot add a ``NOT NULL`` or ``CHECK`` constraint to an
+        existing column, so existing databases are rebuilt in place. Historical
+        null/blank sessions are intentionally backfilled per request to avoid
+        inventing conversation groupings that were never recorded.
+        """
+        cols = {
+            row["name"]: row
+            for row in self.conn.execute("PRAGMA table_info(requests)").fetchall()
+        }
+        if not cols or "session_id" not in cols:
+            return
+
+        table_sql_row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'requests'"
+        ).fetchone()
+        table_sql = (table_sql_row["sql"] if table_sql_row else "") or ""
+        blank_count = self.conn.execute(
+            "SELECT COUNT(*) FROM requests WHERE session_id IS NULL OR trim(session_id) = ''"
+        ).fetchone()[0]
+        has_required_schema = (
+            bool(cols["session_id"]["notnull"])
+            and "CHECK (trim(session_id) != '')" in table_sql
+        )
+        if has_required_schema and blank_count == 0:
+            return
+
+        evaluation_only_expr = (
+            "COALESCE(evaluation_only, 0)" if "evaluation_only" in cols else "0"
+        )
+        # NOTE: this rebuild hardcodes the full `requests` column set. If a
+        # future migration adds a column to `requests`, it MUST be added here
+        # too (and to the SELECT below) or the rebuild will silently drop it.
+        self.conn.executescript(
+            f"""
+            CREATE TABLE requests_new (
+                request_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                agent_version TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL CHECK (trim(session_id) != ''),
+                evaluation_only INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO requests_new
+                (
+                    request_id,
+                    user_id,
+                    created_at,
+                    source,
+                    agent_version,
+                    session_id,
+                    evaluation_only
+                )
+            SELECT
+                request_id,
+                user_id,
+                created_at,
+                COALESCE(source, ''),
+                COALESCE(agent_version, ''),
+                CASE
+                    WHEN session_id IS NULL OR trim(session_id) = ''
+                    THEN 'legacy-' || lower(hex(randomblob(16)))
+                    ELSE trim(session_id)
+                END,
+                {evaluation_only_expr}
+            FROM requests;
+            DROP TABLE requests;
+            ALTER TABLE requests_new RENAME TO requests;
+            CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id);
+            CREATE INDEX IF NOT EXISTS idx_requests_session_id ON requests(session_id);
+            CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
+            """
+        )
+        self.conn.commit()
+        logger.info("Migrated requests.session_id to required non-empty values")
 
     def _migrate_shadow_comparison_verdicts(self) -> None:
         """F1: create the shadow_comparison_verdicts table if missing.
 
         Idempotent; safe to run on every startup. The PRAGMA-LBYL guard
         avoids running the CREATE statements on every boot for
-        already-migrated DBs — mirrors the :meth:`_migrate_request_metadata`
-        pattern. The ``CREATE TABLE IF NOT EXISTS`` in :data:`_DDL` will
+        already-migrated DBs. The ``CREATE TABLE IF NOT EXISTS`` in :data:`_DDL` will
         also create this table on a fresh database, so this helper is a
         no-op there; its purpose is explicit symmetry with the per-feature
         migration convention and a single named hook the disk/supabase
@@ -1619,8 +1687,8 @@ CREATE TABLE IF NOT EXISTS requests (
     created_at TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT '',
     agent_version TEXT NOT NULL DEFAULT '',
-    session_id TEXT,
-    metadata TEXT NOT NULL DEFAULT '{}'
+    session_id TEXT NOT NULL CHECK (trim(session_id) != ''),
+    evaluation_only INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id);
 CREATE INDEX IF NOT EXISTS idx_requests_session_id ON requests(session_id);
@@ -1644,8 +1712,7 @@ CREATE TABLE IF NOT EXISTS user_playbooks (
     expanded_terms TEXT,
     source_span TEXT,
     notes TEXT,
-    reader_angle TEXT,
-    polarity TEXT NOT NULL DEFAULT 'positive'
+    reader_angle TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_playbook_name ON user_playbooks(playbook_name);
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_agent_version ON user_playbooks(agent_version);
@@ -1791,7 +1858,6 @@ CREATE TABLE IF NOT EXISTS _agent_runs (
     id TEXT PRIMARY KEY,
     org_id TEXT NOT NULL,
     extractor_kind TEXT NOT NULL,
-    extractor_name TEXT NOT NULL,
     user_id TEXT,
     request_id TEXT NOT NULL,
     agent_version TEXT,
@@ -1820,7 +1886,7 @@ CREATE TABLE IF NOT EXISTS _agent_runs (
     last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_runs_ready ON _agent_runs(status, next_resume_at, updated_at);
-CREATE INDEX IF NOT EXISTS idx_agent_runs_binding ON _agent_runs(org_id, extractor_kind, extractor_name, user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_binding ON _agent_runs(org_id, extractor_kind, user_id);
 
 CREATE TABLE IF NOT EXISTS _pending_tool_calls (
     id TEXT PRIMARY KEY,

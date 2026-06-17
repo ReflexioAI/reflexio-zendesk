@@ -8,12 +8,16 @@ also supporting a horizontally-scaled internal service in cloud deployments.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Literal
 
 import httpx
+
+from reflexio.server.tracing import profile_step
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,12 +29,37 @@ _ENV_PROVIDER = "REFLEXIO_EMBEDDING_PROVIDER"
 _ENV_SERVICE_URL = "REFLEXIO_EMBEDDING_SERVICE_URL"
 _ENV_TIMEOUT_MS = "REFLEXIO_EMBEDDING_SERVICE_TIMEOUT_MS"
 _ENV_EMBEDDING_PORT = "EMBEDDING_PORT"
+_ENV_DAEMON_HOST = "REFLEXIO_EMBEDDING_DAEMON_HOST"
+_ENV_LOCAL_SERVICE_PROBE_TIMEOUT_MS = (
+    "REFLEXIO_EMBEDDING_LOCAL_SERVICE_PROBE_TIMEOUT_MS"
+)
 _ENV_CLAUDE_SMART_LOCAL = "CLAUDE_SMART_USE_LOCAL_EMBEDDING"
+_ENV_MAX_TEXTS_PER_REQUEST = "REFLEXIO_EMBEDDING_SERVICE_MAX_TEXTS_PER_REQUEST"
 _DEFAULT_LOCAL_PORT = 8072
 _DEFAULT_INTERNAL_SERVICE_TIMEOUT_MS = 2_000
 _DEFAULT_LOCAL_SERVICE_TIMEOUT_MS = 30_000
+_DEFAULT_LOCAL_SERVICE_PROBE_TIMEOUT_MS = 200
+# Each request embeds its whole ``input`` list in one ``model.encode()`` on the
+# service, so an unbounded request can exceed the client read timeout on a CPU
+# daemon. Cap texts per request and concatenate; encode batching is a separate
+# server-side knob (REFLEXIO_EMBED_BATCH_SIZE).
+_DEFAULT_MAX_TEXTS_PER_REQUEST = 32
+# A reachable daemon is stable, so positive probe results are cached long
+# enough that steady-state requests skip the sequential /health round trip.
+# Failures stay short-lived so a restarted daemon is re-adopted quickly and
+# the inprocess-fallback window stays small.
+_LOCAL_SERVICE_PROBE_CACHE_SECONDS = 60.0
+_LOCAL_SERVICE_PROBE_FAILURE_CACHE_SECONDS = 5.0
+# Keep-alive must expire below the ALB's default 60s idle timeout so the pool
+# never hands out a connection the load balancer already closed.
+_HTTP_KEEPALIVE_EXPIRY_SECONDS = 50.0
+_EMBEDDING_RETRY_BACKOFF_SECONDS = 0.1
 _SERVICE_MODES = {"local_service", "internal_service"}
 _VALID_MODES = {"cloud", *_SERVICE_MODES, "inprocess", "off"}
+_local_service_probe_cache: tuple[float, bool, str | None] | None = None
+_http_client_lock = threading.Lock()
+_http_client_instance: httpx.Client | None = None
+_http_client_pid: int | None = None
 
 
 class EmbeddingUnavailableError(RuntimeError):
@@ -38,8 +67,25 @@ class EmbeddingUnavailableError(RuntimeError):
 
 
 def _local_service_url() -> str:
+    host = os.environ.get(_ENV_DAEMON_HOST, "").strip() or "127.0.0.1"
     port = os.environ.get(_ENV_EMBEDDING_PORT, str(_DEFAULT_LOCAL_PORT))
-    return f"http://127.0.0.1:{port}"
+    return f"http://{host}:{port}"
+
+
+def _local_service_probe_timeout_seconds() -> float:
+    raw = os.environ.get(_ENV_LOCAL_SERVICE_PROBE_TIMEOUT_MS)
+    if raw is None:
+        return _DEFAULT_LOCAL_SERVICE_PROBE_TIMEOUT_MS / 1000
+    try:
+        timeout_ms = int(raw)
+    except ValueError:
+        _LOGGER.warning(
+            "%s must be an integer number of milliseconds; using %dms",
+            _ENV_LOCAL_SERVICE_PROBE_TIMEOUT_MS,
+            _DEFAULT_LOCAL_SERVICE_PROBE_TIMEOUT_MS,
+        )
+        return _DEFAULT_LOCAL_SERVICE_PROBE_TIMEOUT_MS / 1000
+    return max(timeout_ms, 1) / 1000
 
 
 def embedding_service_url(mode: EmbeddingProviderMode | None = None) -> str:
@@ -76,6 +122,72 @@ def embedding_service_timeout_seconds(
             f"{_ENV_TIMEOUT_MS} must be an integer number of milliseconds"
         ) from exc
     return max(timeout_ms, 1) / 1000
+
+
+def _is_local_model(model: str | None) -> bool:
+    return bool(model and model.startswith("local/"))
+
+
+def _http_client() -> httpx.Client:
+    """Shared keep-alive client for health probes and embedding POSTs.
+
+    A per-request client pays DNS resolution plus a TCP handshake on every
+    embedding call. The client is recreated after fork (PID check) so worker
+    children never reuse sockets inherited from the parent process.
+    """
+    global _http_client_instance, _http_client_pid
+    pid = os.getpid()
+    with _http_client_lock:
+        if _http_client_instance is None or _http_client_pid != pid:
+            if _http_client_instance is not None and _http_client_pid != pid:
+                try:
+                    _http_client_instance.close()
+                except Exception:
+                    _LOGGER.debug(
+                        "Failed to close stale embedding HTTP client", exc_info=True
+                    )
+            _http_client_instance = httpx.Client(
+                limits=httpx.Limits(keepalive_expiry=_HTTP_KEEPALIVE_EXPIRY_SECONDS)
+            )
+            _http_client_pid = pid
+        return _http_client_instance
+
+
+def _local_service_status() -> tuple[bool, str | None]:
+    global _local_service_probe_cache
+    now = time.monotonic()
+    if _local_service_probe_cache is not None:
+        cached_at, cached_reachable, cached_model = _local_service_probe_cache
+        ttl = (
+            _LOCAL_SERVICE_PROBE_CACHE_SECONDS
+            if cached_reachable
+            else _LOCAL_SERVICE_PROBE_FAILURE_CACHE_SECONDS
+        )
+        if now - cached_at < ttl:
+            return cached_reachable, cached_model
+
+    try:
+        response = _http_client().get(
+            f"{_local_service_url()}/health",
+            timeout=_local_service_probe_timeout_seconds(),
+        )
+        reachable = response.status_code < 500
+        active_model = response.json().get("active_model") if reachable else None
+        if not isinstance(active_model, str):
+            active_model = None
+    except httpx.HTTPError:
+        reachable = False
+        active_model = None
+    except ValueError:
+        reachable = False
+        active_model = None
+    _local_service_probe_cache = (now, reachable, active_model)
+    return reachable, active_model
+
+
+def _local_service_supports_model(model: str | None) -> bool:
+    reachable, active_model = _local_service_status()
+    return reachable and (active_model is None or active_model == model)
 
 
 def _ordered_embeddings_from_response(
@@ -123,10 +235,10 @@ def _ordered_embeddings_from_response(
 def embedding_provider_mode(model: str | None = None) -> EmbeddingProviderMode:
     """Resolve the embedding provider mode for a model.
 
-    Backwards compatibility: a ``local/*`` model still uses the in-process
-    embedder unless the user explicitly chooses a mode or Claude Smart's legacy
-    ``CLAUDE_SMART_USE_LOCAL_EMBEDDING=1`` flag is present. That legacy flag
-    now means "use the shared local service" by default.
+    Explicit legacy env modes keep their historical behavior. With no explicit
+    env mode, routing is model-driven: ``local/*`` uses a configured daemon host
+    authoritatively, otherwise it uses the local daemon when reachable and falls
+    back to the in-process embedder. Cloud models use their provider directly.
     """
     configured = os.environ.get(_ENV_PROVIDER)
     if configured:
@@ -144,8 +256,11 @@ def embedding_provider_mode(model: str | None = None) -> EmbeddingProviderMode:
     if os.environ.get(_ENV_SERVICE_URL):
         return "internal_service"
 
-    if model and model.startswith("local/"):
-        return "inprocess"
+    if _is_local_model(model) and os.environ.get(_ENV_DAEMON_HOST, "").strip():
+        return "local_service"
+
+    if _is_local_model(model):
+        return "local_service" if _local_service_supports_model(model) else "inprocess"
     return "cloud"
 
 
@@ -186,25 +301,97 @@ def get_service_embeddings(
         )
 
     url = f"{embedding_service_url(mode)}/v1/embeddings"
+    timeout = embedding_service_timeout_seconds(mode)
+
+    # Bound each request so a single large publish cannot exceed the client read
+    # timeout: split into fixed-size chunks and concatenate the results in order.
+    chunk_size = _max_texts_per_request()
+    embeddings: list[list[float]] = []
+    for start in range(0, len(texts), chunk_size):
+        chunk = texts[start : start + chunk_size]
+        embeddings.extend(
+            _post_embedding_batch(
+                url, model=model, texts=chunk, dimensions=dimensions, timeout=timeout
+            )
+        )
+    return embeddings
+
+
+def _post_embedding_batch(
+    url: str,
+    *,
+    model: str,
+    texts: list[str],
+    dimensions: int | None,
+    timeout: float,
+) -> list[list[float]]:
+    """POST one bounded batch of texts to the embedding service."""
     payload: dict[str, Any] = {"model": model, "input": texts}
     if dimensions:
         payload["dimensions"] = dimensions
 
-    timeout = embedding_service_timeout_seconds(mode)
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            with httpx.Client(timeout=timeout) as client:
-                response = client.post(url, json=payload)
+            response = _http_client().post(url, json=payload, timeout=timeout)
             response.raise_for_status()
             body = response.json()
             return _ordered_embeddings_from_response(body.get("data"), len(texts))
-        except Exception as exc:  # noqa: BLE001 - normalized to typed degradation signal
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.RemoteProtocolError,
+        ) as exc:
+            # Connection never established, or the server closed a pooled
+            # keep-alive connection before sending a response (stale-reuse
+            # race) — the request was not processed, so a single retry is
+            # safe and cannot duplicate work.
             last_error = exc
             if attempt == 0:
-                time.sleep(0.1)
+                with profile_step(
+                    "search.embedding.api.retry_backoff",
+                    retry_reason=type(exc).__name__,
+                    retry_backoff_ms=int(_EMBEDDING_RETRY_BACKOFF_SECONDS * 1000),
+                    attempt=attempt + 1,
+                    max_attempts=2,
+                ):
+                    time.sleep(_EMBEDDING_RETRY_BACKOFF_SECONDS)
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
+            # The server already received the request: a read timeout means it
+            # is still encoding, and retrying would queue a second identical
+            # encode behind the first and amplify load on an already-saturated
+            # daemon. HTTPStatusError (4xx/5xx) and malformed-payload errors
+            # (JSONDecodeError / the ValueError raised by
+            # _ordered_embeddings_from_response) will not change on retry
+            # either. Fail fast. Anything outside this set (AttributeError,
+            # TypeError, ...) is a programming bug and propagates raw.
+            last_error = exc
+            break
 
     _LOGGER.warning("Embedding service unavailable at %s: %s", url, last_error)
     raise EmbeddingUnavailableError(
         f"Embedding service unavailable at {url}: {last_error}"
     ) from last_error
+
+
+def _max_texts_per_request() -> int:
+    raw = os.environ.get(_ENV_MAX_TEXTS_PER_REQUEST)
+    if raw is None:
+        return _DEFAULT_MAX_TEXTS_PER_REQUEST
+    try:
+        value = int(raw)
+    except ValueError:
+        _LOGGER.warning(
+            "%s must be an integer; using %d",
+            _ENV_MAX_TEXTS_PER_REQUEST,
+            _DEFAULT_MAX_TEXTS_PER_REQUEST,
+        )
+        return _DEFAULT_MAX_TEXTS_PER_REQUEST
+    if value < 1:
+        _LOGGER.warning(
+            "%s must be >= 1; using %d",
+            _ENV_MAX_TEXTS_PER_REQUEST,
+            _DEFAULT_MAX_TEXTS_PER_REQUEST,
+        )
+        return _DEFAULT_MAX_TEXTS_PER_REQUEST
+    return value

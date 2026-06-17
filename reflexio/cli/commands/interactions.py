@@ -122,6 +122,20 @@ def _interactions_from_payload(payload: dict) -> list[InteractionData]:
         ) from exc
 
 
+def _resolve_session_id(raw_session_id: object, *, source_hint: str) -> str:
+    """Return a non-empty session id or raise a CLI validation error."""
+    if not isinstance(raw_session_id, str) or not raw_session_id.strip():
+        raise CliError(
+            error_type="validation",
+            message=(
+                "session_id is required and cannot be empty "
+                f"({source_hint}; pass --session-id or include 'session_id' in the payload)"
+            ),
+            exit_code=EXIT_VALIDATION,
+        )
+    return raw_session_id.strip()
+
+
 def _read_data_arg(data: str) -> str:
     """Read inline JSON or from a file path prefixed with ``@``.
 
@@ -233,7 +247,7 @@ def publish(
         ),
     ] = None,
     session_id: Annotated[
-        str | None, typer.Option(help="Session ID for grouping")
+        str | None, typer.Option(help="Required session ID for grouping")
     ] = None,
     source: Annotated[str, typer.Option(help="Source tag")] = "cli",
     agent_version: Annotated[
@@ -263,6 +277,13 @@ def publish(
         typer.Option(
             "--force-extraction",
             help="Bypass all extraction gates (stride_size, cheap pre-filter, LLM should_run) and always run extractors",
+        ),
+    ] = False,
+    evaluation_only: Annotated[
+        bool,
+        typer.Option(
+            "--evaluation-only",
+            help="Store for session-level evaluation only and skip profile/playbook extraction",
         ),
     ] = False,
     override_learning_stall: Annotated[
@@ -310,6 +331,9 @@ def publish(
                 message="--user-id is required with --user-message (or set REFLEXIO_USER_ID)",
                 exit_code=EXIT_VALIDATION,
             )
+        resolved_session_id = _resolve_session_id(
+            session_id, source_hint="single-turn publish"
+        )
         interactions: list[InteractionData | dict] = [
             InteractionData(role="user", content=user_message),
             InteractionData(role="assistant", content=agent_response),
@@ -319,10 +343,11 @@ def publish(
             interactions=interactions,
             source=source,
             agent_version=resolve_agent_version(agent_version),
-            session_id=session_id,
+            session_id=resolved_session_id,
             wait_for_response=wait,
             skip_aggregation=skip_aggregation,
             force_extraction=force_extraction,
+            evaluation_only=evaluation_only,
             override_learning_stall=override_learning_stall,
         )
         if json_mode:
@@ -371,15 +396,20 @@ def publish(
                 ),
                 exit_code=EXIT_VALIDATION,
             )
+        resolved_session_id = _resolve_session_id(
+            payload.get("session_id", session_id),
+            source_hint="payload publish",
+        )
         result = client.publish_interaction(
             user_id=resolved_user_id,
             interactions=interaction_items,  # type: ignore[arg-type]
             source=payload.get("source", source),
             agent_version=payload.get("agent_version", resolved_version),
-            session_id=payload.get("session_id", session_id),
+            session_id=resolved_session_id,
             wait_for_response=wait,
             skip_aggregation=payload.get("skip_aggregation", skip_aggregation),
             force_extraction=payload.get("force_extraction", force_extraction),
+            evaluation_only=payload.get("evaluation_only", evaluation_only),
             override_learning_stall=payload.get(
                 "override_learning_stall", override_learning_stall
             ),
@@ -441,7 +471,7 @@ def search(
 @handle_errors
 def delete(
     ctx: typer.Context,
-    interaction_id: Annotated[str, typer.Option(help="Interaction ID to delete")],
+    interaction_id: Annotated[int, typer.Option(help="Interaction ID to delete")],
     user_id: Annotated[str, typer.Option(help="User ID that owns the interaction")],
 ) -> None:
     """Delete a single interaction by ID."""

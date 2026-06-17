@@ -3,7 +3,6 @@ Unit tests for AgentSuccessEvaluator.
 
 Tests the evaluator's responsibilities for:
 - Source filtering on provided interactions
-- Sampling rate filtering
 - Running evaluations on provided interactions
 """
 
@@ -116,12 +115,14 @@ def sample_request_interaction_models(sample_interactions):
     request1 = Request(
         request_id="req1",
         user_id="user1",
+        session_id="test_session",
         created_at=1000,
         source="api",
     )
     request2 = Request(
         request_id="req2",
         user_id="user2",
+        session_id="test_session",
         created_at=1002,
         source="api",
     )
@@ -181,14 +182,13 @@ class TestRun:
         assert result is not None
         assert isinstance(result, list)
 
-    def test_run_respects_sampling_rate(
+    def test_run_does_not_apply_sampling_rate(
         self,
         request_context,
         mock_llm_client,
         sample_request_interaction_models,
     ):
-        """Test that run() respects sampling rate."""
-        # Config with 0% sampling rate - should skip all
+        """Sampling is handled before evaluator invocation, not inside run()."""
         config = AgentSuccessConfig(
             evaluation_name="task_completion",
             success_definition_prompt="Evaluate if task was completed",
@@ -212,18 +212,17 @@ class TestRun:
 
         result = evaluator.run()
 
-        # With 0% sampling rate, should skip all and return empty
-        assert result == []
+        assert len(result) == 1
+        mock_llm_client.generate_chat_response.assert_called_once()
 
-    def test_run_with_100_percent_sampling_rate(
+    def test_run_evaluates_default_config(
         self,
         request_context,
         mock_llm_client,
         extractor_config,
         service_config,
     ):
-        """Test that run() processes all with 100% sampling rate."""
-        # Default sampling_rate is 1.0 (100%)
+        """Test that run() processes the provided interaction group."""
         evaluator = AgentSuccessEvaluator(
             request_context=request_context,
             llm_client=mock_llm_client,
@@ -259,12 +258,14 @@ class TestSourceFiltering:
         request1 = Request(
             request_id="req1",
             user_id="user1",
+            session_id="test_session",
             created_at=1000,
             source="api",
         )
         request2 = Request(
             request_id="req2",
             user_id="user2",
+            session_id="test_session",
             created_at=1002,
             source="web",
         )
@@ -285,7 +286,7 @@ class TestSourceFiltering:
         config = AgentSuccessConfig(
             evaluation_name="task_completion",
             success_definition_prompt="Evaluate if task was completed",
-            source_filter="api",
+            request_sources_enabled=["api"],
         )
 
         service_config = AgentSuccessGenerationServiceConfig(

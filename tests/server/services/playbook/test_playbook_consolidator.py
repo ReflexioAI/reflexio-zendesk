@@ -12,6 +12,7 @@ import pytest
 
 from reflexio.models.api_schema.service_schemas import UserPlaybook
 from reflexio.server.services.playbook.playbook_consolidator import (
+    DifferentiateDecision,
     IndependentDecision,
     PlaybookConsolidationOutput,
     PlaybookConsolidationResult,
@@ -32,7 +33,6 @@ def _make_user_playbook(
     trigger: str | None = None,
     source_interaction_ids: list[int] | None = None,
     user_playbook_id: int = 0,
-    polarity: str = "positive",
 ) -> UserPlaybook:
     """Helper to create a UserPlaybook object for tests."""
     return UserPlaybook(
@@ -44,7 +44,6 @@ def _make_user_playbook(
         trigger=trigger or f"condition_{idx}",
         source="test",
         source_interaction_ids=source_interaction_ids or [],
-        polarity=polarity,  # type: ignore[arg-type]
     )
 
 
@@ -76,16 +75,19 @@ def _unify(
     content: str = "unified content",
     trigger: str = "unified trigger",
     rationale: str = "unified rationale",
-    polarity: str = "positive",
 ) -> UnifyDecision:
-    """Build a ``UnifyDecision`` with sane defaults for the apply tests."""
+    """Build a ``UnifyDecision`` with sane defaults for the apply tests.
+
+    Polarity is not a decision field; the unified row's orientation is derived
+    from ``content`` / ``rationale`` wording at apply time. The defaults derive
+    positive (no avoidance framing).
+    """
     return UnifyDecision(
         new_id=new_id,
         archive_existing_ids=archive_existing_ids or [],
         content=content,
         trigger=trigger,
         rationale=rationale,
-        polarity=polarity,  # type: ignore[arg-type]
     )
 
 
@@ -122,27 +124,31 @@ class TestFormatPlaybooksWithPrefix:
         """Rendered rows MUST expose `Trigger` and `Rationale` alongside `Content`.
 
         Several decision kinds compare existing-vs-new triggers (``differentiate``,
-        same-trigger contradictions, trigger refinements). Without the trigger
+        same-situation contradictions, trigger refinements). Without the trigger
         field in the prompt payload the model is guessing about the field it is
         supposed to refine. This regression test pins the row shape.
         """
+        # Under Option B there is no derived ``Polarity`` field in the row: the
+        # LLM reads orientation directly from the content/rationale wording.
         fb = UserPlaybook(
             user_playbook_id=0,
             agent_version="v1",
             request_id="req1",
             playbook_name="fb",
-            content="do X when Y",
+            content="Do not start unbilled work when Y",
             trigger="user asks about billing",
-            rationale="prevents unbilled work",
-            polarity="negative",
+            rationale="prevents unbilled work after user pushback",
             source="extractor",
         )
         result = mock_consolidator._format_playbooks_with_prefix([fb], "EXISTING")
         assert 'Trigger: "user asks about billing"' in result, result
-        assert 'Rationale: "prevents unbilled work"' in result, result
-        # Content / polarity / name / source must still render alongside.
-        assert 'Content: "do X when Y"' in result
-        assert "Polarity: negative" in result
+        assert 'Rationale: "prevents unbilled work after user pushback"' in result, (
+            result
+        )
+        # Content / name / source must still render alongside. The derived
+        # ``Polarity`` field was removed under Option B.
+        assert 'Content: "Do not start unbilled work when Y"' in result
+        assert "Polarity:" not in result
         assert "Name: fb" in result
         assert "Source: extractor" in result
 
@@ -338,12 +344,10 @@ class TestBuildDeduplicatedResults:
         added to the archive list.
         """
         new_playbooks = [
-            _make_user_playbook(0, content="new content", polarity="positive"),
+            _make_user_playbook(0, content="new content"),
         ]
         existing_playbooks = [
-            _make_user_playbook(
-                1, user_playbook_id=500, content="old content", polarity="positive"
-            ),
+            _make_user_playbook(1, user_playbook_id=500, content="old content"),
         ]
 
         dedup_output = PlaybookConsolidationOutput(
@@ -352,7 +356,6 @@ class TestBuildDeduplicatedResults:
                     "NEW-0",
                     archive_existing_ids=[0],
                     content="final content",
-                    polarity="positive",
                 )
             ],
         )
@@ -376,20 +379,18 @@ class TestBuildDeduplicatedResults:
         rows into a single inserted row, archiving every referenced EXISTING id.
         """
         new_playbooks = [
-            _make_user_playbook(0, source_interaction_ids=[10], polarity="positive"),
+            _make_user_playbook(0, source_interaction_ids=[10]),
         ]
         existing_playbooks = [
             _make_user_playbook(
                 1,
                 user_playbook_id=501,
                 source_interaction_ids=[1],
-                polarity="positive",
             ),
             _make_user_playbook(
                 2,
                 user_playbook_id=502,
                 source_interaction_ids=[2],
-                polarity="positive",
             ),
         ]
 
@@ -399,7 +400,6 @@ class TestBuildDeduplicatedResults:
                     "NEW-0",
                     archive_existing_ids=[0, 1],
                     content="merged content",
-                    polarity="positive",
                 )
             ],
         )
@@ -428,7 +428,7 @@ class TestBuildDeduplicatedResults:
         apply path must support it without raising.
         """
         new_playbooks = [
-            _make_user_playbook(0, content="solo new", polarity="positive"),
+            _make_user_playbook(0, content="solo new"),
         ]
 
         dedup_output = PlaybookConsolidationOutput(
@@ -437,7 +437,6 @@ class TestBuildDeduplicatedResults:
                     "NEW-0",
                     archive_existing_ids=[],
                     content="solo final",
-                    polarity="positive",
                 )
             ],
         )
@@ -453,6 +452,65 @@ class TestBuildDeduplicatedResults:
         assert len(result) == 1
         assert result[0].content == "solo final"
         assert delete_ids == []
+
+    def test_unify_over_budget_logs_warning(self, mock_consolidator, caplog):
+        """An over-budget unify logs a backstop warning but still applies.
+
+        The complexity budget is a soft signal: the merge proceeds (the row is
+        inserted), and ``event=consolidation_over_budget`` is emitted with the
+        offending length and the configured budget.
+        """
+        mock_consolidator._dedup_config.max_unified_content_chars = 10
+        over_budget_content = "x" * 50
+
+        new_playbooks = [_make_user_playbook(0, content="new content")]
+
+        dedup_output = PlaybookConsolidationOutput(
+            decisions=[
+                _unify("NEW-0", archive_existing_ids=[], content=over_budget_content)
+            ],
+        )
+
+        with caplog.at_level("WARNING"):
+            result, _ = mock_consolidator._build_deduplicated_results(
+                new_playbooks=new_playbooks,
+                existing_playbooks=[],
+                dedup_output=dedup_output,
+                request_id="req1",
+                agent_version="v1",
+            )
+
+        # Merge still applies (soft backstop, not a blocker).
+        assert len(result) == 1
+        assert result[0].content == over_budget_content
+        assert any(
+            "event=consolidation_over_budget" in rec.message
+            and "len=50" in rec.message
+            and "budget=10" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_unify_within_budget_no_warning(self, mock_consolidator, caplog):
+        """A within-budget unify emits no over-budget warning."""
+        mock_consolidator._dedup_config.max_unified_content_chars = 1000
+
+        new_playbooks = [_make_user_playbook(0, content="new content")]
+        dedup_output = PlaybookConsolidationOutput(
+            decisions=[_unify("NEW-0", archive_existing_ids=[], content="short")],
+        )
+
+        with caplog.at_level("WARNING"):
+            mock_consolidator._build_deduplicated_results(
+                new_playbooks=new_playbooks,
+                existing_playbooks=[],
+                dedup_output=dedup_output,
+                request_id="req1",
+                agent_version="v1",
+            )
+
+        assert not any(
+            "event=consolidation_over_budget" in rec.message for rec in caplog.records
+        )
 
     def test_unify_counter_bumps_once_per_decision(self, mock_consolidator):
         """``unify_count`` increments by exactly one per applied ``UnifyDecision``,
@@ -510,6 +568,114 @@ class TestBuildDeduplicatedResults:
         # the candidate was consumed by the decision.
         assert result == []
         assert delete_ids == []
+
+    def test_reject_new_resolves_existing_position(self, mock_consolidator):
+        """``reject_new`` ids may refer to the rendered ``EXISTING-N`` position.
+
+        The consolidation prompt shows rows as ``[EXISTING-0]`` etc. If the LLM
+        emits ``0`` for that first row, the apply path must consume the NEW
+        candidate rather than treating the id as invalid and triggering the
+        safety fallback.
+        """
+        new_playbooks = [_make_user_playbook(0)]
+        existing_playbooks = [_make_user_playbook(1, user_playbook_id=999)]
+
+        dedup_output = PlaybookConsolidationOutput(
+            decisions=[
+                RejectNewDecision(new_id="NEW-0", superseded_by_existing_id=0),
+            ],
+        )
+
+        result, delete_ids = mock_consolidator._build_deduplicated_results(
+            new_playbooks=new_playbooks,
+            existing_playbooks=existing_playbooks,
+            dedup_output=dedup_output,
+            request_id="req1",
+            agent_version="v1",
+        )
+
+        assert result == []
+        assert delete_ids == []
+
+    def test_differentiate_resolves_existing_position(self, mock_consolidator):
+        """``differentiate`` ids may refer to the rendered ``EXISTING-N`` position."""
+        new_playbooks = [_make_user_playbook(0, trigger="broad trigger")]
+        existing_playbooks = [_make_user_playbook(1, user_playbook_id=999)]
+
+        dedup_output = PlaybookConsolidationOutput(
+            decisions=[
+                DifferentiateDecision(
+                    new_id="NEW-0",
+                    existing_id=0,
+                    refined_new_trigger="narrow new trigger",
+                    refined_existing_trigger="narrow existing trigger",
+                ),
+            ],
+        )
+
+        result, delete_ids = mock_consolidator._build_deduplicated_results(
+            new_playbooks=new_playbooks,
+            existing_playbooks=existing_playbooks,
+            dedup_output=dedup_output,
+            request_id="req1",
+            agent_version="v1",
+        )
+
+        assert len(result) == 2
+        assert result[0].trigger == "narrow new trigger"
+        assert result[1].trigger == "narrow existing trigger"
+        assert delete_ids == [999]
+
+    def test_differentiate_falls_back_to_db_id(self, mock_consolidator):
+        """When the id misses every ``EXISTING-N`` position, the apply path
+        falls back to a DB ``user_playbook_id`` for older prompt outputs.
+
+        Here the single existing row sits at position 0 but carries DB id 999.
+        Emitting ``999`` misses ``EXISTING-999`` and must resolve via the DB-id
+        fallback, archiving the right row.
+        """
+        new_playbooks = [_make_user_playbook(0, trigger="broad trigger")]
+        existing_playbooks = [_make_user_playbook(1, user_playbook_id=999)]
+
+        dedup_output = PlaybookConsolidationOutput(
+            decisions=[
+                DifferentiateDecision(
+                    new_id="NEW-0",
+                    existing_id=999,
+                    refined_new_trigger="narrow new trigger",
+                    refined_existing_trigger="narrow existing trigger",
+                ),
+            ],
+        )
+
+        result, delete_ids = mock_consolidator._build_deduplicated_results(
+            new_playbooks=new_playbooks,
+            existing_playbooks=existing_playbooks,
+            dedup_output=dedup_output,
+            request_id="req1",
+            agent_version="v1",
+        )
+
+        assert len(result) == 2
+        assert delete_ids == [999]
+
+    def test_existing_reference_ignores_out_of_range_position_key(
+        self, mock_consolidator
+    ):
+        """Out-of-range position-like keys must not shadow legacy DB ids."""
+        db_row = _make_user_playbook(1, user_playbook_id=999)
+        stray_position_row = _make_user_playbook(2, user_playbook_id=123)
+
+        resolved = mock_consolidator._resolve_existing_reference(
+            999,
+            existing_by_position={
+                "EXISTING-0": db_row,
+                "EXISTING-999": stray_position_row,
+            },
+            existing_by_id={999: db_row},
+        )
+
+        assert resolved is db_row
 
     def test_safety_fallback_unhandled_playbooks(self, mock_consolidator):
         """NEW playbooks not referenced by any decision are added via safety fallback."""
@@ -733,9 +899,7 @@ class TestBuildDeduplicatedResultsEdgeCases:
             _make_user_playbook(0, source_interaction_ids=[1, 2]),
         ]
         existing_playbooks = [
-            _make_user_playbook(
-                1, user_playbook_id=200, source_interaction_ids=[2, 3]
-            ),
+            _make_user_playbook(1, user_playbook_id=200, source_interaction_ids=[2, 3]),
         ]
 
         dedup_output = PlaybookConsolidationOutput(

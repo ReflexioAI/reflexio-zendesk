@@ -10,6 +10,7 @@ import os
 import time
 import uuid
 from collections.abc import Generator
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import psycopg2
@@ -28,6 +29,12 @@ from reflexio.server.services.storage.storage_base import (
     AgentBinding,
     AgentRunRecord,
     AgentRunStatus,
+    PendingToolCallRecord,
+    PendingToolCallStatus,
+    RunToolDependencyRecord,
+    build_pending_tool_call_dedup_key,
+    build_scope_hash,
+    human_feedback_scope,
 )
 from tests.server.test_utils import skip_in_precommit
 
@@ -113,7 +120,6 @@ def test_postgres_agent_run_round_trip(postgres_storage: PostgresStorage) -> Non
             binding=AgentBinding(
                 org_id=postgres_storage.org_id,
                 extractor_kind="profile",
-                extractor_name="docker_postgres_agent_run",
                 user_id="pg-agent-user",
                 request_id=request_id,
                 agent_version="docker-postgres-e2e",
@@ -146,3 +152,72 @@ def test_postgres_agent_run_round_trip(postgres_storage: PostgresStorage) -> Non
     loaded = postgres_storage.get_agent_run(run_id)
     assert loaded is not None
     assert loaded.status == AgentRunStatus.FINALIZED
+
+
+@skip_in_precommit
+def test_postgres_pending_tool_call_round_trip(
+    postgres_storage: PostgresStorage,
+) -> None:
+    run_id = f"pg-agent-run-{uuid.uuid4().hex[:8]}"
+    call_id = f"pg-tool-call-{uuid.uuid4().hex[:8]}"
+    now = datetime(2026, 6, 16, tzinfo=UTC)
+    scope = human_feedback_scope(postgres_storage.org_id)
+
+    postgres_storage.create_agent_run(
+        AgentRunRecord(
+            id=run_id,
+            binding=AgentBinding(
+                org_id=postgres_storage.org_id,
+                extractor_kind="profile",
+                user_id="pg-agent-user",
+                request_id=f"pg-agent-request-{uuid.uuid4().hex[:8]}",
+                agent_version="docker-postgres-e2e",
+                source="docker-postgres-e2e",
+            ),
+            status=AgentRunStatus.FINALIZED_PENDING_TOOL,
+            generation_request_snapshot={"reason": "pending-tool-call-e2e"},
+        )
+    )
+    postgres_storage.create_pending_tool_call(
+        PendingToolCallRecord(
+            id=call_id,
+            org_id=postgres_storage.org_id,
+            user_id="pg-agent-user",
+            scope=scope,
+            scope_hash=build_scope_hash(scope),
+            tool_name="ask_human",
+            dedup_key=build_pending_tool_call_dedup_key(
+                tool_name="ask_human",
+                question_text="Which deployment target should be used?",
+            ),
+            status=PendingToolCallStatus.PENDING,
+            question_text="Which deployment target should be used?",
+            args={"question": "Which deployment target should be used?"},
+            tags=["deployment"],
+            expires_at=now + timedelta(hours=1),
+            cache_until=now + timedelta(minutes=5),
+        )
+    )
+    postgres_storage.attach_run_tool_dependency(
+        RunToolDependencyRecord(run_id=run_id, pending_tool_call_id=call_id)
+    )
+
+    resolved = postgres_storage.resolve_pending_tool_call(
+        call_id,
+        result={"answer": "AWS ECS"},
+        resolved_at=now,
+        valid_for_seconds=3600,
+    )
+    claimed = postgres_storage.claim_ready_agent_run(
+        org_id=postgres_storage.org_id,
+        worker_id="pg-worker",
+        now=now,
+    )
+
+    assert resolved is not None
+    assert resolved.status == PendingToolCallStatus.RESOLVED
+    assert resolved.result == {"answer": "AWS ECS"}
+    assert claimed is not None
+    assert claimed.id == run_id
+    assert claimed.status == AgentRunStatus.RESUMING
+    assert postgres_storage.consume_run_tool_dependencies(run_id) == 1

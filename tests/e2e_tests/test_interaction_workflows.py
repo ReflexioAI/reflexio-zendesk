@@ -13,12 +13,19 @@ from reflexio.models.api_schema.service_schemas import (
     DeleteUserInteractionRequest,
     InteractionData,
 )
+from reflexio.models.config_schema import SINGLETON_USER_PLAYBOOK_NAME
 from reflexio.server.services.agent_success_evaluation.group_evaluation_runner import (
     run_group_evaluation,
 )
 from tests.server.test_utils import skip_in_precommit, skip_low_priority
 
-pytestmark = pytest.mark.e2e
+# These workflows publish a full 16-interaction conversation, which triggers
+# cold loading of the local embedder + cross-encoder on first use. Under the
+# default parallel run (-n auto) on a contended CI box, several workers load
+# models at once and a single publish can exceed the global per-test timeout
+# (120s), turning a correct test into a spurious timeout failure. Give them a
+# generous per-test budget so only genuine hangs fail.
+pytestmark = [pytest.mark.e2e, pytest.mark.timeout(300)]
 
 
 @skip_in_precommit
@@ -84,7 +91,7 @@ def test_publish_interaction_end_to_end(
 
     # Verify playbooks were generated and stored
     user_playbooks = reflexio_instance.request_context.storage.get_user_playbooks(
-        playbook_name="test_playbook"
+        playbook_name=SINGLETON_USER_PLAYBOOK_NAME
     )
     assert len(user_playbooks) > 0 and user_playbooks[0].content.strip() != ""
 
@@ -122,6 +129,7 @@ def test_search_interactions_end_to_end(
     reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -160,6 +168,7 @@ def test_get_interactions_end_to_end(
     reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -200,6 +209,7 @@ def test_delete_interaction_end_to_end(
     response = reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": sample_interaction_requests,
             "source": "test_conversation",
         }
@@ -266,6 +276,7 @@ def test_dict_input_handling_end_to_end(
     response = reflexio_instance.publish_interaction(
         {
             "user_id": user_id,
+            "session_id": "e2e_test_session",
             "interaction_data_list": interaction_dicts,
             "source": "test_conversation",
         }

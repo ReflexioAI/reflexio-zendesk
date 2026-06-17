@@ -182,7 +182,11 @@ class TestResolveModelName:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         for role in ModelRole:
             result = resolve_model_name(role)
-            expected = getattr(_PROVIDER_DEFAULTS["openai"], role.value)
+            expected = (
+                _PROVIDER_DEFAULTS["local"].embedding
+                if role == ModelRole.EMBEDDING
+                else getattr(_PROVIDER_DEFAULTS["openai"], role.value)
+            )
             assert result == expected, f"Mismatch for {role}"
 
     def test_auto_detect_anthropic(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -213,8 +217,8 @@ class TestResolveModelName:
         result = resolve_model_name(ModelRole.GENERATION)
         assert result == _PROVIDER_DEFAULTS["anthropic"].generation
 
-    def test_embedding_cross_provider_anthropic_primary(self) -> None:
-        """When only Anthropic key is in APIKeyConfig, embedding falls back to OpenAI via env."""
+    def test_embedding_config_default_ignores_cloud_api_keys(self) -> None:
+        """Embedding defaults to the OSS local model unless config overrides it."""
         from reflexio.models.config_schema import APIKeyConfig
 
         config = APIKeyConfig(
@@ -225,12 +229,12 @@ class TestResolveModelName:
             ModelRole.EMBEDDING,
             api_key_config=config,
         )
-        assert result == _PROVIDER_DEFAULTS["openai"].embedding
+        assert result == _PROVIDER_DEFAULTS["local"].embedding
 
     def test_gemini_embedding(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GEMINI_API_KEY", "gem-test")
         result = resolve_model_name(ModelRole.EMBEDDING)
-        assert result == _PROVIDER_DEFAULTS["gemini"].embedding
+        assert result == _PROVIDER_DEFAULTS["local"].embedding
 
     def test_embedding_fallback_to_local_when_no_cloud(
         self, monkeypatch: pytest.MonkeyPatch
@@ -246,14 +250,14 @@ class TestResolveModelName:
     def test_embedding_fallback_skipped_when_cloud_available(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Cloud embedder beats local fallback when both are available."""
+        """Local default still wins when cloud embedding keys are available."""
         from reflexio.server.llm.providers import local_embedding_provider as lep
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
         result = resolve_model_name(ModelRole.EMBEDDING)
-        assert result == _PROVIDER_DEFAULTS["openai"].embedding
+        assert result == _PROVIDER_DEFAULTS["local"].embedding
 
     def test_embedding_explicit_opt_in_beats_cloud(
         self, monkeypatch: pytest.MonkeyPatch
@@ -267,16 +271,18 @@ class TestResolveModelName:
         result = resolve_model_name(ModelRole.EMBEDDING)
         assert result == _PROVIDER_DEFAULTS["local"].embedding
 
-    def test_embedding_no_chromadb_raises(
+    def test_embedding_default_does_not_probe_chromadb(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Anthropic only + chromadb missing → RuntimeError with install hint."""
+        """Saved config owns overrides; default model selection does not inspect imports."""
         from reflexio.server.llm.providers import local_embedding_provider as lep
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
         monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: None)
-        with pytest.raises(RuntimeError, match="chromadb"):
+        assert (
             resolve_model_name(ModelRole.EMBEDDING)
+            == _PROVIDER_DEFAULTS["local"].embedding
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +413,9 @@ class TestExtractionAgentRole:
         assert anthropic.extraction_agent is not None
         assert "sonnet" in anthropic.extraction_agent.lower()
 
-    def test_openai_defaults_map_to_gpt5_mini(self) -> None:
+    def test_openai_defaults_map_to_gpt5(self) -> None:
         openai = _PROVIDER_DEFAULTS["openai"]
-        assert openai.extraction_agent == "gpt-5-mini"
+        assert openai.extraction_agent == "gpt-5.5"
 
     def test_claude_code_defaults_cover_extraction_agent(self) -> None:
         cc = _PROVIDER_DEFAULTS["claude-code"]
@@ -452,7 +458,7 @@ class TestMinimaxExtractionAgentRole:
         )
 
         result = _auto_detect_model(ModelRole.EXTRACTION_AGENT, providers=["minimax"])
-        assert result == "minimax/MiniMax-M2.7"
+        assert result == "minimax/MiniMax-M3"
 
 
 # ---------------------------------------------------------------------------
@@ -462,12 +468,12 @@ class TestMinimaxExtractionAgentRole:
 
 class TestMinimaxOnlyEnvRegression:
     """Reproduces the e2e regression where a fresh setup-init with only
-    MINIMAX_API_KEY in env saw the extractor pick gpt-5-mini at runtime.
+    MINIMAX_API_KEY in env saw the extractor pick gpt-5.4-mini at runtime.
 
     The contract this class locks in: when the only LLM env var in scope
     is MINIMAX_API_KEY, every generation-family role (the slots that
     profile_extractor / playbook_extractor / agent_success_evaluator
-    resolve at construction time) must resolve to ``minimax/MiniMax-M2.7``,
+    resolve at construction time) must resolve to ``minimax/MiniMax-M3``,
     not to any OpenAI default. This is the runtime expectation the
     setup-init wizard documents to MiniMax-only users.
 
@@ -483,8 +489,8 @@ class TestMinimaxOnlyEnvRegression:
         """``default_generation_model_name`` must be the MiniMax model."""
         monkeypatch.setenv("MINIMAX_API_KEY", "mm-test")
         result = resolve_model_name(ModelRole.GENERATION)
-        assert result == "minimax/MiniMax-M2.7", (
-            f"Expected minimax/MiniMax-M2.7, got {result!r}. If this fails, "
+        assert result == "minimax/MiniMax-M3", (
+            f"Expected minimax/MiniMax-M3, got {result!r}. If this fails, "
             "MiniMax-only users will hit OpenAI auth errors at extraction time."
         )
 
@@ -494,7 +500,7 @@ class TestMinimaxOnlyEnvRegression:
         """``should_run_model_name`` must also resolve to the MiniMax model."""
         monkeypatch.setenv("MINIMAX_API_KEY", "mm-test")
         result = resolve_model_name(ModelRole.SHOULD_RUN)
-        assert result == "minimax/MiniMax-M2.7"
+        assert result == "minimax/MiniMax-M3"
 
     def test_all_generation_roles_resolve_to_minimax(
         self, monkeypatch: pytest.MonkeyPatch
@@ -524,7 +530,7 @@ class TestMinimaxOnlyEnvRegression:
     ) -> None:
         """An empty ``OPENAI_API_KEY=`` placeholder line must NOT promote OpenAI.
 
-        The bundled ``.env.example`` ships with ``OPENAI_API_KEY=`` (no
+        A bundled ``.env`` template may ship ``OPENAI_API_KEY=`` (no
         value); ``load_dotenv`` interprets this as
         ``os.environ['OPENAI_API_KEY'] = ''``. ``detect_available_providers``
         relies on truthiness, so an empty string must be treated as
@@ -537,7 +543,7 @@ class TestMinimaxOnlyEnvRegression:
         assert "openai" not in providers, (
             f"Empty OPENAI_API_KEY must not promote OpenAI; got {providers}"
         )
-        assert resolve_model_name(ModelRole.GENERATION) == "minimax/MiniMax-M2.7"
+        assert resolve_model_name(ModelRole.GENERATION) == "minimax/MiniMax-M3"
 
     def test_minimax_with_chromadb_resolves_embedding_to_local(
         self, monkeypatch: pytest.MonkeyPatch

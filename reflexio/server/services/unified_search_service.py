@@ -33,10 +33,15 @@ from reflexio.models.api_schema.service_schemas import (
     UserPlaybook,
     UserProfile,
 )
-from reflexio.models.config_schema import SearchMode, SearchOptions
+from reflexio.models.config_schema import (
+    RetrievalFloorConfig,
+    SearchMode,
+    SearchOptions,
+)
 from reflexio.server.llm.litellm_client import LiteLLMClient
 from reflexio.server.prompt.prompt_manager import PromptManager
 from reflexio.server.services.pre_retrieval import QueryReformulator
+from reflexio.server.services.retrieval.relevance_floor import apply_relevance_floors
 from reflexio.server.services.storage.storage_base import BaseStorage
 from reflexio.server.tracing import profile_step, set_span_data
 
@@ -61,6 +66,7 @@ _SEARCH_FANOUT_EXECUTOR = ThreadPoolExecutor(
     max_workers=_SEARCH_FANOUT_MAX_WORKERS,
     thread_name_prefix="reflexio-search",
 )
+_ENV_SINGLE_RPC = "REFLEXIO_UNIFIED_SEARCH_SINGLE_RPC"
 _EMBEDDING_CACHE_TTL_SECONDS = max(
     0, int(os.getenv("REFLEXIO_QUERY_EMBEDDING_CACHE_TTL_SECONDS", "300") or "300")
 )
@@ -80,6 +86,7 @@ def run_unified_search(
     llm_client: LiteLLMClient,
     prompt_manager: PromptManager,
     pre_retrieval_model_name: str | None = None,
+    retrieval_floor: RetrievalFloorConfig | None = None,
 ) -> UnifiedSearchResponse:
     """
     Search across all entity types (profiles, agent playbooks, user playbooks) in parallel.
@@ -105,6 +112,10 @@ def run_unified_search(
     top_k = request.top_k if request.top_k is not None else 5
     threshold = request.threshold if request.threshold is not None else 0.3
 
+    floor_cfg = retrieval_floor or RetrievalFloorConfig()
+    floor_on = floor_cfg.enabled
+    fetch_k = max(top_k, floor_cfg.pool_size) if floor_on else top_k
+
     # --- Phase A: query reformulation + embedding generation ---
     reformulated_query, embedding = _run_phase_a(
         query=request.query,
@@ -125,12 +136,22 @@ def run_unified_search(
         storage=storage,
         embedding=embedding,
         query=reformulated_query,
-        top_k=top_k,
+        top_k=fetch_k,
         threshold=threshold,
     )
 
     if profiles is None:
         return UnifiedSearchResponse(success=False, msg="Search failed")
+
+    if floor_on:
+        profiles, agent_playbooks, user_playbooks = _apply_floors(
+            query=reformulated_query,
+            profiles=profiles,
+            agent_playbooks=agent_playbooks,  # type: ignore[arg-type]
+            user_playbooks=user_playbooks,  # type: ignore[arg-type]
+            top_k=top_k,
+            cfg=floor_cfg,
+        )
 
     return UnifiedSearchResponse(
         success=True,
@@ -246,6 +267,33 @@ def _run_phase_b(
             entity_types=sorted(entity_types),
             top_k=top_k,
         ) as span:
+            if (
+                getattr(storage, "supports_unified_hybrid_search", False)
+                and _unified_single_rpc_enabled()
+            ):
+                combined = _run_phase_b_single_rpc(
+                    request=request,
+                    storage=storage,
+                    embedding=embedding,
+                    query=query,
+                    top_k=top_k,
+                    threshold=threshold,
+                    entity_types=entity_types,
+                    allowed_agent_statuses=allowed_agent_statuses,
+                )
+                if combined is not None:
+                    profiles, agent_playbooks, user_playbooks = combined
+                    set_span_data(
+                        span,
+                        {
+                            "single_rpc": True,
+                            "profiles_count": len(profiles),
+                            "agent_playbooks_count": len(agent_playbooks),
+                            "user_playbooks_count": len(user_playbooks),
+                        },
+                    )
+                    return profiles, agent_playbooks, user_playbooks
+                span.set_data("single_rpc_fallback", True)
             profiles_future = (
                 _submit_with_current_context(
                     _SEARCH_FANOUT_EXECUTOR,
@@ -325,6 +373,107 @@ def _run_phase_b(
         return None, None, None
 
     return profiles, agent_playbooks, user_playbooks
+
+
+def _unified_single_rpc_enabled() -> bool:
+    """Kill switch for the combined Phase B RPC (default on)."""
+    return os.getenv(_ENV_SINGLE_RPC, "1").strip().lower() not in {"0", "false", "off"}
+
+
+def _run_phase_b_single_rpc(
+    *,
+    request: UnifiedSearchRequest,
+    storage: BaseStorage,
+    embedding: list[float] | None,
+    query: str,
+    top_k: int,
+    threshold: float,
+    entity_types: set[str],
+    allowed_agent_statuses: list[PlaybookStatus] | None,
+) -> tuple[list[UserProfile], list[AgentPlaybook], list[UserPlaybook]] | None:
+    """Run all Phase B arms through one combined storage round trip.
+
+    Trades the per-arm round-trip overhead for serialized execution of the
+    three queries inside one database session — a win when round-trip
+    overhead dominates per-arm query time (toggle via
+    ``REFLEXIO_UNIFIED_SEARCH_SINGLE_RPC`` to compare).
+
+    Returns:
+        The three result lists, or None when the combined call fails so the
+        caller can fall back to the per-arm fan-out (e.g. the SQL function
+        is not yet migrated on this deployment). Timeouts propagate like the
+        fan-out path so a hung database is not retried.
+    """
+    statuses = (
+        list(allowed_agent_statuses)
+        if allowed_agent_statuses
+        else list(_DEFAULT_AGENT_PLAYBOOK_STATUSES)
+    )
+    # Resolve storage.unified_hybrid_search before submit so missing or stale
+    # capability flags can fall back to the fan-out path.
+    unified_hybrid_search = getattr(storage, "unified_hybrid_search", None)
+    if not callable(unified_hybrid_search):
+        return None
+
+    future = _submit_with_current_context(
+        _SEARCH_FANOUT_EXECUTOR,
+        unified_hybrid_search,
+        query=query,
+        query_embedding=embedding,
+        top_k=top_k,
+        threshold=threshold,
+        user_id=request.user_id,
+        agent_version=request.agent_version,
+        playbook_name=request.playbook_name,
+        agent_playbook_statuses=statuses,
+        search_mode=request.search_mode,
+        include_profiles="profiles" in entity_types and bool(request.user_id),
+        include_agent_playbooks="agent_playbooks" in entity_types,
+        include_user_playbooks="user_playbooks" in entity_types,
+    )
+    try:
+        profiles, agent_playbooks, user_playbooks = future.result(timeout=30)
+    except FuturesTimeoutError:
+        raise
+    except Exception:
+        logger.warning(
+            "Unified single-RPC search failed; falling back to per-arm fan-out",
+            exc_info=True,
+        )
+        return None
+
+    # Mirror _search_agent_playbooks_via_storage: dedupe by id, cap at top_k.
+    deduped: list[AgentPlaybook] = []
+    seen_ids: set[str] = set()
+    for playbook in agent_playbooks:
+        playbook_id = str(getattr(playbook, "agent_playbook_id", ""))
+        if playbook_id and playbook_id not in seen_ids:
+            seen_ids.add(playbook_id)
+            deduped.append(playbook)
+            if len(deduped) >= top_k:
+                break
+    return profiles, deduped, user_playbooks
+
+
+def _apply_floors(
+    query: str,
+    profiles: list[UserProfile],
+    agent_playbooks: list[AgentPlaybook],
+    user_playbooks: list[UserPlaybook],
+    top_k: int,
+    cfg: RetrievalFloorConfig,
+) -> tuple[list[UserProfile], list[AgentPlaybook], list[UserPlaybook]]:
+    """Apply the per-arm relevance floor with one batched cross-encoder call."""
+    floored_profiles, floored_agent, floored_user = apply_relevance_floors(
+        query,
+        [
+            ("profiles", profiles, cfg.profile_floor),
+            ("agent_playbooks", agent_playbooks, cfg.agent_playbook_floor),
+            ("user_playbooks", user_playbooks, cfg.user_playbook_floor),
+        ],
+        top_k,
+    )
+    return floored_profiles, floored_agent, floored_user
 
 
 def _get_cached_query_embedding(
@@ -476,9 +625,10 @@ def _submit_with_current_context(
     executor: ThreadPoolExecutor,
     fn: Callable[..., object],
     *args: object,
+    **kwargs: object,
 ) -> Future[Any]:
     context = contextvars.copy_context()
-    return executor.submit(context.run, fn, *args)
+    return executor.submit(context.run, fn, *args, **kwargs)
 
 
 def _storage_backend_name(storage: BaseStorage) -> str:

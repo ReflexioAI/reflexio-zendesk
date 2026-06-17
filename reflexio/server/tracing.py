@@ -93,3 +93,66 @@ def set_span_data(span: TraceSpan, values: Mapping[str, Any]) -> None:
             span.set_data(key, value)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Tracer failed to set span data %s: %s", key, exc)
+
+
+@contextmanager
+def sentry_tags(**tags: Any) -> Iterator[None]:
+    """Attach tags to any Sentry events produced inside the block.
+
+    Used inside ``except`` handlers, immediately wrapping a
+    ``logger.exception(...)`` call, so the event auto-captured by
+    Sentry's ``LoggingIntegration`` is filterable by org / subsystem.
+
+    No-op when ``sentry-sdk`` is not installed (the OS package does not
+    declare it as a dependency; enterprise deployments pull it in).
+    Tag values that are ``None`` are skipped to avoid noisy "None" tags.
+
+    Args:
+        **tags: arbitrary tag name → value pairs. Values are stringified.
+
+    Yields:
+        None. Re-enters the active Sentry scope for the duration of the
+        ``with`` block.
+    """
+    try:
+        import sentry_sdk  # type: ignore[import-not-found]
+    except ImportError:
+        yield
+        return
+
+    # Mirrors `profile_step` above: instrumentation must never make a product
+    # request fail. If the Sentry SDK throws while opening or closing the
+    # scope, log and continue rather than letting the exception escape the
+    # caller's `with sentry_tags(...)` block and mask the original failure.
+    # `new_scope()` is the sentry-sdk >=2.0 replacement for the deprecated
+    # `push_scope()`; the AttributeError on the older 1.x SDK is caught by
+    # the broad `except` below so the helper still degrades cleanly.
+    try:
+        scope_cm = sentry_sdk.new_scope()
+        scope = scope_cm.__enter__()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to open Sentry scope for tags: %s", exc)
+        yield
+        return
+
+    for key, value in tags.items():
+        if value is None:
+            continue
+        try:
+            scope.set_tag(key, str(value))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to set Sentry tag %s: %s", key, exc)
+
+    try:
+        yield
+    except BaseException as exc:
+        try:
+            scope_cm.__exit__(type(exc), exc, exc.__traceback__)
+        except Exception as cleanup_exc:  # noqa: BLE001
+            logger.warning("Failed to close Sentry scope: %s", cleanup_exc)
+        raise
+    else:
+        try:
+            scope_cm.__exit__(None, None, None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to close Sentry scope: %s", exc)

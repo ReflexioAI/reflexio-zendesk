@@ -16,6 +16,7 @@ def disable_mock_llm_response(monkeypatch):
     monkeypatch.delenv("MOCK_LLM_RESPONSE", raising=False)
 
 
+from reflexio.models.api_schema.domain.enums import UserActionType
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.models.api_schema.service_schemas import (
     Interaction,
@@ -23,6 +24,7 @@ from reflexio.models.api_schema.service_schemas import (
     UserPlaybook,
 )
 from reflexio.models.config_schema import (
+    PendingToolCallConfig,
     PlaybookAggregatorConfig,
     PlaybookConfig,
 )
@@ -69,6 +71,9 @@ def mock_request_context():
     context.storage = MagicMock()
     # Mock get_operation_state to return None by default (no in-progress state)
     context.storage.get_operation_state.return_value = None
+    context.storage.update_agent_run_status.side_effect = (
+        lambda _run_id, status, **_kwargs: MagicMock(status=status)
+    )
     # Mock try_acquire_in_progress_lock to return success
     context.storage.try_acquire_in_progress_lock.return_value = {"acquired": True}
     # Mock get_user_playbooks to return empty list (for existing playbooks check)
@@ -85,6 +90,13 @@ def mock_request_context():
     )
     # Mock window_size for extractor
     context.configurator.get_config.return_value.window_size = 100
+    # Pin the pending-tool-call config to the real default (disabled). Without
+    # this, the auto-generated MagicMock makes the resumable-agent path think
+    # pending tools are enabled and feeds a MagicMock similarity_threshold into
+    # a numeric comparison (prior_answer_search), raising TypeError.
+    context.configurator.get_config.return_value.pending_tool_call_config = (
+        PendingToolCallConfig()
+    )
     context.prompt_manager = PromptManager()
     return context
 
@@ -110,7 +122,7 @@ def test_interactions():
             content="I need help with my account",
             role="user",
             created_at=int(datetime.now(UTC).timestamp()),
-            user_action="click",
+            user_action=UserActionType.CLICK,
             user_action_description="Clicked help button",
             interacted_image_url="https://example.com/help",
         ),
@@ -121,7 +133,7 @@ def test_interactions():
             content="Thank you for your help!",
             role="user",
             created_at=int(datetime.now(UTC).timestamp()),
-            user_action="click",
+            user_action=UserActionType.CLICK,
             user_action_description="Clicked thank you button",
             interacted_image_url="https://example.com/thank-you",
         ),
@@ -362,7 +374,7 @@ def test_playbook_message_construction_with_interactions(
             content="I need help with my account",
             role="user",
             created_at=int(datetime.now(UTC).timestamp()),
-            user_action="click",
+            user_action=UserActionType.CLICK,
             user_action_description="help button",
             interacted_image_url="https://example.com/help",
         ),
@@ -373,7 +385,7 @@ def test_playbook_message_construction_with_interactions(
             content="Thank you for your help!",
             role="user",
             created_at=int(datetime.now(UTC).timestamp()),
-            user_action="none",
+            user_action=UserActionType.NONE,
             user_action_description="",
         ),
     ]

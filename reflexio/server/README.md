@@ -54,6 +54,8 @@ Description: FastAPI backend server that processes user interactions to generate
 
 **Directory**: `api_endpoints/`
 
+**Detailed Documentation**: See [`api_endpoints/README.md`](api_endpoints/README.md) for the `RequestContext` contract and per-file handler map.
+
 | File | Purpose |
 |------|---------|
 | `request_context.py` | RequestContext (bundles org_id, storage, configurator, prompt_manager) |
@@ -77,7 +79,7 @@ Description: FastAPI backend server that processes user interactions to generate
 - **Operations/admin**: `GET /api/get_operation_status`, `POST /api/cancel_operation`, `POST /api/admin/cache/invalidate`, `DELETE /api/delete_interaction`, `DELETE /api/delete_request`, `DELETE /api/delete_session`, `DELETE /api/delete_requests_by_ids`, `DELETE /api/delete_all_interactions`, `POST /api/clear_user_data`
 - **Human clarification/stall state**: `GET /api/pending_tool_calls`, `GET /api/pending_tool_calls/{pending_tool_call_id}`, `POST /api/pending_tool_calls/{pending_tool_call_id}/resolve`, `PATCH /api/pending_tool_calls/{pending_tool_call_id}/answer`, `POST /api/pending_tool_calls/{pending_tool_call_id}/not_applicable`, `POST /api/pending_tool_calls/{pending_tool_call_id}/cancel`, `GET /api/stall_state`, `POST /api/stall_state/notified`
 
-**Authentication Pattern**: The open-source app uses `default_get_org_id` and `DEFAULT_ORG_ID` for local/no-auth starts. Enterprise wraps `create_app()` in `reflexio_ext/server/api.py` with authenticated org resolution, login/OAuth/account/share/waitlist routers, admin checks, Sentry tracing, and usage metrics.
+**Authentication Pattern**: The open-source app uses `default_get_org_id` and `DEFAULT_ORG_ID` for local/no-auth starts. The enterprise extension wraps `create_app()` with authenticated org resolution, login/OAuth/account/share/waitlist routers, admin checks, Sentry tracing, and usage metrics.
 
 **Pattern**: Core route handlers call `Reflexio` through `get_reflexio(org_id)`; endpoint helper files should not instantiate `Reflexio` directly.
 
@@ -171,6 +173,8 @@ python -m reflexio.server.scripts.manage_invitation_codes list --show-used
 ## Services
 
 **Directory**: `services/`
+
+**Detailed Documentation**: See [`services/README.md`](services/README.md) for the per-directory file index across generation, evaluation, async extraction, search, and persistence.
 
 **Service Boundary**: The service layer owns LLM orchestration, extraction, evaluation, optimization, search preparation, storage access, and long-running operation state. API endpoints should validate/authenticate requests, build `RequestContext`, and delegate into `Reflexio` or focused service helpers rather than embedding business logic.
 
@@ -414,7 +418,7 @@ Key files:
 - `shadow_comparison/judge.py`: Per-turn regular-vs-shadow judge that writes shadow verdicts through storage
 - `shadow_comparison/outcome.py`: Verdict outcome model helpers
 - `evaluation_overview/service.py`: Aggregates evaluation-page metrics
-- `evaluation_overview/hero_state.py`, `distribution.py`, `group_aggregation.py`, `rule_attribution.py`, `shadow_aggregation.py`: Focused aggregation helpers
+- `evaluation_overview/hero_state.py`, `distribution.py`, `rule_attribution.py`, `shadow_aggregation.py`: Focused aggregation helpers
 
 **Pattern**: Session-level agent success evaluation remains in `agent_success_evaluation/`; dashboard-facing rollups and per-turn shadow verdict analysis live in these companion directories.
 
@@ -614,6 +618,8 @@ All services follow BaseGenerationService:
 ## See Also
 
 - [Code Map (root README)](../README.md) -- high-level overview of all Reflexio components
+- [API Endpoints README](api_endpoints/README.md) -- RequestContext contract and handler/helper map
+- [Services README](services/README.md) -- per-directory index of the business-logic layer
 - [Prompt Bank README](prompt/prompt_bank/README.md) -- versioned prompt template system
 - [Playbook Service README](services/playbook/README.md) -- playbook extraction, aggregation, and deduplication pipeline
 - [Site Variables README](site_var/README.md) -- global configuration and feature flags

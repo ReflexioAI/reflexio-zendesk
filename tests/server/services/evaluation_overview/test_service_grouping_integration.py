@@ -1,16 +1,10 @@
-"""Integration tests for the F2 group-by aggregation wired into
-EvaluationOverviewService.run().
+"""Integration tests for source-set comparison in EvaluationOverviewService.
 
-The service must:
-- Look up each session's first Request and read its metadata.
-- Bucket session outcomes by the metadata's reflexio_retrieval_enabled value.
-- Populate success_rate_trend_by_group on the response.
-
-Uses a real SQLite storage in a temp dir (no mocks) so the join between
-eval results and the requests table is exercised end-to-end. The
-``_get_embedding`` call on the SQLite backend is patched out — without
-it, ``save_agent_success_evaluation_results`` would try to hit a real
-LLM endpoint just to embed the (empty) failure text.
+Uses a real SQLite storage in a temp dir (no mocks) so the join between eval
+results and the requests table is exercised end-to-end. The ``_get_embedding``
+call on the SQLite backend is patched out — without it,
+``save_agent_success_evaluation_results`` would try to hit a real LLM endpoint
+just to embed the (empty) failure text.
 """
 
 from __future__ import annotations
@@ -26,6 +20,7 @@ from reflexio.models.api_schema.domain.entities import (
     Request,
 )
 from reflexio.models.api_schema.eval_overview_schema import (
+    EvaluationSourceSetRequest,
     GetEvaluationOverviewRequest,
 )
 from reflexio.models.config_schema import Config, StorageConfigSQLite
@@ -55,19 +50,20 @@ def _seed_session(
     session_id: str,
     ts: int,
     is_success: bool,
-    metadata: dict,
     user_id: str = "u1",
+    source: str = "test",
+    evaluation_only: bool = False,
 ) -> None:
-    """Add one Request (carrying metadata) and one eval result for the session."""
+    """Add one Request and one eval result for the session."""
     storage.add_request(
         Request(
             request_id=f"req-{session_id}",
             user_id=user_id,
             created_at=ts,
-            source="test",
+            source=source,
             agent_version="v1",
             session_id=session_id,
-            metadata=metadata,
+            evaluation_only=evaluation_only,
         )
     )
     storage.save_agent_success_evaluation_results(
@@ -83,16 +79,12 @@ def _seed_session(
     )
 
 
-def test_run_produces_three_curves_with_correct_n_and_rate(
+def test_run_exposes_available_sources_from_first_session_request(
     storage: SQLiteStorage,
 ) -> None:
     base_ts = 1_700_000_000
-    _seed_session(storage, "s1", base_ts, True, {"reflexio_retrieval_enabled": True})
-    _seed_session(storage, "s2", base_ts, True, {"reflexio_retrieval_enabled": True})
-    _seed_session(storage, "s3", base_ts, False, {"reflexio_retrieval_enabled": True})
-    _seed_session(storage, "s4", base_ts, True, {"reflexio_retrieval_enabled": False})
-    _seed_session(storage, "s5", base_ts, False, {"reflexio_retrieval_enabled": False})
-    _seed_session(storage, "s6", base_ts, True, {})
+    _seed_session(storage, "s1", base_ts, True, source="baseline")
+    _seed_session(storage, "s2", base_ts, False, source="")
 
     service = EvaluationOverviewService(
         storage=storage, config=Config(storage_config=StorageConfigSQLite())
@@ -101,49 +93,88 @@ def test_run_produces_three_curves_with_correct_n_and_rate(
         GetEvaluationOverviewRequest(from_ts=base_ts - 1, to_ts=base_ts + 1)
     )
 
-    g = response.success_rate_trend_by_group
-    assert len(g.treatment) == 1
-    assert g.treatment[0].n == 3
-    assert abs(g.treatment[0].rate - (2 / 3)) < 1e-9
-
-    assert len(g.control) == 1
-    assert g.control[0].n == 2
-    assert g.control[0].rate == 0.5
-
-    assert len(g.untagged) == 1
-    assert g.untagged[0].n == 1
-    assert g.untagged[0].rate == 1.0
+    assert response.source_set_comparison.available_sources == ["", "baseline"]
+    assert response.source_set_comparison.sets == []
+    assert response.source_set_comparison.unmatched_session_count == 0
 
 
-def test_run_untagged_only_falls_back_to_empty_treatment_control(
+def test_run_computes_source_set_metrics_by_first_request_source(
     storage: SQLiteStorage,
 ) -> None:
     base_ts = 1_700_000_000
-    _seed_session(storage, "s1", base_ts, True, {})
-    _seed_session(storage, "s2", base_ts, False, {})
+    _seed_session(storage, "s1", base_ts, True, source="baseline")
+    _seed_session(storage, "s2", base_ts, False, source="baseline")
+    _seed_session(storage, "s3", base_ts, True, source="candidate")
+    _seed_session(storage, "s4", base_ts, True, source="other")
+    storage.add_request(
+        Request(
+            request_id="req-s3-later",
+            user_id="u1",
+            created_at=base_ts + 1,
+            source="baseline",
+            agent_version="v1",
+            session_id="s3",
+        )
+    )
 
     service = EvaluationOverviewService(
         storage=storage, config=Config(storage_config=StorageConfigSQLite())
     )
     response = service.run(
-        GetEvaluationOverviewRequest(from_ts=base_ts - 1, to_ts=base_ts + 1)
+        GetEvaluationOverviewRequest(
+            from_ts=base_ts - 1,
+            to_ts=base_ts + 2,
+            source_sets=[
+                EvaluationSourceSetRequest(label="Baseline", sources=["baseline"]),
+                EvaluationSourceSetRequest(label="Candidate", sources=["candidate"]),
+            ],
+        )
     )
 
-    g = response.success_rate_trend_by_group
-    assert g.treatment == []
-    assert g.control == []
-    assert len(g.untagged) == 1
-    assert g.untagged[0].n == 2
+    comparison = response.source_set_comparison
+    assert comparison.available_sources == ["baseline", "candidate", "other"]
+    assert comparison.unmatched_session_count == 1
+
+    by_label = {row.label: row for row in comparison.sets}
+    assert by_label["Baseline"].session_count == 2
+    assert by_label["Baseline"].session_ids == ["s1", "s2"]
+    assert by_label["Baseline"].success_rate_pp == 50.0
+    assert by_label["Baseline"].context_tiles.success.current == 50.0
+
+    assert by_label["Candidate"].session_count == 1
+    assert by_label["Candidate"].session_ids == ["s3"]
+    assert by_label["Candidate"].success_rate_pp == 100.0
 
 
-def test_run_no_sessions_returns_empty_group_trend(
+def test_run_source_set_includes_evaluation_only_requests(
     storage: SQLiteStorage,
 ) -> None:
+    base_ts = 1_700_000_000
+    _seed_session(
+        storage,
+        "s1",
+        base_ts,
+        True,
+        source="eval_only_source",
+        evaluation_only=True,
+    )
+
     service = EvaluationOverviewService(
         storage=storage, config=Config(storage_config=StorageConfigSQLite())
     )
-    response = service.run(GetEvaluationOverviewRequest(from_ts=0, to_ts=1))
-    g = response.success_rate_trend_by_group
-    assert g.treatment == []
-    assert g.control == []
-    assert g.untagged == []
+    response = service.run(
+        GetEvaluationOverviewRequest(
+            from_ts=base_ts - 1,
+            to_ts=base_ts + 1,
+            source_sets=[
+                EvaluationSourceSetRequest(
+                    label="Eval only", sources=["eval_only_source"]
+                )
+            ],
+        )
+    )
+
+    row = response.source_set_comparison.sets[0]
+    assert row.session_count == 1
+    assert row.session_ids == ["s1"]
+    assert row.success_rate_pp == 100.0

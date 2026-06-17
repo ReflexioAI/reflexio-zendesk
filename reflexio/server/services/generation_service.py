@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import logging
 import os
 import threading
@@ -48,6 +49,7 @@ from reflexio.server.services.storage.retention import (
     delete_count_for_retention,
     get_row_retention_limits,
 )
+from reflexio.server.tracing import sentry_tags
 from reflexio.server.usage_metrics import record_usage_event
 
 if TYPE_CHECKING:
@@ -76,6 +78,15 @@ def _retention_cleanup_interval_seconds() -> float:
 _RETENTION_CLEANUP_INTERVAL_SECONDS = _retention_cleanup_interval_seconds()
 _retention_cleanup_last_run: dict[tuple[str, str], float] = {}
 _retention_cleanup_lock = threading.Lock()
+
+
+def _stable_group_sampling_fraction(
+    org_id: str, user_id: str, session_id: str
+) -> float:
+    """Return a deterministic [0, 1) sample value for one session."""
+    key = f"{org_id}\0{user_id}\0{session_id}".encode()
+    digest = hashlib.sha256(key).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
 
 
 @dataclass
@@ -171,9 +182,19 @@ class GenerationService:
         )
 
         try:
-            # Always generate a new UUID for request_id
-            request_id = str(uuid.uuid4())
+            caller_request_id = publish_user_interaction_request.request_id
+            request_id = (
+                caller_request_id
+                if caller_request_id is not None
+                else str(uuid.uuid4())
+            )
             result.request_id = request_id
+
+            if (
+                caller_request_id is not None
+                and self.storage.get_request(request_id) is not None  # type: ignore[reportOptionalMemberAccess]
+            ):
+                raise ValueError(f"request_id {request_id!r} already exists")
 
             new_interactions: list[Interaction] = (
                 GenerationService.get_interaction_from_publish_user_interaction_request(
@@ -193,7 +214,7 @@ class GenerationService:
                 org_id=self.org_id,
                 user_id=user_id,
                 request_id=request_id,
-                session_id=publish_user_interaction_request.session_id or None,
+                session_id=publish_user_interaction_request.session_id,
                 source=publish_user_interaction_request.source,
                 agent_version=agent_version,
                 event_name="publish_request_received",
@@ -202,16 +223,15 @@ class GenerationService:
                 count_value=len(new_interactions),
             )
 
-            # Store Request — propagate customer-stamped metadata so the
-            # eval pipeline (e.g. F2 sticky-group aggregator) can read it
-            # back from the first request of each session.
+            # Store Request before adding interactions so downstream workers can
+            # resolve the session's source and evaluation-only status.
             new_request = Request(
                 request_id=request_id,
                 user_id=user_id,
                 source=publish_user_interaction_request.source,
                 agent_version=agent_version,
-                session_id=publish_user_interaction_request.session_id or None,
-                metadata=publish_user_interaction_request.metadata,
+                session_id=publish_user_interaction_request.session_id,
+                evaluation_only=publish_user_interaction_request.evaluation_only,
             )
             self.storage.add_request(new_request)  # type: ignore[reportOptionalMemberAccess]
 
@@ -222,6 +242,33 @@ class GenerationService:
 
             # Extract source (empty string treated as None)
             source = publish_user_interaction_request.source or None
+
+            if publish_user_interaction_request.evaluation_only:
+                self._schedule_group_evaluation_if_needed(
+                    new_request=new_request,
+                    user_id=user_id,
+                    agent_version=agent_version,
+                    source=source,
+                )
+                record_usage_event(
+                    org_id=self.org_id,
+                    user_id=user_id,
+                    request_id=request_id,
+                    session_id=new_request.session_id,
+                    source=source,
+                    agent_version=agent_version,
+                    backend="evaluation_only",
+                    event_name="publish_request_succeeded",
+                    event_category="publish",
+                    outcome="success",
+                    count_value=len(new_interactions),
+                    duration_ms=int((time.perf_counter() - publish_start) * 1000),
+                    metadata={
+                        "evaluation_only": True,
+                        "warning_count": len(result.warnings),
+                    },
+                )
+                return result
 
             if (
                 not publish_user_interaction_request.override_learning_stall
@@ -308,21 +355,31 @@ class GenerationService:
                         future.result(timeout=GENERATION_SERVICE_TIMEOUT_SECONDS)
                     except FuturesTimeoutError:  # noqa: PERF203
                         msg = f"{service_name} timed out after {GENERATION_SERVICE_TIMEOUT_SECONDS}s"
-                        logger.error("%s for request %s", msg, request_id)
+                        with sentry_tags(
+                            subsystem="generation",
+                            service=service_name,
+                            request_id=request_id,
+                            error_type="timeout",
+                        ):
+                            logger.error("%s for request %s", msg, request_id)
                         result.warnings.append(msg)
                     except Exception as e:
                         msg = f"{service_name} failed: {e}"
-                        logger.error(
-                            "Generation service failed for request %s: %s, exception type: %s",
-                            request_id,
-                            str(e),
-                            type(e).__name__,
-                        )
+                        with sentry_tags(
+                            subsystem="generation",
+                            service=service_name,
+                            request_id=request_id,
+                            error_type=type(e).__name__,
+                        ):
+                            logger.exception(
+                                "Generation service failed for request %s",
+                                request_id,
+                            )
                         result.warnings.append(msg)
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
 
-            # Schedule delayed group evaluation if session_id is present
+            # Schedule delayed group evaluation for the required session.
             self._schedule_group_evaluation_if_needed(
                 new_request=new_request,
                 user_id=user_id,
@@ -352,7 +409,7 @@ class GenerationService:
                 org_id=self.org_id,
                 user_id=user_id,
                 request_id=result.request_id,
-                session_id=publish_user_interaction_request.session_id or None,
+                session_id=publish_user_interaction_request.session_id,
                 source=publish_user_interaction_request.source,
                 agent_version=agent_version,
                 event_name="publish_request_failed",
@@ -361,14 +418,19 @@ class GenerationService:
                 duration_ms=int((time.perf_counter() - publish_start) * 1000),
                 error_kind=type(e).__name__,
             )
-            # log exception
-            logger.error(
-                "Failed to refresh user profile for user id: %s due to %s, exception type: %s",
-                user_id,
-                e,
-                type(e).__name__,
-            )
-            raise e
+            with sentry_tags(
+                subsystem="generation",
+                op="refresh_profile",
+                org_id=self.org_id,
+                user_id=user_id,
+                request_id=result.request_id,
+                error_type=type(e).__name__,
+            ):
+                logger.exception(
+                    "Failed to refresh user profile for user id: %s",
+                    user_id,
+                )
+            raise
 
     # ===============================
     # private methods
@@ -382,7 +444,7 @@ class GenerationService:
         agent_version: str,
         source: str | None,
     ) -> None:
-        """Enqueue agent-success evaluation for this session, if session_id is set.
+        """Enqueue agent-success evaluation for this session.
 
         Must be called once per publish — from BOTH the classic and the agentic
         extraction code paths — so that ``AgentSuccessEvaluationResult`` records
@@ -391,13 +453,20 @@ class GenerationService:
 
         Args:
             new_request (Request): The just-stored request whose session is being
-                published into. ``new_request.session_id`` gates scheduling.
+                published into.
             user_id (str): The user owning the session.
             agent_version (str): Agent version string carried into the evaluator.
             source (str | None): Optional source label.
         """
         session_id = new_request.session_id
-        if not session_id:
+        if not self._should_sample_group_evaluation(
+            user_id=user_id, session_id=session_id
+        ):
+            logger.info(
+                "Skipping group evaluation scheduling for unsampled session=%s user=%s",
+                session_id,
+                user_id,
+            )
             return
 
         scheduler = GroupEvaluationScheduler.get_instance()
@@ -438,6 +507,23 @@ class GenerationService:
             ),
         )
 
+    def _should_sample_group_evaluation(self, *, user_id: str, session_id: str) -> bool:
+        config = self.configurator.get_config()
+        agent_success_config = getattr(config, "agent_success_config", None)
+        if agent_success_config is None:
+            return False
+
+        sampling_rate = agent_success_config.sampling_rate
+        if sampling_rate >= 1.0:
+            return True
+        if sampling_rate <= 0.0:
+            return False
+
+        return (
+            _stable_group_sampling_fraction(self.org_id, user_id, session_id)
+            < sampling_rate
+        )
+
     def _maybe_run_reflection(
         self, *, user_id: str, agent_version: str, source: str | None
     ) -> None:
@@ -459,12 +545,18 @@ class GenerationService:
                 )
             )
         except Exception as exc:  # noqa: BLE001 — must not break publish
-            logger.warning(
-                "reflection step failed for user %s: %s (error_type=%s)",
-                user_id,
-                exc,
-                type(exc).__name__,
-            )
+            # Promoted to logger.exception so Sentry's LoggingIntegration
+            # captures the event. The except still doesn't re-raise — the
+            # publish loop continues — but on-call now sees the failure
+            # instead of it being buried at WARNING level.
+            with sentry_tags(
+                subsystem="generation",
+                op="reflection",
+                org_id=self.org_id,
+                user_id=user_id,
+                error_type=type(exc).__name__,
+            ):
+                logger.exception("reflection step failed for user %s", user_id)
 
     def _cleanup_storage_tables_if_needed(self) -> None:
         """Best-effort publish-boundary cleanup for capped storage tables."""
@@ -493,16 +585,28 @@ class GenerationService:
                     try:
                         self._cleanup_retention_target(target_name, limit)
                     except Exception as e:  # noqa: BLE001
-                        logger.error(
-                            "Failed to cleanup retention target %s: %s",
-                            target_name,
-                            e,
-                        )
+                        with sentry_tags(
+                            subsystem="generation",
+                            op="cleanup_retention_target",
+                            org_id=self.org_id,
+                            target_name=target_name,
+                            error_type=type(e).__name__,
+                        ):
+                            logger.exception(
+                                "Failed to cleanup retention target %s",
+                                target_name,
+                            )
             finally:
                 mgr.release_simple_lock()
 
         except Exception as e:
-            logger.error("Failed to cleanup storage tables: %s", e)
+            with sentry_tags(
+                subsystem="generation",
+                op="cleanup_storage_tables",
+                org_id=self.org_id,
+                error_type=type(e).__name__,
+            ):
+                logger.exception("Failed to cleanup storage tables")
             # Don't raise - cleanup failure shouldn't block normal operation
 
     def _should_check_retention_target(self, target_name: str, now: float) -> bool:

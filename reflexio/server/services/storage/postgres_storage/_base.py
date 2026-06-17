@@ -33,7 +33,10 @@ from reflexio.server.llm.model_defaults import ModelRole, resolve_model_name
 from reflexio.server.llm.providers.embedding_service_provider import (
     EmbeddingUnavailableError,
 )
-from reflexio.server.services.storage.error import StorageError
+from reflexio.server.services.storage.error import (
+    StorageError,
+    require_non_empty_session_id,
+)
 from reflexio.server.services.storage.postgres_storage._migration_utils import (
     check_migration_needed as _check_migration_needed,
 )
@@ -71,7 +74,7 @@ def _rows(response: Any) -> list[dict[str, Any]]:
 
 
 _PROFILE_COLUMNS = "profile_id, user_id, content, last_modified_timestamp, generated_from_request_id, profile_time_to_live, expiration_timestamp, custom_features, created_at, source, status, extractor_names, source_span, notes, reader_angle"
-_INTERACTION_COLUMNS = "interaction_id, user_id, content, request_id, created_at, role, user_action, user_action_description, interacted_image_url, shadow_content, expert_content, tools_used"
+_INTERACTION_COLUMNS = "interaction_id, user_id, content, request_id, created_at, role, user_action, user_action_description, interacted_image_url, shadow_content, expert_content, tools_used, citations"
 _REQUEST_COLUMNS = "request_id, user_id, created_at, source, agent_version, session_id"
 _USER_PLAYBOOK_COLUMNS = 'user_playbook_id, user_id, playbook_name, created_at, request_id, agent_version, content, "trigger", rationale, blocking_issue, status, source, source_interaction_ids, source_span, notes, reader_angle'
 _USER_PLAYBOOK_COLUMNS_WITH_EMBEDDING = _USER_PLAYBOOK_COLUMNS + ", embedding"
@@ -130,7 +133,7 @@ def _parse_rpc_row_to_request(row: dict[str, Any]) -> Request:
         created_at=int(datetime.fromisoformat(row["request_created_at"]).timestamp()),
         source=row.get("request_source") or "",
         agent_version=row.get("request_agent_version") or "",
-        session_id=row.get("session_id"),
+        session_id=require_non_empty_session_id(row.get("session_id")),
     )
 
 

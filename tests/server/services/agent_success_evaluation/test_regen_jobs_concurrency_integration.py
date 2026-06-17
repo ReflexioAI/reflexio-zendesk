@@ -68,7 +68,6 @@ def _seed(storage: SQLiteStorage, session_id: str, ts: int) -> None:
             source="test",
             agent_version="v1",
             session_id=session_id,
-            metadata={"reflexio_retrieval_enabled": True},
         )
     )
     storage.save_agent_success_evaluation_results(
@@ -120,7 +119,6 @@ def test_run_regen_bounds_concurrent_inflight(
     job = RegenJob(
         job_id="j1",
         org_id="0",
-        evaluation_name="overall",
         from_ts=ts - 1,
         to_ts=ts + 1,
         status="running",
@@ -204,7 +202,6 @@ def test_run_regen_cancel_under_concurrency_drops_cancelled_from_counters(
     job = RegenJob(
         job_id="j-cancel",
         org_id="0",
-        evaluation_name="overall",
         from_ts=ts - 1,
         to_ts=ts + 1,
         status="running",

@@ -135,12 +135,14 @@ def sample_request_interaction_models(sample_interactions):
     request1 = Request(
         request_id="req1",
         user_id="user1",
+        session_id="test_session",
         created_at=1000,
         source="api",
     )
     request2 = Request(
         request_id="req2",
         user_id="user2",
+        session_id="test_session",
         created_at=1002,
         source="api",
     )
@@ -899,7 +901,8 @@ class TestBuildUserPlaybook:
         assert result is not None
         assert result.trigger == "processing external data"
         assert result.content == "validate inputs before processing"
-        assert result.playbook_name == extractor_config.extractor_name
+        # Singleton extraction: playbook_name is always the singleton constant.
+        assert result.playbook_name == "playbook"
 
     def test_returns_none_for_entry_without_content(
         self,
@@ -1051,7 +1054,8 @@ class TestBuildUserPlaybook:
             "agent provides a factual correction during debugging",
         }
         assert all(p.source_interaction_ids == [1, 2, 3] for p in result)
-        assert all(p.playbook_name == extractor_config.extractor_name for p in result)
+        # Singleton extraction: playbook_name is always the singleton constant.
+        assert all(p.playbook_name == "playbook" for p in result)
 
     def test_mock_mode_routes_through_process_structured_response_list(
         self,

@@ -4,10 +4,13 @@ Verifies the load-bearing invariant of the reflection-extraction-polarity
 feature at the consolidator boundary:
 
 When an EXISTING positive ``UserPlaybook`` collides with a NEW
-failure-path-derived NEGATIVE candidate on the same trigger, the
-consolidator MUST route the pair through a contradiction-aware decision
-(``UnifyDecision`` carrying the polarity the NEW evidence justifies,
-``RejectNewDecision``, or ``DifferentiateDecision``). After the
+failure-path-derived NEGATIVE candidate on the same trigger (a
+same-situation contradiction), the consolidator MUST route the pair
+through a contradiction-aware decision (``RejectNewDecision`` or
+``DifferentiateDecision``) and MUST NOT ``unify`` them into one
+self-contradicting skill. Under Option B (consolidator-compose) this
+no-self-contradiction judgment is made by the LLM in the consolidation
+prompt, not by a mechanical apply-time polarity validator. After the
 generation-service apply path runs (``delete_user_playbooks_by_ids``
 followed by ``save_user_playbooks``), storage MUST NOT contain two
 current rows on the same trigger with opposing polarity — the two rules
@@ -28,13 +31,14 @@ short-circuited:
   memory. Extractor-side polarity threading is covered exhaustively by
   C3/D6 integration tests.
 * Phase 2 (consolidation): the real ``PlaybookConsolidator`` is invoked
-  with a scripted LLM response covering each of the three allowed
-  resolutions of the contradiction pair under the 4-kind redesign:
-  ``RejectNewDecision`` (the existing positive wins),
+  with a scripted LLM response covering the LLM-driven resolutions of a
+  same-situation contradiction pair under Option B:
+  ``RejectNewDecision`` (the existing positive wins) and
   ``DifferentiateDecision`` (the two rules refine onto disjoint
-  triggers), and a forbidden ``UnifyDecision`` with mismatched polarity
-  (rejected by the apply-layer polarity validator). The forbidden case
-  is the structural linchpin guard the 4-kind redesign buys.
+  triggers). The LLM must NOT ``unify`` a same-situation contradiction
+  (that would make the skill self-contradict); the apply layer no longer
+  enforces a mechanical polarity validator, so the guarantee is now
+  LLM-judged.
 * Phase 3 (apply): the generation-service apply flow
   (``delete_user_playbooks_by_ids`` → ``save_user_playbooks``) is
   replicated, then storage is queried directly.
@@ -58,12 +62,21 @@ from reflexio.server.services.playbook.playbook_consolidator import (
     PlaybookConsolidationOutput,
     PlaybookConsolidator,
     RejectNewDecision,
-    UnifyDecision,
 )
 from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
 from reflexio.server.services.storage.storage_base import BaseStorage
 
 pytestmark = pytest.mark.e2e
+
+
+def _is_avoidance(content: str) -> bool:
+    """Local wording check: does this row read as negative/avoidance advice?
+
+    Trivial fixture-wording predicate over the test's controlled (mocked/
+    seeded) content — NOT a general polarity classifier. Orientation here is
+    purely a wording convention; negative rows are phrased as avoidance.
+    """
+    return content.lstrip().startswith(("Avoid", "Do not", "Don't", "Never"))
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +176,6 @@ def _seed_positive_playbook(
         content="Recommend product X — past sessions showed strong interest.",
         trigger=trigger,
         rationale="Earlier session ended in a successful conversion on X.",
-        polarity="positive",
         source="api",
         source_interaction_ids=[],
     )
@@ -203,7 +215,6 @@ def _build_failure_path_negative_candidate(
         content="Avoid suggesting product X — the user said no twice today.",
         trigger=trigger,
         rationale="User pushed back: 'Stop suggesting X, I told you no twice.'",
-        polarity="negative",
         source="api",
         source_interaction_ids=[],
     )
@@ -289,16 +300,16 @@ def _assert_no_opposing_polarity_on_same_trigger(
         AssertionError: If any two surviving rows share a non-empty
             trigger but disagree on polarity.
     """
-    triggers_seen: dict[str, set[str]] = {}
+    triggers_seen: dict[str, set[bool]] = {}
     for pb in surviving:
         if pb.trigger is None:
             continue
-        polarities = triggers_seen.setdefault(pb.trigger, set())
-        polarities.add(pb.polarity)
-    for trigger, polarities in triggers_seen.items():
-        assert polarities <= {"positive"} or polarities <= {"negative"}, (
+        orientations = triggers_seen.setdefault(pb.trigger, set())
+        orientations.add(_is_avoidance(pb.content))
+    for trigger, orientations in triggers_seen.items():
+        assert len(orientations) <= 1, (
             f"contradiction-resolution invariant violated: trigger {trigger!r} "
-            f"has surviving rows with polarities {polarities}"
+            f"has surviving rows that mix avoidance and non-avoidance wording"
         )
 
 
@@ -334,16 +345,17 @@ def test_existing_positive_plus_failure_path_resolves_via_reject_new(
 
     # Phase 1 — extraction stand-in: seed the existing positive playbook.
     existing = _seed_positive_playbook(storage, user_id=user_id, trigger=trigger)
-    assert existing.polarity == "positive", (
-        f"Setup failure — seeded playbook must be positive; got {existing.polarity!r}"
+    assert existing.content.lstrip().startswith("Recommend"), (
+        "Setup failure — seeded playbook must use positive (Recommend) wording; "
+        f"got {existing.content!r}"
     )
 
     # Phase 1 (cont.) — construct the failure-path negative candidate on
     # the same trigger.
     candidate = _build_failure_path_negative_candidate(user_id=user_id, trigger=trigger)
-    assert candidate.polarity == "negative", (
-        "Setup failure — failure-path candidate must be negative; "
-        f"got {candidate.polarity!r}"
+    assert candidate.content.lstrip().startswith("Avoid"), (
+        "Setup failure — failure-path candidate must use avoidance wording; "
+        f"got {candidate.content!r}"
     )
 
     # Phase 2 — drive the real consolidator with a ``RejectNewDecision``.
@@ -369,8 +381,7 @@ def test_existing_positive_plus_failure_path_resolves_via_reject_new(
         f"reject_new must NOT archive the existing row; got {archive_ids!r}"
     )
     assert rows == [], (
-        f"reject_new must NOT emit any new row; got "
-        f"{[(r.content, r.polarity) for r in rows]}"
+        f"reject_new must NOT emit any new row; got {[r.content for r in rows]}"
     )
 
     # Phase 3 — apply to storage and inspect the post-state directly.
@@ -380,13 +391,13 @@ def test_existing_positive_plus_failure_path_resolves_via_reject_new(
     # Storage post-state: the seeded positive row is still the only row.
     assert len(surviving) == 1, (
         "exactly one row must survive reject_new resolution; got "
-        f"{[(r.user_playbook_id, r.content, r.polarity) for r in surviving]}"
+        f"{[(r.user_playbook_id, r.content) for r in surviving]}"
     )
     survivor = surviving[0]
     assert survivor.user_playbook_id == existing.user_playbook_id, (
         "surviving row must be the original existing playbook"
     )
-    assert survivor.polarity == "positive"
+    assert survivor.content.lstrip().startswith("Recommend")
     assert survivor.trigger == trigger
     assert survivor.content == existing.content
 
@@ -398,66 +409,65 @@ def test_existing_positive_plus_failure_path_resolves_via_reject_new(
     _assert_no_opposing_polarity_on_same_trigger(surviving)
 
 
-def test_existing_positive_plus_failure_path_rejects_mismatched_polarity_unify(
+def test_existing_positive_plus_failure_path_does_not_self_contradict_via_unify(
     request_context: RequestContext,
     consolidator: PlaybookConsolidator,
 ):
-    """A ``unify`` archiving an opposite-polarity EXISTING is rejected by the validator.
+    """A same-situation contradiction is resolved by the LLM's decision kind, not ``unify``.
 
-    If the LLM mis-emits a ``UnifyDecision`` that archives an EXISTING
-    positive row while declaring ``polarity="negative"``, the apply-layer
-    polarity validator raises ``ConsolidationContractError`` and the
-    per-decision isolation in ``_build_deduplicated_results`` bumps the
-    failed counter while suppressing the safety fallback for the orphan
-    candidate. Storage is unchanged: the existing positive row remains,
-    and the negative candidate is NOT silently inserted as an opposing
-    twin. This is the structural linchpin of the 4-kind redesign.
+    Under Option B (consolidator-compose) the no-self-contradiction guard
+    moved from a mechanical apply-time polarity validator to the
+    consolidation prompt: the LLM must NOT route a same-trigger
+    opposite-advice pair through ``unify`` (that would make the skill
+    contradict itself on the same situation) and instead chooses
+    ``reject_new`` (or ``differentiate``). This test drives the LLM-reported
+    ``reject_new`` resolution and asserts the load-bearing post-state
+    invariant: storage never holds two current rows on the same trigger with
+    opposing polarity. The mechanical guarantee is now LLM-judged (expected
+    per Option B).
     """
     storage = request_context.storage
     assert storage is not None, "RequestContext must provide SQLite storage"
-    user_id = "u_contradiction_unify_reject"
+    user_id = "u_contradiction_no_self_contradict"
     trigger = "when user asks about product X"
 
     existing = _seed_positive_playbook(storage, user_id=user_id, trigger=trigger)
     candidate = _build_failure_path_negative_candidate(user_id=user_id, trigger=trigger)
 
+    # The LLM judges the pair a same-situation contradiction and routes it
+    # through ``reject_new`` rather than self-contradicting via ``unify``.
     rows, archive_ids = _drive_consolidator(
         consolidator,
         candidates=[candidate],
         existing_playbooks=[existing],
         decisions=[
-            UnifyDecision(
+            RejectNewDecision(
                 new_id="NEW-0",
-                archive_existing_ids=[0],
-                content=candidate.content,
-                trigger=trigger,
-                rationale="LLM mis-merged opposite-polarity pair",
-                polarity="negative",
+                superseded_by_existing_id=existing.user_playbook_id,
+                reason="same-situation contradiction — prior positive rule wins",
             )
         ],
     )
 
-    # The polarity validator refused: no row emitted, no archive.
+    # reject_new is a pure no-op: no row emitted, no archive.
     assert rows == [], (
-        f"polarity mismatch must NOT produce a unified row; got "
-        f"{[(r.content, r.polarity) for r in rows]}"
+        f"reject_new must NOT produce a row; got {[r.content for r in rows]}"
     )
     assert archive_ids == [], (
-        f"polarity mismatch must NOT archive the existing row; got {archive_ids!r}"
+        f"reject_new must NOT archive the existing row; got {archive_ids!r}"
     )
 
     _apply_to_storage(storage, rows, archive_ids)
     surviving = storage.get_user_playbooks(user_id=user_id)
 
     # Storage post-state: the seeded positive row remains, and the negative
-    # candidate did NOT leak in via the safety fallback (the contract-error
-    # path marks the orphan handled).
+    # candidate did NOT leak in via the safety fallback.
     assert len(surviving) == 1, (
-        "exactly one row must survive polarity-mismatch rejection; got "
-        f"{[(r.user_playbook_id, r.content, r.polarity) for r in surviving]}"
+        "exactly one row must survive same-situation contradiction resolution; got "
+        f"{[(r.user_playbook_id, r.content) for r in surviving]}"
     )
     assert surviving[0].user_playbook_id == existing.user_playbook_id
-    assert surviving[0].polarity == "positive"
+    assert surviving[0].content.lstrip().startswith("Recommend")
 
     _assert_no_opposing_polarity_on_same_trigger(surviving)
 
@@ -504,14 +514,14 @@ def test_existing_positive_plus_failure_path_resolves_via_differentiate(
     assert archive_ids == [existing.user_playbook_id]
     assert len(rows) == 2, (
         f"differentiate must emit two refined rows; got {len(rows)}: "
-        f"{[(r.trigger, r.polarity) for r in rows]}"
+        f"{[(r.trigger, r.content) for r in rows]}"
     )
 
     _apply_to_storage(storage, rows, archive_ids)
     surviving = storage.get_user_playbooks(user_id=user_id)
     assert len(surviving) == 2, (
         f"two refined rows must survive; got {len(surviving)}: "
-        f"{[(r.trigger, r.polarity) for r in surviving]}"
+        f"{[(r.trigger, r.content) for r in surviving]}"
     )
 
     surviving_triggers = {r.trigger for r in surviving}

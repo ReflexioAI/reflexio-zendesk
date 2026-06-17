@@ -112,7 +112,6 @@ def _seed_followup_ready_run(storage: SQLiteStorage) -> None:
             binding=AgentBinding(
                 org_id="e2e_resumable_org",
                 extractor_kind="profile",
-                extractor_name="default_profile_extractor",
                 user_id="user_1",
                 request_id="request_1",
                 agent_version="v1",
@@ -183,8 +182,8 @@ def _load_live_e2e_settings() -> tuple[str, str]:
         "REFLEXIO_API_KEY"
     )
     base_url = (
-        os.environ.get("REFLEXIO_API_URL")
-        or dotenv_values_from_file.get("REFLEXIO_API_URL")
+        os.environ.get("REFLEXIO_URL")
+        or dotenv_values_from_file.get("REFLEXIO_URL")
         or "http://localhost:8081"
     )
 

@@ -11,6 +11,7 @@ Covers:
 """
 
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -185,7 +186,7 @@ class TestSSRFPrevention:
                 }
             )
 
-    def test_azure_endpoint_allows_valid_url(self):
+    def test_azure_endpoint_allows_valid_url(self, non_strict_mode):
         """Valid Azure endpoints are accepted."""
         config = AzureOpenAIConfig.model_validate(
             {
@@ -194,6 +195,28 @@ class TestSSRFPrevention:
             }
         )
         assert "openai.azure.com" in str(config.endpoint)
+
+    def test_blocks_hostname_resolving_to_metadata_by_default(
+        self, non_strict_mode, monkeypatch
+    ):
+        """A hostname that resolves to a metadata IP is blocked even when
+        REFLEXIO_BLOCK_PRIVATE_URLS is unset (DNS-rebinding defense)."""
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            return [(2, 1, 0, "", ("169.254.169.254", port or 80))]
+
+        monkeypatch.setattr(
+            "reflexio.models.api_schema.validators.socket.getaddrinfo",
+            fake_getaddrinfo,
+        )
+        with pytest.raises(ValidationError, match="cloud metadata"):
+            CustomEndpointConfig.model_validate(
+                {
+                    "model": "x",
+                    "api_key": "k",
+                    "api_base": "http://rebind.example.test/v1",
+                }
+            )
 
 
 # =============================================================================
@@ -542,7 +565,21 @@ class TestListMinLength:
     def test_publish_interaction_requires_data(self):
         """PublishUserInteractionRequest requires at least one interaction."""
         with pytest.raises(ValidationError):
-            PublishUserInteractionRequest(user_id="test", interaction_data_list=[])
+            PublishUserInteractionRequest(
+                user_id="test", session_id="session", interaction_data_list=[]
+            )
+
+    def test_publish_interaction_requires_non_empty_session_id(self):
+        """PublishUserInteractionRequest requires a non-empty session id."""
+        interaction = InteractionData(content="hello")
+        invalid_session_ids: tuple[Any, ...] = (None, "", "   ")
+        for value in invalid_session_ids:
+            with pytest.raises(ValidationError):
+                PublishUserInteractionRequest(
+                    user_id="test",
+                    session_id=value,
+                    interaction_data_list=[interaction],
+                )
 
     def test_add_user_playbook_requires_data(self):
         """AddUserPlaybookRequest requires at least one user playbook."""
@@ -647,7 +684,7 @@ class TestCrossFieldValidators:
         config = OpenAIConfig(api_key="sk-test")
         assert config.api_key == "sk-test"
 
-    def test_openai_config_with_azure(self):
+    def test_openai_config_with_azure(self, non_strict_mode):
         """OpenAIConfig with only azure_config is valid."""
         config = OpenAIConfig(
             azure_config=AzureOpenAIConfig.model_validate(
@@ -686,19 +723,13 @@ class TestCrossFieldValidators:
         assert config.stride_size == DEFAULT_STRIDE_SIZE
 
     def test_config_defaults_extractors_when_omitted(self):
-        """Config: omitted extractor fields still get the default extractors."""
+        """Config: omitted extractor fields still get singleton extractors."""
         config = Config(storage_config=StorageConfigSQLite())
 
         assert config.profile_extractor_config is not None
         assert config.user_playbook_extractor_config is not None
-        assert (
-            config.profile_extractor_config.extractor_name
-            == "default_profile_extractor"
-        )
-        assert (
-            config.user_playbook_extractor_config.extractor_name
-            == "default_playbook_extractor"
-        )
+        assert config.profile_extractor_config.extractor_name is None
+        assert config.user_playbook_extractor_config.extractor_name is None
         assert isinstance(config.pending_tool_call_config, PendingToolCallConfig)
         assert config.pending_tool_call_config.enabled is False
 

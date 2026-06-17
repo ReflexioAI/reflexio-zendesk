@@ -98,6 +98,24 @@ class ScoreDistribution(BaseModel):
     labels: list[str]
 
 
+class EvaluationSourceSetRequest(BaseModel):
+    """One labeled request-source cohort for evaluation comparison.
+
+    ``sources`` match ``Request.source`` exactly. The empty string is valid and
+    represents requests published without a source.
+    """
+
+    label: NonEmptyStr
+    sources: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_sources_are_unique(self) -> Self:
+        """Reject duplicate source values within a single set."""
+        if len(set(self.sources)) != len(self.sources):
+            raise ValueError("source set sources must be unique")
+        return self
+
+
 class GetEvaluationOverviewRequest(BaseModel):
     """Input for the overview endpoint.
 
@@ -107,18 +125,34 @@ class GetEvaluationOverviewRequest(BaseModel):
         bucket (BucketLiteral): Granularity of the hero trend buckets.
         include_shadow (bool): When False, skip the shadow-side aggregations
             (cheaper) — the hero will degrade to shadow_off state.
+        source_sets (list[EvaluationSourceSetRequest]): Optional labeled
+            request-source cohorts to compare. Sources are matched exactly
+            against the first request in each evaluated session.
     """
 
     from_ts: int = Field(ge=0)
     to_ts: int = Field(ge=0)
     bucket: BucketLiteral = "week"
     include_shadow: bool = True
+    source_sets: list[EvaluationSourceSetRequest] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_time_window(self) -> Self:
-        """Ensure the requested time window is ordered."""
+    def validate_request(self) -> Self:
+        """Ensure the requested time window and source sets are valid."""
         if self.from_ts > self.to_ts:
             raise ValueError("from_ts must be <= to_ts")
+        labels = [s.label for s in self.source_sets]
+        if len(set(labels)) != len(labels):
+            raise ValueError("source set labels must be unique")
+        seen_sources: set[str] = set()
+        for source_set in self.source_sets:
+            overlap = seen_sources.intersection(source_set.sources)
+            if overlap:
+                overlap_list = ", ".join(sorted(repr(s) for s in overlap))
+                raise ValueError(
+                    f"source values cannot appear in multiple source sets: {overlap_list}"
+                )
+            seen_sources.update(source_set.sources)
         return self
 
 
@@ -137,41 +171,6 @@ class BraintrustTileRow(BaseModel):
     current: float
     n: int = Field(ge=0)
     delta: float
-
-
-class TrendPoint(BaseModel):
-    """One point on a grouped success-rate trend curve (F2).
-
-    Args:
-        ts (int): Unix epoch seconds — bucket start.
-        rate (float): Success rate for sessions in this bucket, [0.0, 1.0].
-        n (int): Session count backing the rate. Must be non-negative.
-    """
-
-    ts: int
-    rate: float
-    n: int = Field(ge=0)
-
-
-class SuccessRateTrendByGroup(BaseModel):
-    """Group-split trend data for the dashboard's dual-curve chart (F2).
-
-    Grouping is by ``Request.metadata.reflexio_retrieval_enabled``, read from
-    the first request of each session in the window. Sessions whose first
-    request has the key absent OR a non-bool value land in ``untagged``.
-
-    Args:
-        treatment (list[TrendPoint]): Curve for sessions where the first
-            request had ``metadata.reflexio_retrieval_enabled = True``.
-        control (list[TrendPoint]): Curve for ``... = False``.
-        untagged (list[TrendPoint]): Curve for sessions where the key is
-            absent or non-bool — surfaced (not silently coerced) so
-            customers can see how many of their sessions are untagged.
-    """
-
-    treatment: list[TrendPoint] = Field(default_factory=list)
-    control: list[TrendPoint] = Field(default_factory=list)
-    untagged: list[TrendPoint] = Field(default_factory=list)
 
 
 class ShadowWinRateTrendPoint(BaseModel):
@@ -243,17 +242,40 @@ class ShadowWinRateTrend(BaseModel):
     judge_prompt_version: str = Field(default="v1.0.0")
 
 
+class SourceSetEvaluationMetrics(BaseModel):
+    """Metrics for one labeled request-source set."""
+
+    label: str
+    sources: list[str]
+    session_count: int = Field(ge=0)
+    session_ids: list[str] = Field(default_factory=list)
+    success_rate_pp: float
+    buckets: list[HeroBucket]
+    context_tiles: ContextTile
+    score_distribution: ScoreDistribution
+    rule_attribution: list[RuleAttributionRow]
+    braintrust_tiles: list[BraintrustTileRow] = Field(default_factory=list)
+
+
+class SourceSetComparison(BaseModel):
+    """Comparison payload for request-source cohorts."""
+
+    available_sources: list[str] = Field(default_factory=list)
+    sets: list[SourceSetEvaluationMetrics] = Field(default_factory=list)
+    unmatched_session_count: int = Field(default=0, ge=0)
+
+
 class GetEvaluationOverviewResponse(BaseModel):
     hero: HeroBlock
     context_tiles: ContextTile
     rule_attribution: list[RuleAttributionRow]
     score_distribution: ScoreDistribution
     braintrust_tiles: list[BraintrustTileRow] = Field(default_factory=list)
-    success_rate_trend_by_group: SuccessRateTrendByGroup = Field(
-        default_factory=SuccessRateTrendByGroup
-    )
     shadow_win_rate_trend: ShadowWinRateTrend = Field(
         default_factory=ShadowWinRateTrend
+    )
+    source_set_comparison: SourceSetComparison = Field(
+        default_factory=SourceSetComparison
     )
 
 
@@ -266,15 +288,14 @@ class RegenerateRequest(BaseModel):
     """Input for POST /api/evaluations/regenerate.
 
     Args:
-        evaluation_name (NonEmptyStr): Name of the evaluator to replay.
-            Must match one of the ``agent_success_configs[*].evaluation_name``
-            entries in the caller's config.
+        evaluation_name (NonEmptyStr | None): Deprecated compatibility field.
+            Singleton evaluation ignores name-based selection.
         from_ts (int): Inclusive lower bound of the window (Unix seconds).
         to_ts (int): Inclusive upper bound of the window (Unix seconds).
             Must be strictly greater than ``from_ts``.
     """
 
-    evaluation_name: NonEmptyStr
+    evaluation_name: NonEmptyStr | None = None
     from_ts: int = Field(ge=0)
     to_ts: int = Field(ge=0)
 
@@ -374,12 +395,13 @@ class GradeOnDemandRequest(BaseModel):
         session_id (NonEmptyStr): Target session to grade.
         agent_version (NonEmptyStr): Agent version filter (must be set — eval
             results are versioned).
-        evaluation_name (NonEmptyStr): Evaluator config name to run.
+        evaluation_name (NonEmptyStr | None): Deprecated compatibility field.
+            Singleton evaluation ignores name-based selection.
     """
 
     session_id: NonEmptyStr
     agent_version: NonEmptyStr
-    evaluation_name: NonEmptyStr
+    evaluation_name: NonEmptyStr | None = None
 
 
 class GradeOnDemandResponse(BaseModel):

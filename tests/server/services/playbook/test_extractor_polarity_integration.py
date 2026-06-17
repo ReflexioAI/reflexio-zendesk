@@ -1,14 +1,15 @@
 """
 Integration tests for polarity emission by the classic playbook extractor.
 
-These tests verify the end-to-end polarity flow from LLM response through
+These tests verify the end-to-end wording flow from LLM response through
 ``PlaybookExtractor.run()`` to the produced ``UserPlaybook`` objects:
 
-* Neutral / no-failure windows produce playbooks with ``polarity="positive"``
-  via internal derivation.
-* Failure-evidence windows with avoidance wording and rationale
-  produce playbooks with negative polarity AND content prefixed by one of
-  ``NEGATIVE_PREFIXES`` — confirming the negative path is preserved end-to-end.
+* Neutral / no-failure windows produce action-style playbooks whose content
+  does NOT read as avoidance.
+* Failure-evidence windows with avoidance wording and rationale produce at
+  least one playbook whose content starts with a negative/avoidance prefix
+  (``"Avoid"``/``"Do not"``/``"Don't"``/``"Never"``) — confirming the
+  avoidance path is preserved end-to-end.
 """
 
 from __future__ import annotations
@@ -35,9 +36,12 @@ from reflexio.server.services.playbook.playbook_service_utils import (
     StructuredPlaybookContent,
     StructuredPlaybookList,
 )
-from reflexio.server.services.polarity_utils import NEGATIVE_PREFIXES
 
 pytestmark = pytest.mark.integration
+
+# Local wording convention for avoidance-oriented playbook content. Not a
+# polarity classifier — just the literal prefixes the fixtures use.
+_NEGATIVE_PREFIXES = ("Avoid", "Do not", "Don't", "Never")
 
 
 # ===============================
@@ -58,6 +62,9 @@ def request_context(temp_storage_dir, worker_id):
     org_id = f"polarity_int_{worker_id}"
     context = RequestContext(org_id=org_id, storage_base_dir=temp_storage_dir)
     context.storage = MagicMock()
+    context.storage.update_agent_run_status.side_effect = (
+        lambda _run_id, status, **_kwargs: MagicMock(status=status)
+    )
     # Mock prompt manager so the extractor can render the extraction prompt
     # without depending on the on-disk prompt registry.
     context.prompt_manager = MagicMock()
@@ -107,6 +114,7 @@ def neutral_request_interaction_models():
     request = Request(
         request_id="req_neutral",
         user_id="user_neutral",
+        session_id="test_session",
         created_at=1000,
         source="api",
     )
@@ -151,6 +159,7 @@ def failure_request_interaction_models():
     request = Request(
         request_id="req_failure",
         user_id="user_failure",
+        session_id="test_session",
         created_at=2000,
         source="api",
     )
@@ -304,12 +313,14 @@ def test_classic_extractor_emits_positive_when_no_failure_evidence(
     # MOCK_LLM_RESPONSE=false ensures the mock_llm_client return value is used
     # instead of the extractor's deterministic mock branch.
     with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
-        result = extractor.run().items
+        extracted = extractor.run()
+        result = extracted if isinstance(extracted, list) else extracted.items
 
     assert len(result) == 2, "Expected two playbooks from the neutral window"
-    assert all(playbook.polarity == "positive" for playbook in result), (
-        "All action-style playbooks must derive polarity=positive"
-    )
+    assert all(
+        not playbook.content.lstrip().startswith(_NEGATIVE_PREFIXES)
+        for playbook in result
+    ), "No action-style playbook from a neutral window should read as avoidance"
 
 
 def test_classic_extractor_emits_negative_on_clear_failure(
@@ -319,11 +330,11 @@ def test_classic_extractor_emits_negative_on_clear_failure(
     service_config,
     failure_request_interaction_models,
 ):
-    """Window with user pushback → at least one playbook has polarity=negative.
+    """Window with user pushback → at least one playbook uses avoidance wording.
 
-    Validates that negative polarity is derived end-to-end when the LLM writes
-    an avoidance rule: the emitted ``UserPlaybook`` must have
-    ``polarity == "negative"`` AND content starting with one of ``NEGATIVE_PREFIXES``
+    Validates that avoidance wording is preserved end-to-end when the LLM writes
+    an avoidance rule: at least one emitted ``UserPlaybook`` must have content
+    starting with one of ``_NEGATIVE_PREFIXES``
     (``"Avoid"``/``"Do not"``/``"Don't"``/``"Never"``).
     """
     request_context.storage.get_last_k_interactions_grouped.return_value = (
@@ -354,20 +365,15 @@ def test_classic_extractor_emits_negative_on_clear_failure(
     )
 
     with patch.dict(os.environ, {"MOCK_LLM_RESPONSE": "false"}):
-        result = extractor.run().items
+        extracted = extractor.run()
+        result = extracted if isinstance(extracted, list) else extracted.items
 
     assert len(result) == 2, "Expected both playbook entries to be emitted"
 
-    negative_playbooks = [pb for pb in result if pb.polarity == "negative"]
+    negative_playbooks = [
+        pb for pb in result if pb.content.lstrip().startswith(_NEGATIVE_PREFIXES)
+    ]
     assert len(negative_playbooks) >= 1, (
-        "Expected at least one playbook with polarity=negative from a failure window"
-    )
-
-    negative_playbook = negative_playbooks[0]
-    assert any(
-        negative_playbook.content.lstrip().startswith(prefix)
-        for prefix in NEGATIVE_PREFIXES
-    ), (
-        f"Negative-polarity content must start with one of {NEGATIVE_PREFIXES}; "
-        f"got: {negative_playbook.content!r}"
+        "Expected at least one playbook with avoidance wording from a failure "
+        f"window (one of {_NEGATIVE_PREFIXES}); got: {[pb.content for pb in result]!r}"
     )

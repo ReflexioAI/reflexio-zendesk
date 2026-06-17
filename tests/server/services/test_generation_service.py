@@ -4,6 +4,7 @@ from datetime import UTC
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from reflexio.models.api_schema.service_schemas import (
     InteractionData,
@@ -71,12 +72,11 @@ def test_publish_request_with_session_id(mock_llm_responses):
         generation_service.run(request)
 
 
-def test_empty_session_id_allows_multiple_requests(mock_llm_responses):
-    """
-    Test that multiple requests with empty session_id are allowed.
-    """
+def test_publish_request_honors_caller_request_id(mock_llm_responses):
     user_id = "test_user_id"
     org_id = "test_org"
+    session_id = "test_session_id"
+    request_id = "caller-request-id"
 
     with tempfile.TemporaryDirectory() as temp_dir:
         llm_config = LiteLLMConfig(model="gpt-4o-mini")
@@ -87,34 +87,98 @@ def test_empty_session_id_allows_multiple_requests(mock_llm_responses):
         )
 
         interaction = InteractionData(
-            content="interaction without session",
+            content="test interaction",
             created_at=int(datetime.datetime.now(UTC).timestamp()),
         )
 
-        # Request without session_id (empty string)
         request = PublishUserInteractionRequest(
+            request_id=request_id,
             user_id=user_id,
             interaction_data_list=[interaction],
-            session_id="",  # Empty session
+            session_id=session_id,
         )
 
-        # Should not raise any exception
-        generation_service.run(request)
+        result = generation_service.run(request)
 
-        # Try another request with empty session_id - should also succeed
-        another_interaction = InteractionData(
-            content="another interaction without session",
+        assert result.request_id == request_id
+        assert generation_service.storage is not None
+        stored_request = generation_service.storage.get_request(request_id)
+        assert stored_request is not None
+        assert stored_request.request_id == request_id
+
+
+def test_publish_request_rejects_empty_caller_request_id():
+    interaction = InteractionData(
+        content="test interaction",
+        created_at=int(datetime.datetime.now(UTC).timestamp()),
+    )
+
+    with pytest.raises(ValidationError):
+        PublishUserInteractionRequest(
+            request_id="",
+            user_id="test_user_id",
+            session_id="test_session_id",
+            interaction_data_list=[interaction],
+        )
+
+
+def test_publish_request_rejects_duplicate_caller_request_id(mock_llm_responses):
+    user_id = "test_user_id"
+    org_id = "test_org"
+    request_id = "caller-request-id"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        llm_config = LiteLLMConfig(model="gpt-4o-mini")
+        llm_client = LiteLLMClient(llm_config)
+        generation_service = GenerationService(
+            llm_client=llm_client,
+            request_context=RequestContext(org_id=org_id, storage_base_dir=temp_dir),
+        )
+
+        interaction = InteractionData(
+            content="test interaction",
             created_at=int(datetime.datetime.now(UTC).timestamp()),
         )
 
-        another_request = PublishUserInteractionRequest(
+        first_request = PublishUserInteractionRequest(
+            request_id=request_id,
             user_id=user_id,
-            interaction_data_list=[another_interaction],
-            session_id="",
+            session_id="test_session_id",
+            interaction_data_list=[interaction],
+        )
+        second_request = PublishUserInteractionRequest(
+            request_id=request_id,
+            user_id=user_id,
+            session_id="test_session_id",
+            interaction_data_list=[interaction],
         )
 
-        # Should not raise any exception
-        generation_service.run(another_request)
+        generation_service.run(first_request)
+        with pytest.raises(ValueError, match="already exists"):
+            generation_service.run(second_request)
+
+        assert generation_service.storage is not None
+        assert (
+            len(
+                generation_service.storage.get_interactions_by_request_ids([request_id])
+            )
+            == 1
+        )
+
+
+def test_empty_session_id_is_rejected():
+    """Publish requests must include a non-empty session_id."""
+    interaction = InteractionData(
+        content="interaction without session",
+        created_at=int(datetime.datetime.now(UTC).timestamp()),
+    )
+
+    with pytest.raises(ValidationError):
+        PublishUserInteractionRequest(
+            user_id="test_user_id",
+            interaction_data_list=[interaction],
+            session_id="",
+        )
 
 
 # NOTE: TestWindowSizeStrideOverrides class was removed because the global

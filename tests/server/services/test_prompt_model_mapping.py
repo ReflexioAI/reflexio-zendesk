@@ -30,33 +30,39 @@ _PROMPT_BANK_DIR = (
 # holds the expected mock response for this prompt's structured output.
 # None means the prompt does not produce structured output relevant to mocking.
 PROMPT_VERSION_MAP: dict[str, tuple[str, str | None]] = {
-    "playbook_extraction_main": ("v1.1.0", "playbook_extraction"),
-    "playbook_extraction_context": ("v4.1.0", None),
+    "playbook_extraction_main": ("v1.3.0", "playbook_extraction"),
+    "playbook_extraction_context": ("v4.3.0", None),
     "playbook_should_generate": ("v3.0.0", "boolean_evaluation"),
     "playbook_should_generate_expert": ("v1.0.0", "boolean_evaluation"),
-    "playbook_extraction_context_expert": ("v3.1.0", None),
-    "playbook_extraction_main_expert": ("v1.1.0", "playbook_extraction"),
-    "playbook_aggregation": ("v2.1.0", "playbook_aggregation"),
-    "playbook_consolidation": ("v2.0.0", "playbook_consolidation"),
-    "playbook_optimizer_judge": ("v1.1.0", None),
+    "playbook_extraction_context_expert": ("v3.3.0", None),
+    "playbook_extraction_main_expert": ("v1.2.0", "playbook_extraction"),
+    "playbook_aggregation": ("v2.3.0", "playbook_aggregation"),
+    "playbook_consolidation": ("v2.3.3", "playbook_consolidation"),
+    "playbook_optimizer_judge": ("v1.2.0", None),
     "profile_update_main": ("v1.0.0", "profile_extraction"),
     "profile_update_instruction_start": ("v1.1.0", None),
     "profile_should_generate": ("v1.0.0", "boolean_evaluation"),
     "profile_should_generate_override": ("v1.0.0", "boolean_evaluation"),
     "profile_deduplication": ("v1.0.0", "profile_deduplication"),
     "agent_success_evaluation": ("v1.0.0", "agent_success_evaluation"),
-    "agent_success_evaluation_with_comparison": (
-        "v1.0.0",
-        "agent_success_evaluation_comparison",
-    ),
+    # F1 cleanup: the session-level shadow comparison branch was retracted.
+    # The prompt directories remain on disk (marked active: false in their
+    # frontmatter) as historical records, but they no longer drive any
+    # production code path, and the ``agent_success_evaluation_comparison``
+    # registry key was removed, so they are mapped without a registry key.
+    "agent_success_evaluation_with_comparison": ("v1.0.0", None),
     "shadow_content_evaluation": ("v1.0.0", None),
-    "memory_reflection": ("v1.1.0", None),
+    "memory_reflection": ("v1.7.0", None),
     "query_reformulation": ("v1.0.0", None),
     "document_expansion": ("v1.0.0", None),
     "compress_session_for_query": ("v1.3.0", None),
     "rerank_relevance": ("v1.1.0", None),
     # Answer-LLM system prompt for memory-grounded user questions
     "answer_synthesis": ("v1.5.2", None),
+    # F1 — per-turn shadow comparison judge. Produces structured
+    # ShadowComparisonOutput; the mock dispatch lives in the integration
+    # tests rather than the global heuristic mock, so no registry key.
+    "shadow_comparison": ("v1.0.0", None),
 }
 
 
@@ -123,12 +129,18 @@ def _get_latest_prompt_version(prompt_id: str) -> str:
     active_versions = sorted(
         (p for p in all_versions if _is_active(p)), key=_semver_key
     )
-    if not active_versions:
-        pytest.fail(
-            f"No active version files found in {prompt_dir} "
-            f"(all {len(all_versions)} files have active: false)"
-        )
-    return active_versions[-1].stem.split(".prompt")[0]
+    if active_versions:
+        return active_versions[-1].stem.split(".prompt")[0]
+
+    # No active version: the directory holds only deprecated/historical
+    # records (every file is ``active: false``). Such dirs no longer drive a
+    # runtime code path, but ``test_all_prompt_dirs_are_mapped`` still requires
+    # them in the mapping. Pin them to their latest on-disk version so the
+    # trip-wire stays meaningful (a new version file is still detected) without
+    # the all-dirs-mapped contract and the active-version filter contradicting
+    # each other.
+    latest = sorted(all_versions, key=_semver_key)
+    return latest[-1].stem.split(".prompt")[0]
 
 
 class TestPromptVersionMapping:

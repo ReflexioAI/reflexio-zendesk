@@ -13,7 +13,7 @@ import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 from reflexio.models.api_schema.internal_schema import SessionDescriptor
 from reflexio.server.api_endpoints.request_context import RequestContext
@@ -53,7 +53,6 @@ class JobFailure:
 class RegenJob:
     job_id: str
     org_id: str
-    evaluation_name: str
     from_ts: int
     to_ts: int
     status: JobStatus
@@ -75,24 +74,23 @@ class RegenJob:
 
 
 class RegenJobRegistry:
-    """Process-local job registry. One active job per (org_id, evaluation_name)."""
+    """Process-local job registry. One active singleton job per org."""
 
     def __init__(self) -> None:
         self._jobs: dict[str, RegenJob] = {}
-        self._by_org_evaluator: dict[tuple[str, str], str] = {}
+        self._by_org: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def create(
         self,
         *,
         org_id: str,
-        evaluation_name: str,
         from_ts: int,
         to_ts: int,
         total: int,
     ) -> RegenJob:
         """Register a new running job. Raises RuntimeError when an actively-running
-        job exists for (org, evaluator).
+        job exists for the org.
 
         Only *running* jobs block; a previous completed/cancelled/errored job for
         the same key is replaced. Eviction by TTL is a separate cleanup concern —
@@ -101,23 +99,20 @@ class RegenJobRegistry:
         """
         with self._lock:
             self._evict_completed_locked(DEFAULT_TTL_SECONDS)
-            key = (org_id, evaluation_name)
+            key = org_id
             active = self._active_job_for_locked(key)
             if active is not None:
-                raise RuntimeError(
-                    f"A regenerate is already running for evaluator '{evaluation_name}'"
-                )
+                raise RuntimeError("A regenerate is already running for this org")
             job = RegenJob(
                 job_id=uuid.uuid4().hex,
                 org_id=org_id,
-                evaluation_name=evaluation_name,
                 from_ts=from_ts,
                 to_ts=to_ts,
                 status="running",
                 total=total,
             )
             self._jobs[job.job_id] = job
-            self._by_org_evaluator[key] = job.job_id
+            self._by_org[key] = job.job_id
             return job
 
     def get(self, job_id: str) -> RegenJob | None:
@@ -131,13 +126,13 @@ class RegenJobRegistry:
         if job is not None:
             job.cancel_event.set()
 
-    def has_active(self, org_id: str, evaluation_name: str) -> bool:
+    def has_active(self, org_id: str) -> bool:
         with self._lock:
             self._evict_completed_locked(DEFAULT_TTL_SECONDS)
-            return self._active_job_for_locked((org_id, evaluation_name)) is not None
+            return self._active_job_for_locked(org_id) is not None
 
-    def _active_job_for_locked(self, key: tuple[str, str]) -> RegenJob | None:
-        """Return the running job for (org, evaluator), or None when no live job exists.
+    def _active_job_for_locked(self, key: str) -> RegenJob | None:
+        """Return the running job for an org, or None when no live job exists.
 
         A registry entry whose job has already finished
         (``completed`` / ``cancelled`` / ``error``) is treated as having no active
@@ -145,7 +140,7 @@ class RegenJobRegistry:
         registry still holds the finished job until TTL eviction so status polls
         keep working, but it doesn't block new submissions.
         """
-        job_id = self._by_org_evaluator.get(key)
+        job_id = self._by_org.get(key)
         if job_id is None:
             return None
         job = self._jobs.get(job_id)
@@ -168,7 +163,7 @@ class RegenJobRegistry:
         ]
         for jid in drop:
             j = self._jobs.pop(jid)
-            self._by_org_evaluator.pop((j.org_id, j.evaluation_name), None)
+            self._by_org.pop(j.org_id, None)
 
 
 # Single process-local instance.
@@ -179,29 +174,27 @@ def _load_first_request(
     storage: BaseStorage,
     user_id: str,
     session_id: str,
-    cache: dict[str, tuple[int, dict[str, Any]]],
-) -> tuple[int, dict[str, Any]]:
-    """Return the (created_at, metadata) of a session's earliest request, memoized.
+    cache: dict[str, tuple[int, str]],
+) -> tuple[int, str]:
+    """Return the (created_at, source) of a session's earliest request, memoized.
 
     The regen worker can see multiple SessionDescriptors for the same
     session_id (one per distinct agent_version/source tuple). This
-    helper guarantees each session_id triggers at most one storage call,
-    mirroring the amortized pattern F2's evaluation overview service
-    uses.
+    helper guarantees each session_id triggers at most one storage call.
 
     Args:
         storage (BaseStorage): Storage backend bound to the request_context.
         user_id (str): Owner of the session's requests.
         session_id (str): Session whose first-request data to return.
-        cache (dict[str, tuple[int, dict[str, Any]]]): Memoization dict
-            keyed by session_id; updated in place.
+        cache (dict[str, tuple[int, str]]): Memoization dict keyed by
+            session_id; updated in place.
 
     Returns:
-        tuple[int, dict[str, Any]]: ``(first_created_at, first_metadata)``.
-        Falls back to ``(0, {})`` when the session has no requests (the
+        tuple[int, str]: ``(first_created_at, first_source)``. Falls back
+        to ``(0, "")`` when the session has no requests (the
         descriptor is still kept so the regen worker can attempt
         evaluation; the sampler simply treats it as the epoch-zero day
-        bucket and the untagged group).
+        bucket and the empty-source stratum).
     """
     cached = cache.get(session_id)
     if cached is not None:
@@ -211,24 +204,24 @@ def _load_first_request(
     except Exception as e:  # noqa: BLE001 — per-session resilience boundary
         logger.warning(
             "Failed to fetch requests for session %s during F3 sampler candidate "
-            "discovery (%s); falling back to (created_at=0, metadata={}). The "
+            "discovery (%s); falling back to (created_at=0, source=''). The "
             "session will be retried in the per-session loop below.",
             session_id,
             e,
         )
-        cache[session_id] = (0, {})
+        cache[session_id] = (0, "")
         return cache[session_id]
     if not requests:
         logger.warning(
             "Session %s has no requests in storage despite being returned by "
             "get_session_ids_in_window (possible race or contract violation); "
-            "falling back to (created_at=0, metadata={}).",
+            "falling back to (created_at=0, source='').",
             session_id,
         )
-        cache[session_id] = (0, {})
+        cache[session_id] = (0, "")
         return cache[session_id]
     first = min(requests, key=lambda r: r.created_at)
-    cache[session_id] = (first.created_at, first.metadata or {})
+    cache[session_id] = (first.created_at, first.source or "")
     return cache[session_id]
 
 
@@ -236,7 +229,7 @@ def _build_sample_candidates(
     storage: BaseStorage,
     descriptors: list[SessionDescriptor],
 ) -> list[SampleCandidate]:
-    """Convert raw SessionDescriptors into SampleCandidates with metadata.
+    """Convert raw SessionDescriptors into SampleCandidates.
 
     Reads the first-request data for each distinct session_id at most
     once via ``_load_first_request``'s cache, then assembles one
@@ -253,10 +246,10 @@ def _build_sample_candidates(
         list[SampleCandidate]: One candidate per descriptor, ready for the
         pure ``sample_candidates`` function.
     """
-    cache: dict[str, tuple[int, dict[str, Any]]] = {}
+    cache: dict[str, tuple[int, str]] = {}
     candidates: list[SampleCandidate] = []
     for sd in descriptors:
-        created_at, metadata = _load_first_request(
+        created_at, first_source = _load_first_request(
             storage, sd.user_id, sd.session_id, cache
         )
         candidates.append(
@@ -266,7 +259,7 @@ def _build_sample_candidates(
                 agent_version=sd.agent_version,
                 source=sd.source,
                 created_at=created_at,
-                first_request_metadata=metadata,
+                first_request_source=first_source,
             )
         )
     return candidates
@@ -311,7 +304,6 @@ def _dispatch_one(
         request_context=request_context,
         llm_client=llm_client,
         force_regenerate=True,
-        evaluation_name=job.evaluation_name,
     )
 
 
@@ -334,7 +326,7 @@ def run_regen(
 
     Step 1 enumerates all candidate sessions in ``[from_ts, to_ts]`` via
     ``storage.get_session_ids_in_window``. Step 2 stratifies them by
-    (day-bucket x F2 group) and samples up to
+    (day-bucket x first request source) and samples up to
     ``config.eval_sample_n_per_stratum`` per stratum — giving the regen
     pipeline predictable cost regardless of traffic volume. Step 3
     dispatches the sampled subset through a ``ThreadPoolExecutor`` whose

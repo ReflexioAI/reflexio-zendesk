@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
+from reflexio.server.services.storage.sqlite_storage._agent_run import _dt
 from reflexio.server.services.storage.storage_base import (
     AgentBinding,
     AgentRunRecord,
@@ -28,6 +29,12 @@ def storage():
         yield SQLiteStorage(org_id="org_1", db_path=f"{temp_dir}/reflexio.db")
 
 
+def test_sqlite_agent_run_parser_treats_offsetless_timestamp_as_utc():
+    parsed = _dt("2026-06-10T23:47:07.50016")
+
+    assert parsed == datetime(2026, 6, 10, 23, 47, 7, 500160, tzinfo=UTC)
+
+
 def _agent_run(
     run_id: str, status: AgentRunStatus, *, org_id: str = "org_1"
 ) -> AgentRunRecord:
@@ -36,7 +43,6 @@ def _agent_run(
         binding=AgentBinding(
             org_id=org_id,
             extractor_kind="profile",
-            extractor_name="default_profile_extractor",
             user_id="user_1",
             request_id="request_1",
             agent_version="v1",
@@ -109,6 +115,22 @@ def test_sqlite_update_agent_run_status_records_lifecycle_timestamps(storage):
     assert finalized is not None
     assert finalized.agent_completed_at is not None
     assert finalized.finalized_at is not None
+
+
+def test_sqlite_update_agent_run_status_honors_expected_statuses(storage):
+    storage.create_agent_run(_agent_run("run_1", AgentRunStatus.FAILED))
+
+    updated = storage.update_agent_run_status(
+        "run_1",
+        AgentRunStatus.AGENT_COMPLETED,
+        committed_output={"profiles": []},
+        expected_statuses=(AgentRunStatus.RUNNING, AgentRunStatus.RESUMING),
+    )
+
+    assert updated is not None
+    assert updated.status == AgentRunStatus.FAILED
+    assert updated.committed_output is None
+    assert updated.agent_completed_at is None
 
 
 def test_sqlite_pending_tool_call_active_dedup_lookup(storage):

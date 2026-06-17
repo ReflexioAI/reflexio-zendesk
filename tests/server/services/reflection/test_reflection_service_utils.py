@@ -9,18 +9,25 @@ from reflexio.server.services.reflection.reflection_service_utils import (
 def test_reflection_decision_no_change_only_required_fields():
     d = ReflectionDecision(target_kind="playbook", target_id="42")
     assert d.new_content is None
-    assert d.new_polarity is None
+    assert d.new_rationale is None
 
 
-def test_reflection_decision_has_new_polarity_optional():
+def test_reflection_decision_no_polarity_field():
+    # Polarity is derived from wording at apply time; the declarative
+    # new_polarity field was removed from the decision schema.
+    fields = ReflectionDecision.model_fields
+    assert "new_polarity" not in fields
+
+
+def test_reflection_decision_revision_fields_optional():
     d = ReflectionDecision(
         target_kind="playbook",
         target_id="42",
         new_content="Avoid X when Y.",
-        new_polarity="negative",
         new_rationale="User pushed back when X was recommended.",
     )
-    assert d.new_polarity == "negative"
+    assert d.new_content == "Avoid X when Y."
+    assert d.new_rationale == "User pushed back when X was recommended."
 
 
 def test_reflection_decision_no_action_field():
@@ -29,10 +36,17 @@ def test_reflection_decision_no_action_field():
     assert "action" not in fields
 
 
-def test_reflection_result_has_revised_and_flipped_counts():
+def test_reflection_result_has_revised_count():
     r = ReflectionResult()
     assert r.revised_count == 0
-    assert r.flipped_count == 0
+
+
+def test_reflection_result_has_no_flipped_count_field():
+    # flipped_count was retired: flips are LLM-reported and indistinguishable
+    # from non-flip content rewrites (both carry new_rationale), so there is
+    # no separate flip counter.
+    fields = ReflectionResult.model_fields
+    assert "flipped_count" not in fields
 
 
 def test_reflection_result_no_replaced_count_field():
