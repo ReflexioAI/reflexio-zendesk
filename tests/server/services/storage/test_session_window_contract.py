@@ -5,18 +5,23 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 from collections.abc import Generator
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
 
-from reflexio.models.api_schema.internal_schema import SessionDescriptor
+from reflexio.models.api_schema.internal_schema import (
+    RequestInteractionDataModel,
+    SessionDescriptor,
+)
 from reflexio.models.api_schema.service_schemas import (
     AgentSuccessEvaluationResult,
     Request,
 )
 from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
 from reflexio.server.services.storage.storage_base import BaseStorage
+from reflexio.server.services.storage.storage_base._requests import RequestMixin
 
 pytestmark = pytest.mark.integration
 
@@ -41,6 +46,27 @@ def _seed_request(storage: BaseStorage, user_id: str, session_id: str, ts: int) 
         user_id=user_id,
         created_at=ts,
         source="test",
+        agent_version="v1",
+        session_id=session_id,
+    )
+    storage.add_request(req)
+    return req.request_id
+
+
+def _seed_request_with_source(
+    storage: BaseStorage,
+    *,
+    user_id: str,
+    session_id: str,
+    ts: int,
+    source: str,
+    request_id: str,
+) -> str:
+    req = Request(
+        request_id=request_id,
+        user_id=user_id,
+        created_at=ts,
+        source=source,
         agent_version="v1",
         session_id=session_id,
     )
@@ -90,7 +116,7 @@ def test_null_session_rejected_by_request_model() -> None:
             created_at=1000,
             source="test",
             agent_version="v1",
-            session_id=None,
+            session_id=cast(Any, None),
         )
 
 
@@ -179,6 +205,7 @@ def _seed_eval_result(
     session_id: str,
     evaluation_name: str,
     agent_version: str = "v1",
+    created_at: int = 1000,
 ) -> None:
     """Save one ``AgentSuccessEvaluationResult`` row with minimal fields set."""
     result = AgentSuccessEvaluationResult(
@@ -193,9 +220,144 @@ def _seed_eval_result(
         user_turns_to_resolution=None,
         is_escalated=False,
         embedding=[],
-        created_at=1000,
+        created_at=created_at,
     )
     storage.save_agent_success_evaluation_results([result])
+
+
+def test_first_requests_by_session_ids_returns_earliest_request(
+    storage: BaseStorage,
+) -> None:
+    _seed_request_with_source(
+        storage,
+        user_id="u1",
+        session_id="s1",
+        ts=2000,
+        source="later",
+        request_id="req_s1_later",
+    )
+    _seed_request_with_source(
+        storage,
+        user_id="u1",
+        session_id="s1",
+        ts=1000,
+        source="first",
+        request_id="req_s1_first",
+    )
+    _seed_request_with_source(
+        storage,
+        user_id="u2",
+        session_id="s2",
+        ts=1500,
+        source="only",
+        request_id="req_s2_only",
+    )
+
+    out = storage.get_first_requests_by_session_ids(["s2", "s1", "missing", "s1"])
+
+    assert set(out) == {"s1", "s2"}
+    assert out["s1"].user_id == "u1"
+    assert out["s1"].source == "first"
+    assert out["s1"].created_at == 1000
+    assert out["s2"].user_id == "u2"
+    assert out["s2"].source == "only"
+
+
+def test_base_first_request_fallback_paginates_all_session_rows() -> None:
+    class PaginatedSessionStorage:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int | None, int]] = []
+            self.requests = [
+                Request(
+                    request_id=f"req-{i}",
+                    user_id="u1",
+                    created_at=1_700_000_000 + i,
+                    source=f"source-{i}",
+                    agent_version="v1",
+                    session_id="big-session",
+                )
+                for i in range(1001)
+            ]
+
+        def get_sessions(
+            self,
+            user_id: str | None = None,
+            request_id: str | None = None,
+            session_id: str | None = None,
+            start_time: int | None = None,
+            end_time: int | None = None,
+            top_k: int | None = 30,
+            offset: int = 0,
+        ) -> dict[str, list[RequestInteractionDataModel]]:
+            del user_id, request_id, start_time, end_time
+            self.calls.append((top_k, offset))
+            matching = [r for r in self.requests if r.session_id == session_id]
+            rows = sorted(matching, key=lambda r: r.created_at, reverse=True)
+            page = rows[offset : offset + (top_k or 0)]
+            return {
+                session_id or "": [
+                    RequestInteractionDataModel(
+                        session_id=r.session_id,
+                        request=r,
+                        interactions=[],
+                    )
+                    for r in page
+                ]
+            }
+
+    storage = PaginatedSessionStorage()
+
+    out = RequestMixin.get_first_requests_by_session_ids(
+        cast(Any, storage), ["big-session"]
+    )
+
+    assert out["big-session"].created_at == 1_700_000_000
+    assert out["big-session"].source == "source-0"
+    assert storage.calls == [(1000, 0), (1000, 1000)]
+
+
+def test_eval_result_window_read_filters_in_storage_contract(
+    storage: BaseStorage,
+) -> None:
+    _seed_eval_result(storage, "old", "overall_success", created_at=100)
+    _seed_eval_result(storage, "inside", "overall_success", created_at=200)
+    _seed_eval_result(storage, "new", "overall_success", created_at=300)
+    _seed_eval_result(
+        storage, "inside_v2", "overall_success", agent_version="v2", created_at=250
+    )
+
+    all_inside = storage.get_agent_success_evaluation_results_in_window(150, 260)
+    v1_inside = storage.get_agent_success_evaluation_results_in_window(
+        150, 260, agent_version="v1"
+    )
+
+    assert {r.session_id for r in all_inside} == {"inside", "inside_v2"}
+    assert {r.session_id for r in v1_inside} == {"inside"}
+
+
+def test_targeted_eval_result_id_lookup(
+    storage: BaseStorage,
+) -> None:
+    _seed_eval_result(storage, "s1", "overall_success", agent_version="v1")
+    _seed_eval_result(storage, "s1", "safety", agent_version="v1")
+    _seed_eval_result(storage, "s1", "overall_success", agent_version="v2")
+    _seed_eval_result(storage, "s2", "overall_success", agent_version="v1")
+
+    ids = storage.get_agent_success_evaluation_result_ids(
+        session_id="s1",
+        evaluation_name="overall_success",
+        agent_version="v1",
+    )
+
+    assert len(ids) == 1
+    row = [
+        r
+        for r in storage.get_agent_success_evaluation_results(limit=100)
+        if r.result_id == ids[0]
+    ][0]
+    assert row.session_id == "s1"
+    assert row.evaluation_name == "overall_success"
+    assert row.agent_version == "v1"
 
 
 def test_delete_scoped_to_session_and_name(storage: BaseStorage) -> None:
