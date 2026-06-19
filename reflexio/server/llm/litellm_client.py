@@ -38,9 +38,6 @@ from reflexio.server.llm.model_defaults import ModelRole, resolve_model_name
 from reflexio.server.llm.providers.claude_code_provider import (
     register_if_enabled as _register_claude_code,
 )
-from reflexio.server.llm.providers.openclaw_provider import (
-    register_if_enabled as _register_openclaw,
-)
 from reflexio.server.llm.providers.embedding_service_provider import (
     EmbeddingUnavailableError,
     embedding_provider_mode,
@@ -64,6 +61,9 @@ from reflexio.server.llm.providers.nomic_embedding_provider import (
 )
 from reflexio.server.llm.providers.nomic_embedding_provider import (
     register_if_enabled as _register_nomic_embedder,
+)
+from reflexio.server.llm.providers.openclaw_provider import (
+    register_if_enabled as _register_openclaw,
 )
 
 # Suppress LiteLLM's verbose logging
@@ -232,14 +232,17 @@ class LiteLLMConfig:
         temperature: Temperature for response generation (0.0 to 2.0).
         max_tokens: Maximum tokens to generate.
         timeout: Request timeout in seconds.
-        max_retries: Maximum retry attempts on the primary model. Passed
-            directly to litellm's num_retries. Default 3.
+        max_retries: Maximum same-model retry attempts. Used by the embedding
+            path (litellm's num_retries) and clamped in _build_completion_params.
+            NOT used on the chat-completion path — that forces num_retries=0 so a
+            hung primary can't be retried before the fallback (PYTHON-FASTAPI-62).
+            Default 3.
         retry_delay: Currently unused — LiteLLM owns retry backoff. Kept for
             backward compatibility; remove in a follow-up sweep.
         top_p: Top-p sampling parameter.
         api_key_config: Optional API key configuration from Config (overrides env vars).
-        fallback_models: Models LiteLLM tries in order after the primary
-            exhausts num_retries. Passed directly to litellm's fallbacks param.
+        fallback_models: Models LiteLLM tries in order after the primary's single
+            attempt. Passed directly to litellm's fallbacks param.
             Default is an empty list (no fallback) so local reflexio and the
             claude-smart integration are never silently routed to an unintended
             provider. Production opts in via the env var
@@ -264,12 +267,18 @@ class LiteLLMConfig:
     )
 
 
-# Reasoning models that routinely exceed the default 120s provider timeout on
-# large extraction contexts. Values are floors, not overrides: the effective
-# timeout is max(configured, floor), and an explicit per-call timeout kwarg
-# always wins.
+# Per-model provider-timeout floors. Values are floors, not overrides: the
+# effective timeout is max(configured, floor), and an explicit per-call timeout
+# kwarg always wins.
+#
+# MiniMax-M3 was pinned to 240s when it was the sole model. That let a *hung*
+# primary block ~240s before falling back, dominating the wasted time behind
+# Sentry PYTHON-FASTAPI-62. It is now floored at the 120s default so a hang is
+# abandoned sooner and the fallback (e.g. gpt-5-mini) is reached faster. This is
+# the key post-deploy tuning knob: raise it if legitimately-slow calls start
+# timing out, lower it to cut more waste.
 _MODEL_TIMEOUT_FLOOR_SECONDS: dict[str, int] = {
-    "minimax/MiniMax-M3": 240,
+    "minimax/MiniMax-M3": 120,
 }
 
 
@@ -1119,20 +1128,38 @@ class LiteLLMClient:
         except Exception:
             return None
 
-    def _completion_with_hard_timeout(self, params: dict[str, Any]) -> Any:
+    def _coerce_timeout_seconds(self, params: dict[str, Any]) -> float:
+        """Coerce ``params['timeout']`` to a float, falling back to the config
+        default when it is missing or non-numeric."""
+        try:
+            return float(params.get("timeout", self.config.timeout))
+        except (TypeError, ValueError):
+            return float(self.config.timeout)
+
+    def _completion_with_hard_timeout(
+        self, params: dict[str, Any], hard_timeout: float
+    ) -> Any:
         """Run ``litellm.completion`` with a client-side wall-clock bound.
 
         Some providers can exceed LiteLLM's ``timeout`` kwarg. Run the blocking
         call in a child process so the caller can fail, release locks, and
         terminate the in-flight provider request instead of waiting indefinitely.
+
+        ``hard_timeout`` is the wall-clock kill bound for the whole subprocess.
+        Because LiteLLM walks ``[primary, *fallbacks]`` inside this one call
+        (copying ``timeout`` unchanged into each rung), the caller sizes
+        ``hard_timeout`` to cover the entire fallback ladder, not a single
+        attempt — otherwise the subprocess would be killed before LiteLLM ever
+        reaches a fallback (the root cause of Sentry PYTHON-FASTAPI-62).
         """
         provider_timeout = params.get("timeout", self.config.timeout)
-        try:
-            timeout_seconds = float(provider_timeout)
-        except (TypeError, ValueError):
-            timeout_seconds = float(self.config.timeout)
+        # timeout_seconds + grace_seconds below only classify test doubles in
+        # _should_process_isolate_completion (real litellm vs a monkeypatched
+        # closure) — they do NOT size the kill bound, which is the caller's
+        # ladder-wide ``hard_timeout``.
+        timeout_seconds = self._coerce_timeout_seconds(params)
         grace_seconds = self._hard_timeout_grace_seconds()
-        hard_timeout = max(0.001, timeout_seconds) + max(0.0, grace_seconds)
+        hard_timeout = max(0.001, hard_timeout)
 
         if not self._should_process_isolate_completion(timeout_seconds, grace_seconds):
             return litellm.completion(**params)
@@ -1305,14 +1332,15 @@ class LiteLLMClient:
         self, messages: list[dict[str, Any]], **kwargs: Any
     ) -> str | BaseModel | ToolCallingChatResponse:
         """
-        Make a request to the LLM, delegating retries and fallback to litellm.
+        Make a request to the LLM, delegating cross-model fallback to litellm.
 
-        Retry and fallback semantics are handed to ``litellm.completion`` via
-        the native ``num_retries`` and ``fallbacks`` kwargs. Per the documented
-        flow at https://docs.litellm.ai/docs/router_architecture, the primary
-        model is tried ``num_retries+1`` times, then each fallback gets a single
-        attempt. The one piece we still own at the client level is a single
-        retry for ``StructuredOutputParseError``: LiteLLM cannot detect a
+        Fallback is handed to ``litellm.completion`` via the native ``fallbacks``
+        kwarg, but ``num_retries`` is forced to 0: same-model retry of a *hung*
+        primary is what made the fallback unreachable and produced the 490s in
+        Sentry PYTHON-FASTAPI-62 (see the body comment). So the primary is tried
+        once, then each fallback once. The subprocess hard timeout is sized to
+        cover that whole ladder. The one retry we still own at the client level
+        is a single ``StructuredOutputParseError`` retry: LiteLLM cannot detect a
         post-hoc Pydantic re-validation failure because it sees a successful
         HTTP response.
 
@@ -1329,28 +1357,53 @@ class LiteLLMClient:
             LiteLLMClientError: If the request fails after all retries and
                 fallbacks have been exhausted by litellm.
         """
-        params, response_format, parse_structured_output, max_retries, fallbacks = (
+        params, response_format, parse_structured_output, _max_retries, fallbacks = (
             self._build_completion_params(messages, **kwargs)
         )
 
-        # Hand retries + fallbacks to litellm. ``num_retries`` is the documented
-        # alias for max_retries on litellm.completion.
-        params["num_retries"] = max_retries
+        # Hand the fallback ladder to litellm, but DISABLE same-model retries.
+        # litellm walks [primary, *fallbacks] inside one litellm.completion call,
+        # copying ``timeout`` unchanged into each rung. With num_retries>=1 it
+        # retries a *hung* primary num_retries+1 times (each up to a full
+        # provider timeout) before ever reaching a fallback — making the fallback
+        # unreachable within any sane wall-clock bound (root cause of Sentry
+        # PYTHON-FASTAPI-62). num_retries=0 makes the fallback LIST the resilience
+        # mechanism: each model is tried once, in order.
+        params["num_retries"] = 0
         if fallbacks:
             params["fallbacks"] = fallbacks
 
+        # Size the hard (wall-clock) timeout to cover the WHOLE ladder. litellm
+        # copies this single ``params["timeout"]`` into EVERY rung (primary + each
+        # fallback), so every rung shares the primary's per-attempt budget and the
+        # subprocess must be allowed to run ``(1 + len(fallbacks))`` of them plus
+        # one grace buffer before being killed — otherwise it is killed before
+        # litellm can reach a fallback.
+        #
+        # ASYMMETRIC-FLOOR FOOTGUN: because every rung shares one timeout, a
+        # fallback whose _MODEL_TIMEOUT_FLOOR_SECONDS floor is HIGHER than the
+        # primary's would run — and be killed — at the primary's shorter timeout,
+        # reintroducing the "fallback killed early" failure this fix removes. The
+        # floor table is single-valued today (MiniMax-M3 == the 120 default), so
+        # this is latent; revisit the sizing (e.g. max floor across rungs, passed
+        # as ``params["timeout"]``) before adding an asymmetric floor entry.
+        per_attempt_timeout = self._coerce_timeout_seconds(params)
+        hard_timeout = (
+            1 + len(fallbacks)
+        ) * per_attempt_timeout + self._hard_timeout_grace_seconds()
+
         request_start = time.perf_counter()
         self.logger.info(
-            "event=llm_request_start model=%s timeout=%s has_response_format=%s num_retries=%d fallbacks=%s",
+            "event=llm_request_start model=%s timeout=%s has_response_format=%s num_retries=0 fallbacks=%s hard_timeout=%.3f",
             params.get("model"),
             params.get("timeout"),
             response_format is not None,
-            max_retries,
             fallbacks,
+            hard_timeout,
         )
 
         def _call_and_parse() -> str | BaseModel | ToolCallingChatResponse:
-            response = self._completion_with_hard_timeout(params)
+            response = self._completion_with_hard_timeout(params, hard_timeout)
             self._emit_fallback_observability(response, params)
             message = response.choices[0].message  # type: ignore[reportAttributeAccessIssue]
             content = message.content
@@ -1387,22 +1440,22 @@ class LiteLLMClient:
             try:
                 return _call_and_parse()
             except StructuredOutputParseError:
-                # LiteLLM's num_retries covers API errors, but a Pydantic
-                # re-validation failure happens AFTER litellm sees a
-                # successful 200 — so we owe one explicit second attempt at
-                # the model. PR #121 documented this as a MiniMax-M3
-                # mitigation.
+                # litellm's fallbacks cover API/timeout errors, but a Pydantic
+                # re-validation failure happens AFTER litellm sees a successful
+                # 200 — litellm can't detect it, so we owe one explicit second
+                # attempt at the model. PR #121 documented this as a MiniMax-M3
+                # mitigation. (A hard timeout is NOT retried here: same-model
+                # retry of a hang is what produced the 490s in PYTHON-FASTAPI-62;
+                # the fallback ladder inside _call_and_parse handles it instead.)
+                #
+                # This second pass re-walks the full ladder, so the worst-case
+                # wall clock is ~2x the ladder bound. That ceiling is only reached
+                # if a model returns a malformed-but-successful 200 AND runs near
+                # the timeout on BOTH passes — a hang (the common case) raises
+                # LLMHardTimeoutError, which is not caught here and exits after a
+                # single ladder.
                 self.logger.warning(
                     "event=llm_parse_retry model=%s — primary returned malformed structured output, retrying once",
-                    params.get("model"),
-                )
-                return _call_and_parse()
-            except LLMHardTimeoutError:
-                # The hard timeout kills the litellm subprocess, so litellm's
-                # num_retries never gets a chance — we owe one explicit retry
-                # at this level to cover transient provider hangs.
-                self.logger.warning(
-                    "event=llm_hard_timeout_retry model=%s — request hit hard timeout, retrying once",
                     params.get("model"),
                 )
                 return _call_and_parse()
