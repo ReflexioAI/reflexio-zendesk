@@ -1,8 +1,11 @@
 {
-  "id": "reflexio-federated",
-  "name": "Reflexio Federated",
-  "description": "Cross-session memory via Reflexio server. Publishes conversations for extraction, injects relevant profiles and playbooks before each response.",
+  "id": "reflexio-openclaw-smart",
+  "name": "Reflexio openClaw Smart",
+  "description": "Cross-session memory and self-improvement for openClaw via local reflexio backend.",
   "skills": ["./skills"],
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -14,18 +17,16 @@
           "batch_size": { "type": "integer", "default": 10 },
           "max_retries": { "type": "integer", "default": 3 },
           "max_content_length": { "type": "integer", "default": 10000 }
-        },
-        "default": { "batch_size": 10, "max_retries": 3, "max_content_length": 10000 }
+        }
       },
       "search": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "timeout_ms": { "type": "integer", "default": 5000 },
-          "top_k": { "type": "integer", "default": 5 },
+          "top_k": { "type": "integer", "default": 3 },
           "min_prompt_length": { "type": "integer", "default": 5 }
-        },
-        "default": { "timeout_ms": 5000, "top_k": 5, "min_prompt_length": 5 }
+        }
       },
       "server": {
         "type": "object",
@@ -33,8 +34,17 @@
         "properties": {
           "health_check_timeout_ms": { "type": "integer", "default": 3000 },
           "stale_flag_ms": { "type": "integer", "default": 120000 }
-        },
-        "default": { "health_check_timeout_ms": 3000, "stale_flag_ms": 120000 }
+        }
+      },
+      "extraction": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "openClaw model id passed as --model to `openclaw infer model run`. If omitted, the user's openClaw default is used."
+          }
+        }
       }
     }
   }
