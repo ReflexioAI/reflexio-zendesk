@@ -285,6 +285,13 @@ def _true_rrf_merge(
     return [row for row, _ in scored[:match_count]]
 
 
+# Tombstone statuses: rows with these values are excluded from default reads.
+# Tasks 5/9/10 create tombstones; this constant ensures they stay hidden unless
+# explicitly requested via include_tombstones=True on by-id getters, or an
+# explicit status_filter on list/count methods.
+_TOMBSTONE_STATUS_VALUES = (Status.MERGED.value, Status.SUPERSEDED.value)
+
+
 def _status_value(status: Status | None) -> str | None:
     """Convert a Status enum (or None) to its DB string value."""
     if status is None:
@@ -395,6 +402,8 @@ def _row_to_profile(row: sqlite3.Row) -> UserProfile:
         notes=d.get("notes"),
         reader_angle=d.get("reader_angle"),
         tags=_json_loads(d.get("tags")),
+        merged_into=d.get("merged_into"),
+        superseded_by=d.get("superseded_by"),
     )
 
 
@@ -473,6 +482,8 @@ def _row_to_user_playbook(
         source_span=d.get("source_span"),
         notes=d.get("notes"),
         reader_angle=d.get("reader_angle"),
+        merged_into=d.get("merged_into"),
+        superseded_by=d.get("superseded_by"),
     )
 
 
@@ -497,6 +508,8 @@ def _row_to_agent_playbook(row: sqlite3.Row) -> AgentPlaybook:
         embedding=[],
         status=Status(d["status"]) if d.get("status") else None,
         expanded_terms=d.get("expanded_terms"),
+        merged_into=d.get("merged_into"),
+        superseded_by=d.get("superseded_by"),
     )
 
 
@@ -684,6 +697,8 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         self._migrate_request_session_id_required()
         self._migrate_shadow_comparison_verdicts()
         self._migrate_user_playbook_polarity()
+        self._migrate_lineage()
+        self._migrate_lineage_event_table()
         init_stall_state_table(self.conn)
         return True
 
@@ -1206,6 +1221,50 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             logger.info("Dropped legacy polarity column from user_playbooks")
         self.conn.commit()
 
+    def _migrate_lineage(self) -> None:
+        """Add merged_into/superseded_by forward-pointer columns if missing.
+
+        Backfill-safe: columns are nullable with no default. INTEGER for playbook
+        tables (int foreign-key pointers), TEXT for profiles (str profile_id pointers).
+        """
+        int_tables = {"user_playbooks": "INTEGER", "agent_playbooks": "INTEGER"}
+        str_tables = {"profiles": "TEXT"}
+        for table, coltype in {**int_tables, **str_tables}.items():
+            cols = {
+                row["name"]
+                for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for col in ("merged_into", "superseded_by"):
+                if col not in cols:
+                    self.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"  # noqa: S608
+                    )
+                    logger.info("Added %s column to %s", col, table)
+        self.conn.commit()
+
+    def _migrate_lineage_event_table(self) -> None:
+        """Create the lineage_event table + index for existing databases (idempotent)."""
+        with self._lock:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS lineage_event (
+                    event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    org_id        TEXT NOT NULL,
+                    entity_type   TEXT NOT NULL,
+                    entity_id     TEXT NOT NULL,
+                    op            TEXT NOT NULL,
+                    prov_relation TEXT NOT NULL DEFAULT '',
+                    source_ids    TEXT NOT NULL DEFAULT '[]',
+                    actor         TEXT NOT NULL DEFAULT '',
+                    request_id    TEXT NOT NULL DEFAULT '',
+                    reason        TEXT NOT NULL DEFAULT '',
+                    created_at    INTEGER NOT NULL,
+                    UNIQUE (org_id, entity_type, entity_id, op, request_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_lineage_entity
+                    ON lineage_event (entity_type, entity_id);
+            """)
+            self.conn.commit()
+
     def _migrate_agent_playbook_source_windows(self) -> None:
         """Add source window snapshots to existing agent source mappings."""
         cols = {
@@ -1688,6 +1747,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     source_span TEXT,
     notes TEXT,
     reader_angle TEXT,
+    merged_into TEXT,
+    superseded_by TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE INDEX IF NOT EXISTS idx_profiles_user_id ON profiles(user_id);
@@ -1747,7 +1808,9 @@ CREATE TABLE IF NOT EXISTS user_playbooks (
     tags TEXT,
     source_span TEXT,
     notes TEXT,
-    reader_angle TEXT
+    reader_angle TEXT,
+    merged_into INTEGER,
+    superseded_by INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_playbook_name ON user_playbooks(playbook_name);
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_agent_version ON user_playbooks(agent_version);
@@ -1768,7 +1831,9 @@ CREATE TABLE IF NOT EXISTS agent_playbooks (
     embedding TEXT,
     expanded_terms TEXT,
     tags TEXT,
-    status TEXT
+    status TEXT,
+    merged_into INTEGER,
+    superseded_by INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_agent_playbooks_playbook_name ON agent_playbooks(playbook_name);
 CREATE INDEX IF NOT EXISTS idx_agent_playbooks_agent_version ON agent_playbooks(agent_version);
@@ -2055,5 +2120,25 @@ CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_prompt_v
     ON shadow_comparison_verdicts (judge_prompt_version);
 CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_prompt_created_at_desc
     ON shadow_comparison_verdicts (judge_prompt_version, created_at DESC);
+
+-- ============================================================================
+-- Append-only, content-free lineage event log
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS lineage_event (
+    event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id        TEXT NOT NULL,
+    entity_type   TEXT NOT NULL,
+    entity_id     TEXT NOT NULL,
+    op            TEXT NOT NULL,
+    prov_relation TEXT NOT NULL DEFAULT '',
+    source_ids    TEXT NOT NULL DEFAULT '[]',
+    actor         TEXT NOT NULL DEFAULT '',
+    request_id    TEXT NOT NULL DEFAULT '',
+    reason        TEXT NOT NULL DEFAULT '',
+    created_at    INTEGER NOT NULL,
+    UNIQUE (org_id, entity_type, entity_id, op, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_entity ON lineage_event (entity_type, entity_id);
 
 """

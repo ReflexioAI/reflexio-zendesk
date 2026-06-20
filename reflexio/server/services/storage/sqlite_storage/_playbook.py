@@ -25,6 +25,7 @@ from reflexio.models.api_schema.service_schemas import (
 from reflexio.models.config_schema import SearchMode, SearchOptions
 
 from ._base import (
+    _TOMBSTONE_STATUS_VALUES,
     SQLiteStorageBase,
     _build_status_sql,
     _effective_search_mode,
@@ -38,6 +39,7 @@ from ._base import (
     _true_rrf_merge,
     _vector_rank_rows,
 )
+from ._lineage import _append_event_stmt
 
 
 def _row_to_playbook_optimization_candidate(
@@ -93,6 +95,7 @@ class PlaybookMixin:
     # Type hints for instance attributes/methods provided by SQLiteStorageBase via MRO
     _lock: Any
     conn: sqlite3.Connection
+    org_id: str
     _execute: Any
     _fetchone: Any
     _fetchall: Any
@@ -135,8 +138,9 @@ class PlaybookMixin:
                         content, trigger, rationale, blocking_issue,
                         source_interaction_ids,
                         status, source, embedding, expanded_terms,
-                        source_span, notes, reader_angle, tags)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        source_span, notes, reader_angle, tags,
+                        merged_into, superseded_by)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         up.user_id,
                         up.playbook_name,
@@ -158,6 +162,8 @@ class PlaybookMixin:
                         up.notes,
                         up.reader_angle,
                         _json_dumps(up.tags),
+                        up.merged_into,
+                        up.superseded_by,
                     ),
                 )
                 upid = cur.lastrowid or 0
@@ -210,6 +216,10 @@ class PlaybookMixin:
             frag, sparams = _build_status_sql(status_filter)
             sql += f" AND {frag}"
             params.extend(sparams)
+        else:
+            # Default: exclude tombstone statuses (MERGED/SUPERSEDED)
+            sql += " AND (status IS NULL OR status NOT IN (?, ?))"
+            params.extend(_TOMBSTONE_STATUS_VALUES)
         tag_frag, tag_params = _build_tags_sql("user_playbooks", tags)
         if tag_frag:
             sql += f" AND {tag_frag}"
@@ -250,6 +260,10 @@ class PlaybookMixin:
             frag, sparams = _build_status_sql(status_filter)
             sql += f" AND {frag}"
             params.extend(sparams)
+        else:
+            # Default: exclude tombstone statuses (MERGED/SUPERSEDED)
+            sql += " AND (status IS NULL OR status NOT IN (?, ?))"
+            params.extend(_TOMBSTONE_STATUS_VALUES)
 
         row = self._fetchone(sql, params)
         return row["cnt"] if row else 0
@@ -259,8 +273,9 @@ class PlaybookMixin:
         row = self._fetchone(
             """SELECT COUNT(*) as cnt FROM user_playbooks up
                JOIN requests r ON up.request_id = r.request_id
-               WHERE r.session_id = ?""",
-            (session_id,),
+               WHERE r.session_id = ?
+                 AND (up.status IS NULL OR up.status NOT IN (?, ?))""",
+            (session_id, *_TOMBSTONE_STATUS_VALUES),
         )
         return row["cnt"] if row else 0
 
@@ -305,11 +320,27 @@ class PlaybookMixin:
         self._execute(del_sql, del_params)
 
     @SQLiteStorageBase.handle_exceptions
-    def delete_user_playbooks_by_ids(self, user_playbook_ids: list[int]) -> int:
+    def delete_user_playbooks_by_ids(
+        self, user_playbook_ids: list[int], *, emit_hard_delete: bool = True
+    ) -> int:
         if not user_playbook_ids:
             return 0
         ph = ",".join("?" for _ in user_playbook_ids)
         with self._lock:
+            if emit_hard_delete:
+                for upid in user_playbook_ids:
+                    _append_event_stmt(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_type="user_playbook",
+                        entity_id=str(upid),
+                        op="hard_delete",
+                        prov="wasInvalidatedBy",
+                        source_ids=[],
+                        actor="system",
+                        request_id="",
+                        reason="erasure",
+                    )
             self.conn.execute(
                 f"DELETE FROM user_playbooks_fts WHERE rowid IN ({ph})",
                 user_playbook_ids,
@@ -486,6 +517,10 @@ class PlaybookMixin:
             frag, sparams = _build_status_sql(status_filter)
             conditions.append(frag)
             params.extend(sparams)
+        else:
+            # Default: exclude tombstone statuses (MERGED/SUPERSEDED)
+            conditions.append("(up.status IS NULL OR up.status NOT IN (?, ?))")
+            params.extend(_TOMBSTONE_STATUS_VALUES)
         tag_frag, tag_params = _build_tags_sql("up", request.tags)
         if tag_frag:
             conditions.append(tag_frag)
@@ -554,11 +589,15 @@ class PlaybookMixin:
         return [_row_to_user_playbook(r) for r in rows]
 
     @SQLiteStorageBase.handle_exceptions
-    def get_user_playbook_by_id(self, user_playbook_id: int) -> UserPlaybook | None:
-        row = self._fetchone(
-            "SELECT * FROM user_playbooks WHERE user_playbook_id = ?",
-            (user_playbook_id,),
-        )
+    def get_user_playbook_by_id(
+        self, user_playbook_id: int, *, include_tombstones: bool = False
+    ) -> UserPlaybook | None:
+        sql = "SELECT * FROM user_playbooks WHERE user_playbook_id = ?"
+        if not include_tombstones:
+            sql += " AND (status IS NULL OR status NOT IN (?, ?))"
+            row = self._fetchone(sql, (user_playbook_id, *_TOMBSTONE_STATUS_VALUES))
+        else:
+            row = self._fetchone(sql, (user_playbook_id,))
         return _row_to_user_playbook(row) if row else None
 
     @SQLiteStorageBase.handle_exceptions
@@ -610,8 +649,9 @@ class PlaybookMixin:
                        (playbook_name, created_at, agent_version, content,
                         trigger, rationale, blocking_issue,
                         playbook_status, playbook_metadata, embedding,
-                        expanded_terms, tags, status)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        expanded_terms, tags, status,
+                        merged_into, superseded_by)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         ap.playbook_name,
                         created_at_iso,
@@ -630,6 +670,8 @@ class PlaybookMixin:
                         ap.expanded_terms,
                         _json_dumps(ap.tags),
                         ap.status.value if ap.status else None,
+                        ap.merged_into,
+                        ap.superseded_by,
                     ),
                 )
                 ap.agent_playbook_id = cur.lastrowid or 0
@@ -693,11 +735,15 @@ class PlaybookMixin:
         return [_row_to_agent_playbook(r) for r in rows]
 
     @SQLiteStorageBase.handle_exceptions
-    def get_agent_playbook_by_id(self, agent_playbook_id: int) -> AgentPlaybook | None:
-        row = self._fetchone(
-            "SELECT * FROM agent_playbooks WHERE agent_playbook_id = ?",
-            (agent_playbook_id,),
-        )
+    def get_agent_playbook_by_id(
+        self, agent_playbook_id: int, *, include_tombstones: bool = False
+    ) -> AgentPlaybook | None:
+        sql = "SELECT * FROM agent_playbooks WHERE agent_playbook_id = ?"
+        if not include_tombstones:
+            sql += " AND (status IS NULL OR status NOT IN (?, ?))"
+            row = self._fetchone(sql, (agent_playbook_id, *_TOMBSTONE_STATUS_VALUES))
+        else:
+            row = self._fetchone(sql, (agent_playbook_id,))
         return _row_to_agent_playbook(row) if row else None
 
     @SQLiteStorageBase.handle_exceptions
@@ -742,11 +788,27 @@ class PlaybookMixin:
         self._execute(del_sql, del_params)
 
     @SQLiteStorageBase.handle_exceptions
-    def delete_agent_playbooks_by_ids(self, agent_playbook_ids: list[int]) -> None:
+    def delete_agent_playbooks_by_ids(
+        self, agent_playbook_ids: list[int], *, emit_hard_delete: bool = True
+    ) -> None:
         if not agent_playbook_ids:
             return
         ph = ",".join("?" for _ in agent_playbook_ids)
         with self._lock:
+            if emit_hard_delete:
+                for apid in agent_playbook_ids:
+                    _append_event_stmt(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_type="agent_playbook",
+                        entity_id=str(apid),
+                        op="hard_delete",
+                        prov="wasInvalidatedBy",
+                        source_ids=[],
+                        actor="system",
+                        request_id="",
+                        reason="erasure",
+                    )
             self.conn.execute(
                 f"DELETE FROM agent_playbooks_fts WHERE rowid IN ({ph})",
                 agent_playbook_ids,

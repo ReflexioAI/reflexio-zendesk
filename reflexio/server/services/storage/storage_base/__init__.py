@@ -23,10 +23,12 @@ from ._agent_run import (
 )
 from ._base import BaseStorageCore, matches_status_filter
 from ._extras import ExtrasMixin
+from ._lineage import LineageEventMixin
 from ._operations import OperationMixin
 from ._playbook import PlaybookMixin
 from ._profiles import ProfileMixin
 from ._requests import RequestMixin
+from ._retrieval_log import RetrievalLogMixin
 from ._shadow_verdicts import ShadowVerdictsMixin
 from ._share_links import ShareLinkMixin
 from ._stall_state import StallStateMixin
@@ -37,6 +39,8 @@ class BaseStorage(
     ProfileMixin,
     RequestMixin,
     PlaybookMixin,
+    RetrievalLogMixin,
+    LineageEventMixin,
     OperationMixin,
     ExtrasMixin,
     ShareLinkMixin,
@@ -127,6 +131,7 @@ class BaseStorage(
 __all__ = [
     "AgentBinding",
     "AgentRunMixin",
+    "LineageEventMixin",
     "AgentRunRecord",
     "AgentRunStatus",
     "BaseStorage",
@@ -135,6 +140,7 @@ __all__ = [
     "PendingToolCallStatus",
     "PendingToolCallUpsertResult",
     "PlaybookMixin",
+    "RetrievalLogMixin",
     "PriorAnswerMatch",
     "RunToolDependencyKind",
     "RunToolDependencyRecord",
