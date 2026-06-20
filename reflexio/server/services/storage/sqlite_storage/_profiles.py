@@ -2,6 +2,7 @@
 
 import logging
 import sqlite3
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -24,8 +25,8 @@ from reflexio.server.llm.providers.embedding_service_provider import (
 )
 
 from ._base import (
-    SQLiteStorageBase,
     _TOMBSTONE_STATUS_VALUES,
+    SQLiteStorageBase,
     _build_status_sql,
     _effective_search_mode,
     _epoch_now,
@@ -38,6 +39,30 @@ from ._base import (
     _true_rrf_merge,
     _vector_rank_rows,
 )
+from ._lineage import _append_event_stmt
+
+
+def _emit_hard_delete_profile(
+    conn: sqlite3.Connection,
+    *,
+    org_id: str,
+    entity_id: str,
+    request_id: str,
+    actor: str = "api",
+) -> None:
+    """Emit a single hard_delete lineage event for a profile entity."""
+    _append_event_stmt(
+        conn,
+        org_id=org_id,
+        entity_type="profile",
+        entity_id=entity_id,
+        op="hard_delete",
+        prov="wasInvalidatedBy",
+        source_ids=[],
+        actor=actor,
+        request_id=request_id,
+        reason="erasure",
+    )
 
 
 def _build_tags_sql(alias: str, tags: list[str] | None) -> tuple[str, list[Any]]:
@@ -56,6 +81,7 @@ class ProfileMixin:
     # Type hints for instance attributes/methods provided by SQLiteStorageBase via MRO
     _lock: Any
     conn: sqlite3.Connection
+    org_id: str
     _execute: Any
     _fetchone: Any
     _fetchall: Any
@@ -68,6 +94,7 @@ class ProfileMixin:
     _fts_delete_profile: Any
     _vec_upsert: Any
     _vec_delete: Any
+    _delete_profile_search_rows: Any
     _has_sqlite_vec: bool
     llm_client: Any
     embedding_model_name: str
@@ -173,58 +200,80 @@ class ProfileMixin:
     def update_user_profile_by_id(
         self, user_id: str, profile_id: str, new_profile: UserProfile
     ) -> None:
+        """Replace a profile's content in-place and emit a revise lineage event.
+
+        Each call generates a fresh request_id so every edit is a distinct audit
+        event (not collapsed by the idempotency key).  The UPDATE, lineage event,
+        FTS sync, and vec sync are all executed inside a single lock acquisition;
+        self._lock is an RLock so the inner _fts_upsert_profile/_vec_upsert calls
+        that re-acquire it are safe.
+        """
         current_ts = _epoch_now()
         row = self._fetchone(
             "SELECT profile_id FROM profiles WHERE user_id = ? AND profile_id = ? AND expiration_timestamp >= ?",
             (user_id, profile_id, current_ts),
         )
         if not row:
-            import logging
-
-            logger = logging.getLogger(__name__)
             logger.warning("User profile not found for user id: %s", user_id)
             return
         embedding = self._get_embedding(
             "\n".join([new_profile.content, str(new_profile.custom_features)])
         )
         new_profile.embedding = embedding
-        self._execute(
-            """UPDATE profiles SET content=?, last_modified_timestamp=?,
-               generated_from_request_id=?, profile_time_to_live=?,
-               expiration_timestamp=?, custom_features=?, embedding=?,
-               source=?, status=?, extractor_names=?, expanded_terms=?,
-               source_span=?, notes=?, reader_angle=?, tags=?
-               WHERE profile_id=?""",
-            (
-                new_profile.content,
-                new_profile.last_modified_timestamp,
-                new_profile.generated_from_request_id,
-                new_profile.profile_time_to_live.value,
-                new_profile.expiration_timestamp,
-                _json_dumps(new_profile.custom_features),
-                _json_dumps(new_profile.embedding),
-                new_profile.source,
-                new_profile.status.value if new_profile.status else None,
-                _json_dumps(new_profile.extractor_names),
-                new_profile.expanded_terms,
-                new_profile.source_span,
-                new_profile.notes,
-                new_profile.reader_angle,
-                _json_dumps(new_profile.tags),
-                profile_id,
-            ),
-        )
-        fts_parts = [new_profile.content or ""]
-        if new_profile.custom_features:
-            fts_parts.extend(str(v) for v in new_profile.custom_features.values() if v)
-        if new_profile.expanded_terms:
-            fts_parts.append(new_profile.expanded_terms)
-        self._fts_upsert_profile(profile_id, " ".join(fts_parts))
-        rowid_row = self._fetchone(
-            "SELECT rowid FROM profiles WHERE profile_id = ?", (profile_id,)
-        )
-        if rowid_row and embedding:
-            self._vec_upsert("profiles_vec", rowid_row["rowid"], embedding)
+        with self._lock:
+            cur = self.conn.execute(
+                """UPDATE profiles SET content=?, last_modified_timestamp=?,
+                   generated_from_request_id=?, profile_time_to_live=?,
+                   expiration_timestamp=?, custom_features=?, embedding=?,
+                   source=?, status=?, extractor_names=?, expanded_terms=?,
+                   source_span=?, notes=?, reader_angle=?, tags=?
+                   WHERE profile_id=?""",
+                (
+                    new_profile.content,
+                    new_profile.last_modified_timestamp,
+                    new_profile.generated_from_request_id,
+                    new_profile.profile_time_to_live.value,
+                    new_profile.expiration_timestamp,
+                    _json_dumps(new_profile.custom_features),
+                    _json_dumps(new_profile.embedding),
+                    new_profile.source,
+                    new_profile.status.value if new_profile.status else None,
+                    _json_dumps(new_profile.extractor_names),
+                    new_profile.expanded_terms,
+                    new_profile.source_span,
+                    new_profile.notes,
+                    new_profile.reader_angle,
+                    _json_dumps(new_profile.tags),
+                    profile_id,
+                ),
+            )
+            if cur.rowcount > 0:
+                _append_event_stmt(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="profile",
+                    entity_id=str(profile_id),
+                    op="revise",
+                    prov="wasRevisionOf",
+                    source_ids=[],
+                    actor="api",
+                    request_id=uuid.uuid4().hex,
+                    reason="in-place update",
+                )
+            self.conn.commit()
+            fts_parts = [new_profile.content or ""]
+            if new_profile.custom_features:
+                fts_parts.extend(
+                    str(v) for v in new_profile.custom_features.values() if v
+                )
+            if new_profile.expanded_terms:
+                fts_parts.append(new_profile.expanded_terms)
+            self._fts_upsert_profile(profile_id, " ".join(fts_parts))
+            rowid_row = self._fetchone(
+                "SELECT rowid FROM profiles WHERE profile_id = ?", (profile_id,)
+            )
+            if rowid_row and embedding:
+                self._vec_upsert("profiles_vec", rowid_row["rowid"], embedding)
 
     @SQLiteStorageBase.handle_exceptions
     def update_user_profile_tags(
@@ -237,33 +286,65 @@ class ProfileMixin:
 
     @SQLiteStorageBase.handle_exceptions
     def delete_user_profile(self, request: DeleteUserProfileRequest) -> None:
-        rowid_row = self._fetchone(
-            "SELECT rowid FROM profiles WHERE profile_id = ?",
-            (request.profile_id,),
-        )
-        self._fts_delete_profile(request.profile_id)
-        if rowid_row:
-            self._vec_delete("profiles_vec", rowid_row["rowid"])
-        self._execute(
-            "DELETE FROM profiles WHERE user_id = ? AND profile_id = ?",
-            (request.user_id, request.profile_id),
-        )
+        with self._lock:
+            rowid_row = self.conn.execute(
+                "SELECT rowid FROM profiles WHERE user_id = ? AND profile_id = ?",
+                (request.user_id, request.profile_id),
+            ).fetchone()
+            self._fts_delete_profile(request.profile_id)
+            if rowid_row:
+                self._vec_delete("profiles_vec", rowid_row["rowid"])
+            cur = self.conn.execute(
+                "DELETE FROM profiles WHERE user_id = ? AND profile_id = ?",
+                (request.user_id, request.profile_id),
+            )
+            if cur.rowcount > 0:
+                _emit_hard_delete_profile(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_id=str(request.profile_id),
+                    request_id=uuid.uuid4().hex,
+                )
+            self.conn.commit()
 
     @SQLiteStorageBase.handle_exceptions
     def delete_all_profiles_for_user(self, user_id: str) -> None:
-        pids = [
-            r["profile_id"]
-            for r in self._fetchall(
-                "SELECT profile_id FROM profiles WHERE user_id = ?", (user_id,)
-            )
-        ]
-        for pid in pids:
-            self._fts_delete_profile(pid)
-        self._execute("DELETE FROM profiles WHERE user_id = ?", (user_id,))
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            pids = [
+                r["profile_id"]
+                for r in self.conn.execute(
+                    "SELECT profile_id FROM profiles WHERE user_id = ?", (user_id,)
+                ).fetchall()
+            ]
+            if not pids:
+                return
+            self._delete_profile_search_rows(pids)
+            self.conn.execute("DELETE FROM profiles WHERE user_id = ?", (user_id,))
+            for pid in pids:
+                _emit_hard_delete_profile(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_id=str(pid),
+                    request_id=batch_request_id,
+                )
+            self.conn.commit()
 
     @SQLiteStorageBase.handle_exceptions
     def delete_all_profiles(self) -> None:
+        batch_request_id = uuid.uuid4().hex
         with self._lock:
+            pids = [
+                r["profile_id"]
+                for r in self.conn.execute("SELECT profile_id FROM profiles").fetchall()
+            ]
+            for pid in pids:
+                _emit_hard_delete_profile(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_id=str(pid),
+                    request_id=batch_request_id,
+                )
             self.conn.execute("DELETE FROM profiles_fts")
             self.conn.execute("DELETE FROM profiles")
             self.conn.commit()
@@ -282,25 +363,57 @@ class ProfileMixin:
     ) -> int:
         new_val = new_status.value if new_status else None
         now_ts = _epoch_now()
-        params: list[Any] = [new_val, now_ts]
+        old_val_str = old_status.value if old_status else "None"
+        new_val_str = new_status.value if new_status else "None"
+        reason = f"{old_val_str}->{new_val_str}"
 
         if old_status is None or (
             hasattr(old_status, "value") and old_status.value is None
         ):
             where = "status IS NULL"
+            select_params: list[Any] = []
         else:
             where = "status = ?"
-            params.append(old_status.value)
+            select_params = [old_status.value]
 
+        extra_params: list[Any] = []
         if user_ids is not None:
             placeholders = ",".join("?" for _ in user_ids)
             where += f" AND user_id IN ({placeholders})"
-            params.extend(user_ids)
+            extra_params.extend(user_ids)
 
-        cur = self._execute(
-            f"UPDATE profiles SET status = ?, last_modified_timestamp = ? WHERE {where}",
-            params,
-        )
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            affected = [
+                r["profile_id"]
+                for r in self.conn.execute(
+                    f"SELECT profile_id FROM profiles WHERE {where}",
+                    select_params + extra_params,
+                ).fetchall()
+            ]
+            cur = self.conn.execute(
+                f"UPDATE profiles SET status = ?, last_modified_timestamp = ? WHERE {where}",
+                [new_val, now_ts] + select_params + extra_params,
+            )
+            from_val = old_status.value if old_status else None
+            to_val = new_status.value if new_status else None
+            for pid in affected:
+                _append_event_stmt(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="profile",
+                    entity_id=str(pid),
+                    op="status_change",
+                    prov="wasInvalidatedBy",
+                    source_ids=[],
+                    actor="api",
+                    request_id=batch_request_id,
+                    reason=reason,
+                    from_status=from_val,
+                    to_status=to_val,
+                    status_namespace="lifecycle_status",
+                )
+            self.conn.commit()
         return cur.rowcount
 
     @SQLiteStorageBase.handle_exceptions
@@ -349,25 +462,56 @@ class ProfileMixin:
 
     @SQLiteStorageBase.handle_exceptions
     def archive_profile_by_id(self, user_id: str, profile_id: str) -> bool:
-        cur = self._execute(
-            "UPDATE profiles SET status = ?, last_modified_timestamp = ? "
-            "WHERE profile_id = ? AND user_id = ? AND status IS NULL",
-            (Status.ARCHIVED.value, _epoch_now(), profile_id, user_id),
-        )
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE profiles SET status = ?, last_modified_timestamp = ? "
+                "WHERE profile_id = ? AND user_id = ? AND status IS NULL",
+                (Status.ARCHIVED.value, _epoch_now(), profile_id, user_id),
+            )
+            if cur.rowcount > 0:
+                _append_event_stmt(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="profile",
+                    entity_id=str(profile_id),
+                    op="status_change",
+                    prov="wasInvalidatedBy",
+                    source_ids=[],
+                    actor="api",
+                    request_id=uuid.uuid4().hex,
+                    reason="None->archived",
+                    from_status=None,
+                    to_status="archived",
+                    status_namespace="lifecycle_status",
+                )
+            self.conn.commit()
         return cur.rowcount > 0
 
     @SQLiteStorageBase.handle_exceptions
     def delete_all_profiles_by_status(self, status: Status) -> int:
-        # Clean up FTS for profiles being deleted
-        pids = [
-            r["profile_id"]
-            for r in self._fetchall(
-                "SELECT profile_id FROM profiles WHERE status = ?", (status.value,)
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            pids = [
+                r["profile_id"]
+                for r in self.conn.execute(
+                    "SELECT profile_id FROM profiles WHERE status = ?", (status.value,)
+                ).fetchall()
+            ]
+            if not pids:
+                return 0
+            self._delete_profile_search_rows(pids)
+            ph = ",".join("?" for _ in pids)
+            cur = self.conn.execute(
+                f"DELETE FROM profiles WHERE profile_id IN ({ph})", pids
             )
-        ]
-        for pid in pids:
-            self._fts_delete_profile(pid)
-        cur = self._execute("DELETE FROM profiles WHERE status = ?", (status.value,))
+            for pid in pids:
+                _emit_hard_delete_profile(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_id=str(pid),
+                    request_id=batch_request_id,
+                )
+            self.conn.commit()
         return cur.rowcount
 
     @SQLiteStorageBase.handle_exceptions
@@ -384,15 +528,37 @@ class ProfileMixin:
         return [r["user_id"] for r in rows]
 
     @SQLiteStorageBase.handle_exceptions
-    def delete_profiles_by_ids(self, profile_ids: list[str]) -> int:
+    def delete_profiles_by_ids(
+        self, profile_ids: list[str], *, emit_hard_delete: bool = True
+    ) -> int:
         if not profile_ids:
             return 0
-        for pid in profile_ids:
-            self._fts_delete_profile(pid)
         ph = ",".join("?" for _ in profile_ids)
-        cur = self._execute(
-            f"DELETE FROM profiles WHERE profile_id IN ({ph})", profile_ids
-        )
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            existing = [
+                r["profile_id"]
+                for r in self.conn.execute(
+                    f"SELECT profile_id FROM profiles WHERE profile_id IN ({ph})",
+                    profile_ids,
+                ).fetchall()
+            ]
+            if not existing:
+                return 0
+            self._delete_profile_search_rows(existing)
+            cur = self.conn.execute(
+                f"DELETE FROM profiles WHERE profile_id IN ({ph})", profile_ids
+            )
+            if emit_hard_delete:
+                for pid in existing:
+                    _emit_hard_delete_profile(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_id=str(pid),
+                        request_id=batch_request_id,
+                        actor="system",
+                    )
+            self.conn.commit()
         return cur.rowcount
 
     # ------------------------------------------------------------------
