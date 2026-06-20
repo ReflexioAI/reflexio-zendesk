@@ -101,3 +101,45 @@ class LineageEventMixin:
                 ``False`` if the incumbent was not CURRENT and no mutation occurred.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def gc_expired_tombstones(
+        self, *, entity_type: str, older_than_epoch: int, limit: int = 1000
+    ) -> int:
+        """Hard-delete tombstone rows that are older than the given epoch cutoff.
+
+        Emits one ``hard_delete`` lineage event per deleted row before deleting it,
+        all within a single atomic transaction. Rows on legal hold are skipped.
+
+        Args:
+            entity_type (str): One of ``"user_playbook"``, ``"agent_playbook"``,
+                or ``"profile"``.
+            older_than_epoch (int): Unix timestamp. Rows whose age column value
+                is strictly less than this cutoff are eligible.
+            limit (int): Maximum number of rows to delete in one call. Defaults
+                to 1000.
+
+        Returns:
+            int: The number of rows physically deleted.
+
+        Raises:
+            ValueError: If ``entity_type`` is not a recognized entity type.
+        """
+        raise NotImplementedError
+
+    def list_org_ids(self) -> list[str]:
+        """Return every distinct org_id known to this storage instance.
+
+        Used by :class:`LineageGCScheduler` to enumerate all tenants so GC
+        runs for every org, not just the bootstrap org.
+
+        Returns:
+            list[str]: Distinct org ids, order unspecified.
+
+        Raises:
+            NotImplementedError: If the backend has not yet implemented this
+                method (enterprise backends owe this in B2 Task 6).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement list_org_ids"
+        )
