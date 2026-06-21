@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as np
 
+from reflexio.lib._agent_playbook import _PREFIX as _AGGREGATE_PREFIX
 from reflexio.models.api_schema.domain.entities import LineageEvent
 from reflexio.models.api_schema.service_schemas import (
     AgentPlaybook,
@@ -38,6 +39,7 @@ from reflexio.server.services.playbook.playbook_service_utils import (
     ensure_playbook_content,
 )
 from reflexio.server.services.service_utils import log_model_response
+from reflexio.server.site_var.feature_flags import is_aggregation_soft_delete_enabled
 from reflexio.server.tracing import capture_anomaly
 from reflexio.server.usage_metrics import record_usage_event
 
@@ -900,7 +902,7 @@ class PlaybookAggregator:
                                 source_ids=member_ids,
                                 actor="aggregator",
                                 request_id=_run_id,
-                                reason="user->agent aggregation",
+                                reason=f"{_AGGREGATE_PREFIX}{'full_archive' if full_archive else 'incremental'}",
                             )
                         )
                     except Exception:  # noqa: BLE001
@@ -950,14 +952,28 @@ class PlaybookAggregator:
                     playbook_name,
                 )
 
-            # Delete archived playbooks after successful aggregation
+            # Remove archived playbooks after successful aggregation.
+            # Flag ON → durable soft-supersede; Flag OFF → hard-delete (unchanged behavior).
+            soft = is_aggregation_soft_delete_enabled(self.request_context.org_id)
             if full_archive:
                 for name in full_archive_playbook_names:
-                    self.storage.delete_archived_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
-                        name, agent_version=self.agent_version
-                    )
+                    if soft:
+                        # _run_id is always non-empty (uuid4); supersede methods validate request_id themselves.
+                        self.storage.supersede_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
+                            name, agent_version=self.agent_version, request_id=_run_id
+                        )
+                    else:
+                        self.storage.delete_archived_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
+                            name, agent_version=self.agent_version
+                        )
             elif archived_playbook_ids:
-                self.storage.delete_agent_playbooks_by_ids(archived_playbook_ids)  # type: ignore[reportOptionalMemberAccess]
+                if soft:
+                    # _run_id is always non-empty (uuid4); supersede methods validate request_id themselves.
+                    self.storage.supersede_agent_playbooks_by_ids(  # type: ignore[reportOptionalMemberAccess]
+                        archived_playbook_ids, request_id=_run_id
+                    )
+                else:
+                    self.storage.delete_agent_playbooks_by_ids(archived_playbook_ids)  # type: ignore[reportOptionalMemberAccess]
 
             self._enqueue_playbook_optimization(saved_playbook_list)
 
