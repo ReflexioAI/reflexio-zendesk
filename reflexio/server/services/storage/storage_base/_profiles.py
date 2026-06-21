@@ -261,6 +261,70 @@ class ProfileMixin:
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def get_distinct_generated_from_request_ids(self) -> list[str]:
+        """Return the DISTINCT non-empty generated_from_request_id values present on profiles.
+
+        Scoped to the org. Includes profiles of any status (tombstones included) so
+        that an add-only run whose profiles were later tombstoned is still discoverable.
+        Empty-string values are excluded by the query (they must never form a group).
+
+        Used by ``reconstruct_profile_change_log`` to discover add-only dedup runs
+        (runs that added new profiles but superseded nothing, which emit no lineage
+        event and would otherwise be invisible).
+
+        Returns:
+            list[str]: Distinct non-empty ``generated_from_request_id`` values.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_profiles_by_generated_from_request_id(
+        self,
+        request_id: str,
+    ) -> list[UserProfile]:
+        """Return all profiles (any status, including tombstones) for a given generated_from_request_id.
+
+        Scoped to the org. Used by reconstruct_profile_change_log to find the
+        "added" side of a dedup run without depending on mutable status columns.
+        The column is set at profile creation and never changes — it is the
+        time-travel-stable signal for "added in run R".
+
+        Args:
+            request_id (str): The generated_from_request_id value to filter on.
+
+        Returns:
+            list[UserProfile]: All profiles (live or tombstone) whose
+                ``generated_from_request_id`` matches, scoped by org.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def supersede_profiles_by_ids(
+        self,
+        user_id: str,
+        profile_ids: list[str],
+        request_id: str,
+    ) -> int:
+        """Soft-delete profiles by setting status to SUPERSEDED, emitting set-based lineage.
+
+        For each profile id that matches (user_id, current status in {NULL/CURRENT,
+        PENDING}), updates status to SUPERSEDED and emits one ``status_change``
+        lineage event under the shared ``request_id``.  Rows are NOT physically
+        deleted — reads that exclude tombstones will simply filter them out by status.
+
+        Args:
+            user_id (str): Owning user id. Predicate scoped to this user.
+            profile_ids (list[str]): Profile ids to supersede. Already-superseded or
+                non-existent ids are silently skipped.
+            request_id (str): Shared request id to stamp on all emitted events so the
+                entire dedup run is reconstructible from a single id.
+
+        Returns:
+            int: Number of profiles actually updated (0 if all already superseded/absent).
+        """
+        raise NotImplementedError
+
     # Search methods
     @abstractmethod
     def search_interaction(
