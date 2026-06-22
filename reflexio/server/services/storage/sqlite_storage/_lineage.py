@@ -9,15 +9,13 @@ from reflexio.models.api_schema.domain.entities import LineageContext, LineageEv
 from reflexio.models.api_schema.domain.enums import Status
 from reflexio.server.tracing import capture_anomaly
 
-from ._base import _epoch_to_iso
+from ._base import _epoch_now
 
 EntityType = Literal["user_playbook", "agent_playbook", "profile"]
 
-# Tombstone statuses — rows with these statuses are skipped by merge_records guard.
-_TOMBSTONE = (Status.MERGED.value, Status.SUPERSEDED.value)
-
 # GC-eligible statuses — rows with these statuses may be hard-deleted by TTL GC.
-# Deliberately broader than _TOMBSTONE: includes ARCHIVED. Do NOT reuse _TOMBSTONE.
+# Also used as the merge guard: a source that already carries any of these
+# statuses is skipped (no re-tombstone, no clock reset).
 _GC_ELIGIBLE_STATUSES: frozenset[str] = frozenset(
     {Status.MERGED.value, Status.SUPERSEDED.value, Status.ARCHIVED.value}
 )
@@ -27,15 +25,6 @@ _TABLE: dict[str, tuple[str, str]] = {
     "user_playbook": ("user_playbooks", "user_playbook_id"),
     "agent_playbook": ("agent_playbooks", "agent_playbook_id"),
     "profile": ("profiles", "profile_id"),
-}
-
-# Per-entity GC metadata: (table, pk_col, age_col, age_is_text).
-# age_is_text=True  → TEXT ISO-8601 column; compare cutoff as ISO string.
-# age_is_text=False → INTEGER epoch column; compare cutoff as int directly.
-_GC_ENTITY_META: dict[str, tuple[str, str, str, bool]] = {
-    "user_playbook": ("user_playbooks", "user_playbook_id", "created_at", True),
-    "agent_playbook": ("agent_playbooks", "agent_playbook_id", "created_at", True),
-    "profile": ("profiles", "profile_id", "last_modified_timestamp", False),
 }
 
 
@@ -233,17 +222,30 @@ class SQLiteLineageMixin:
             ValueError: If ``entity_type`` is not a recognized entity type.
         """
         table, pk = _resolve_table(entity_type)
+        now = _epoch_now()
+        eligible_ph = ",".join("?" * len(_GC_ELIGIBLE_STATUSES))
+        eligible_vals = list(_GC_ELIGIBLE_STATUSES)
         with self._lock:
             for sid in source_ids:
                 if sid == survivor_id:
                     # Never tombstone the survivor itself, even if it is
                     # accidentally listed among the source ids.
                     continue
+                # Skip sources that already carry any eligible/tombstone status
+                # (MERGED, SUPERSEDED, or ARCHIVED) — avoids re-tombstoning an
+                # already-archived source and resetting its retired_at clock.
                 self.conn.execute(
-                    f"UPDATE {table} SET status=?, merged_into=? "  # noqa: S608
+                    f"UPDATE {table} SET status=?, merged_into=?, retired_at=? "  # noqa: S608
                     f"WHERE {pk}=? AND {pk}!=? "
-                    f"AND (status IS NULL OR status NOT IN (?, ?))",
-                    (Status.MERGED.value, survivor_id, sid, survivor_id, *_TOMBSTONE),
+                    f"AND (status IS NULL OR status NOT IN ({eligible_ph}))",
+                    (
+                        Status.MERGED.value,
+                        survivor_id,
+                        now,
+                        sid,
+                        survivor_id,
+                        *eligible_vals,
+                    ),
                 )
             _append_event_stmt(
                 self.conn,
@@ -291,9 +293,9 @@ class SQLiteLineageMixin:
         table, pk = _resolve_table(entity_type)
         with self._lock:
             cur = self.conn.execute(
-                f"UPDATE {table} SET status=?, superseded_by=? "  # noqa: S608
+                f"UPDATE {table} SET status=?, superseded_by=?, retired_at=? "  # noqa: S608
                 f"WHERE {pk}=? AND status IS NULL",
-                (Status.SUPERSEDED.value, successor_id, incumbent_id),
+                (Status.SUPERSEDED.value, successor_id, _epoch_now(), incumbent_id),
             )
             if cur.rowcount == 0:
                 self.conn.commit()
@@ -348,7 +350,11 @@ class SQLiteLineageMixin:
     def gc_expired_tombstones(
         self, *, entity_type: str, older_than_epoch: int, limit: int = 1000
     ) -> int:
-        """Hard-delete tombstone rows that are older than the given epoch cutoff.
+        """Hard-delete tombstone rows whose retirement instant is older than the cutoff.
+
+        Ages on the uniform INTEGER ``retired_at`` column set at every tombstone
+        write-path (T1).  Rows with ``retired_at = NULL`` (pre-T1 tombstones) are
+        never selected — they have no retirement clock and must be retained.
 
         Emits one ``hard_delete`` lineage event per deleted row, atomically, before
         the DELETE commits. Rows on legal hold are skipped without emitting an event.
@@ -357,7 +363,7 @@ class SQLiteLineageMixin:
             entity_type (str): One of ``"user_playbook"``, ``"agent_playbook"``,
                 or ``"profile"``.
             older_than_epoch (int): Unix timestamp cutoff (exclusive). Rows whose
-                age column is strictly less than this value are eligible.
+                ``retired_at`` is strictly less than this value are eligible.
             limit (int): Maximum rows to delete per call. Defaults to 1000.
 
         Returns:
@@ -368,30 +374,21 @@ class SQLiteLineageMixin:
         """
         if limit <= 0:
             return 0
-        meta = _GC_ENTITY_META.get(entity_type)
-        if meta is None:
-            raise ValueError(f"unknown entity_type: {entity_type!r}")
-        table, pk, age_col, age_is_text = meta
+        table, pk = _resolve_table(entity_type)
 
         eligible_ph = ",".join("?" * len(_GC_ELIGIBLE_STATUSES))
         eligible_vals = list(_GC_ELIGIBLE_STATUSES)
 
-        if age_is_text:
-            # Use the same helper the writer uses so the cutoff string is
-            # byte-for-byte format-consistent with stored values.  This keeps
-            # the ``<`` comparison truly exclusive (strict) at the boundary.
-            cutoff_iso = _epoch_to_iso(older_than_epoch)
-            select_sql = (
-                f"SELECT {pk} FROM {table} "  # noqa: S608
-                f"WHERE status IN ({eligible_ph}) AND {age_col} < ? LIMIT ?"
-            )
-            select_params: list[Any] = [*eligible_vals, cutoff_iso, limit]
-        else:
-            select_sql = (
-                f"SELECT {pk} FROM {table} "  # noqa: S608
-                f"WHERE status IN ({eligible_ph}) AND {age_col} < ? LIMIT ?"
-            )
-            select_params = [*eligible_vals, older_than_epoch, limit]
+        # ORDER BY retired_at ASC for deterministic forward progress.
+        # No SQL LIMIT here — the limit is applied after the legal-hold filter
+        # below so held rows at the front of the batch don't starve eligible rows.
+        select_sql = (
+            f"SELECT {pk} FROM {table} "  # noqa: S608
+            f"WHERE status IN ({eligible_ph}) "
+            f"AND retired_at IS NOT NULL AND retired_at < ? "
+            f"ORDER BY retired_at ASC"
+        )
+        select_params: list[Any] = [*eligible_vals, older_than_epoch]
 
         with self._lock:
             rows = self.conn.execute(select_sql, select_params).fetchall()
@@ -402,6 +399,8 @@ class SQLiteLineageMixin:
             ids_to_delete: list[str] = []
             for eid in candidate_ids:
                 if self._is_on_legal_hold(self.org_id, entity_type, eid):
+                    # NOTE: any real hold-check implementation must run inside
+                    # the same transaction as the DELETE to remain atomic.
                     capture_anomaly(
                         "lineage.gc.legal_hold_skip",
                         level="info",
@@ -411,6 +410,8 @@ class SQLiteLineageMixin:
                     )
                     continue
                 ids_to_delete.append(eid)
+                if len(ids_to_delete) >= limit:
+                    break
 
             if not ids_to_delete:
                 return 0

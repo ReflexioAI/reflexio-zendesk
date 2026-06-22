@@ -39,7 +39,7 @@ from ._base import (
     _true_rrf_merge,
     _vector_rank_rows,
 )
-from ._lineage import _append_event_stmt
+from ._lineage import _GC_ELIGIBLE_STATUSES, _append_event_stmt
 
 
 def _emit_hard_delete_profile(
@@ -401,6 +401,9 @@ class ProfileMixin:
             where += f" AND user_id IN ({placeholders})"
             extra_params.extend(user_ids)
 
+        # Set retired_at = now when transitioning to a GC-eligible status; clear to NULL otherwise.
+        retired_at_val = now_ts if new_val in _GC_ELIGIBLE_STATUSES else None
+
         batch_request_id = uuid.uuid4().hex
         with self._lock:
             affected = [
@@ -411,8 +414,8 @@ class ProfileMixin:
                 ).fetchall()
             ]
             cur = self.conn.execute(
-                f"UPDATE profiles SET status = ?, last_modified_timestamp = ? WHERE {where}",
-                [new_val, now_ts] + select_params + extra_params,
+                f"UPDATE profiles SET status = ?, last_modified_timestamp = ?, retired_at = ? WHERE {where}",
+                [new_val, now_ts, retired_at_val] + select_params + extra_params,
             )
             from_val = old_status.value if old_status else None
             to_val = new_status.value if new_status else None
@@ -516,10 +519,11 @@ class ProfileMixin:
     @SQLiteStorageBase.handle_exceptions
     def archive_profile_by_id(self, user_id: str, profile_id: str) -> bool:
         with self._lock:
+            now_ts = _epoch_now()
             cur = self.conn.execute(
-                "UPDATE profiles SET status = ?, last_modified_timestamp = ? "
+                "UPDATE profiles SET status = ?, last_modified_timestamp = ?, retired_at = ? "
                 "WHERE profile_id = ? AND user_id = ? AND status IS NULL",
-                (Status.ARCHIVED.value, _epoch_now(), profile_id, user_id),
+                (Status.ARCHIVED.value, now_ts, now_ts, profile_id, user_id),
             )
             if cur.rowcount > 0:
                 _append_event_stmt(
@@ -585,11 +589,12 @@ class ProfileMixin:
                 if old_status_val not in eligible:
                     continue
                 cur = self.conn.execute(
-                    "UPDATE profiles SET status = ?, last_modified_timestamp = ? "
+                    "UPDATE profiles SET status = ?, last_modified_timestamp = ?, retired_at = ? "
                     "WHERE profile_id = ? AND user_id = ? "
                     "AND (status IS NULL OR status = ?)",
                     (
                         Status.SUPERSEDED.value,
+                        now_ts,
                         now_ts,
                         pid,
                         user_id,
