@@ -93,7 +93,7 @@ learns, what stays private to a user scope, and what transfers to other users.
 | Identifier | Use | Recommendation |
 | --- | --- | --- |
 | `user_id` | Scope for profiles and user playbooks | Use the human user, tenant, workspace, repo, or project whose preferences should be isolated. For example, use a project id when repo-specific rules should not leak into unrelated repos. |
-| `agent_version` | Scope for shared agent playbooks | Use a stable agent name plus major behavior version, for example `my-agent-v1`. Keep it stable if learnings should transfer across users/projects. |
+| `agent_version` | Scope for shared agent playbooks | Use a stable agent name plus major behavior version, for example `my-agent-v1`. Keep it stable if learnings should transfer across users/projects. If you omit it, the SDK uses `DEFAULT_AGENT_VERSION` (`"agent-v0"`) — fine for a single agent, but set an explicit value before you run more than one. |
 | `session_id` | Group turns for one conversation | Use the host session/conversation id. Generate a UUID if the host does not provide one. |
 | `source` | Audit label | Use the integration name, for example `my-agent-plugin`. |
 
@@ -164,6 +164,62 @@ REFLEXIO_API_KEY="..."
 Implementation rule: if Reflexio is unavailable, the agent must continue
 normally. Treat Reflexio as a best-effort learning layer, not as a dependency
 that can break user work.
+
+## Configure an LLM Provider
+
+Reflexio's extraction (profiles and playbooks), aggregation, and query
+reformulation are LLM-powered. **A self-hosted OSS backend needs a provider
+key, or it will accept publishes and extract nothing** — publishes still
+succeed, but no profiles or playbooks are ever produced, which looks like a
+silent no-op during integration.
+
+Reflexio uses LiteLLM, so it supports many providers (OpenAI, Anthropic,
+OpenRouter, Gemini, MiniMax, DeepSeek, xAI, and custom endpoints). Provide a
+key one of two ways:
+
+1. Environment variable picked up by LiteLLM (simplest for local dev), in the
+   shell or `~/.reflexio/.env`:
+
+   ```shell
+   OPENAI_API_KEY="sk-..."        # or ANTHROPIC_API_KEY, OPENROUTER_API_KEY, ...
+   ```
+
+2. Persisted in the backend `Config` under `api_key_config` (survives restarts).
+   Each provider is a nested object — for OpenAI, set `api_key_config.openai.api_key`.
+   Set it with the SDK:
+
+   ```python
+   client.update_config({"api_key_config": {"openai": {"api_key": "sk-..."}}})
+   ```
+
+If you publish a clear correction and `search` returns nothing, an unset or
+invalid provider key is the most common cause — check this before debugging the
+integration itself.
+
+## Fastest Path: Verify With the CLI
+
+Before wiring SDK hooks, confirm the publish → extract → search loop works
+end to end using the bundled `reflexio` CLI. This is the quickest onboarding
+smoke test:
+
+```shell
+reflexio services start                        # backend on :8081 (+ docs), SQLite storage
+
+reflexio publish --user-id alice --wait --data '{
+  "interactions": [
+    {"role": "user",      "content": "Deploy the new service."},
+    {"role": "assistant", "content": "Deploying to us-east-1..."},
+    {"role": "user",      "content": "No — we never deploy production to us-east-1. Always use us-west-2."},
+    {"role": "assistant", "content": "Understood. Switching to us-west-2."}
+  ]
+}'
+
+reflexio search "deployment region"            # should surface the learned rule
+```
+
+`--wait` runs extraction synchronously so the result is visible immediately
+(see "Extraction is gated" below for why this matters). Once this loop works
+from the CLI, replicate it from the SDK in your host hooks.
 
 ## Capture Interactions
 
@@ -279,6 +335,30 @@ eligible to roll up into `agent_version`-scoped agent playbooks. Set it to
 `True` only when you intentionally want user-level extraction without cross-user
 transfer.
 
+`publish_interaction` always blocks on the HTTP round-trip (so you see 4xx/5xx
+and network errors), but with `wait_for_response=False` the server returns in
+~100 ms after queuing extraction as a background task — fast enough for
+interactive hooks. If you need a truly non-blocking call, a library user can
+submit through the client's `_fire_and_forget(self._publish_interaction_async,
+...)` path directly.
+
+### Extraction Is Gated — Don't Expect a Result From One Publish
+
+Normal background publishing does **not** run extraction on every turn. Two
+gates stand between a publish and a new profile/playbook:
+
+- **Sliding window / stride** (`window_size` / `stride_size`, default `10` / `8`
+  in `Config`): extraction fires once enough new turns have accumulated, not on
+  every publish.
+- **`should_run` pre-filter**: a cheap check (and an LLM gate) can decide a batch
+  carries no durable learning and skip it.
+
+So a single publish — even a clear correction — may legitimately produce
+nothing yet. To force extraction immediately (manual "learn now", tests, the
+verification smoke test), publish with `force_extraction=True`, which bypasses
+both gates. Use this for explicit learn-now and final flushes, **not** for every
+interactive turn — that would run an LLM extraction on every message.
+
 ## Retrieve and Inject Context
 
 Before the agent plans or edits, search Reflexio using the current task text.
@@ -300,8 +380,25 @@ def search_reflexio(user_id: str, agent_version: str, query: str):
     )
 ```
 
+`top_k` and `threshold` are per entity type; if omitted they default to `5` and
+`0.3`. Keep `top_k` small on interactive paths so injected context stays short.
+
 This search shape gives the current user their own profiles and user playbooks,
 plus shared agent playbooks generated for the same `agent_version`.
+
+`search` returns a `UnifiedSearchViewResponse` with one list per entity type.
+These are the fields you need to render context and, later, build the citation
+registry:
+
+| Result list | Id field (use as `citations.real_id`) | `citations.kind` | Title/text field |
+| --- | --- | --- | --- |
+| `profiles` (`ProfileView`) | `profile_id` | `"profile"` | `content` |
+| `user_playbooks` (`UserPlaybookView`) | `user_playbook_id` | `"playbook"` | `playbook_name` |
+| `agent_playbooks` (`AgentPlaybookView`) | `agent_playbook_id` | `"playbook"` | `playbook_name` |
+
+When you assign a short tag (`[p1]`, `[r1]`, `[s1]`) to an injected item, store
+the mapping `tag -> (kind, real_id, title)` from these fields. That mapping is
+exactly what you publish back as `citations` on the assistant turn.
 
 Inject the results as short, instruction-like context. Keep the model-facing
 format compact and auditable:
@@ -432,8 +529,13 @@ Core routes:
 
 Run these checks before considering the integration complete:
 
-1. With Reflexio running, publish a conversation containing a clear correction.
+1. With Reflexio running (and a provider key configured), publish a conversation
+   containing a clear correction. Use `force_extraction=True` (or the CLI
+   `--wait`) so extraction runs immediately instead of waiting for the
+   window/stride gate.
 2. Search for the corrected behavior and confirm a profile or playbook appears.
+   Empty results usually mean no provider key, or extraction was gated — retry
+   with `force_extraction=True`.
 3. Start a new agent session and confirm the relevant learning is injected.
 4. Stop Reflexio, run a normal agent turn, and confirm the agent still works.
 5. Restart Reflexio and confirm the buffered turn is retried and published.
