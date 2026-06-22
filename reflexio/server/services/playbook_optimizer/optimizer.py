@@ -31,6 +31,22 @@ from .scenario_resolver import ScenarioResolver
 
 logger = logging.getLogger(__name__)
 
+# Prefix used when constructing the run-scoped lineage request_id from a job id.
+# Shared with tests so the format is defined in one place.
+_OPTIMIZER_RUN_ID_PREFIX = "optjob_"
+
+
+def optimizer_run_request_id(job_id: int) -> str:
+    """Return the lineage request_id for a playbook optimizer run.
+
+    Args:
+        job_id (int): The ``PlaybookOptimizationJob.job_id`` for this run.
+
+    Returns:
+        str: A non-empty, job-scoped request id of the form ``optjob_<job_id>``.
+    """
+    return f"{_OPTIMIZER_RUN_ID_PREFIX}{job_id}"
+
 
 class PlaybookOptimizationTarget(BaseModel):
     """A single playbook (agent or user) the optimizer should try to improve."""
@@ -129,6 +145,7 @@ class PlaybookOptimizer:
                 metadata_json=json.dumps(split_metadata, ensure_ascii=False),
             )
         )
+        run_request_id = optimizer_run_request_id(job.job_id)
         logger.info(
             "event=playbook_optimization_start job_id=%d candidate_id=none "
             "target_kind=%s target_id=%d "
@@ -251,7 +268,9 @@ class PlaybookOptimizer:
             )
             return "completed"
 
-        successor_id = self._commit_if_allowed(target, incumbent, best_content, config)
+        successor_id = self._commit_if_allowed(
+            target, incumbent, best_content, config, run_request_id
+        )
         logger.info(
             "event=playbook_optimization_committed job_id=%d candidate_id=%d "
             "successor_target_id=%s best_score=%.3f",
@@ -425,6 +444,7 @@ class PlaybookOptimizer:
         incumbent: AgentPlaybook,
         best_content: str,
         config: PlaybookOptimizerConfig,
+        run_request_id: str,
     ) -> int | None:
         # The optimize() entrypoint already gates on _can_adopt_winner before
         # creating the job, but check again so this stays correct if called
@@ -451,6 +471,7 @@ class PlaybookOptimizer:
                 best_content,
                 "playbook_optimizer",
                 playbook_metadata=metadata,
+                request_id=run_request_id,
             )
             if successor_id is not None:
                 self.storage.set_source_windows_for_agent_playbook(
@@ -468,7 +489,11 @@ class PlaybookOptimizer:
         # is no derived polarity label or separate polarity field to keep in
         # sync.
         return _supersede_user_playbook(
-            self.storage, current_user, best_content, "playbook_optimizer"
+            self.storage,
+            current_user,
+            best_content,
+            "playbook_optimizer",
+            request_id=run_request_id,
         )
 
 
@@ -506,6 +531,8 @@ def _supersede_user_playbook(
     incumbent: UserPlaybook,
     best_content: str,
     source: str,
+    *,
+    request_id: str,
 ) -> int | None:
     """Insert a user-playbook successor then atomically supersede the incumbent.
 
@@ -518,11 +545,20 @@ def _supersede_user_playbook(
         incumbent: The current user playbook to replace.
         best_content: Content for the successor playbook.
         source: Provenance label written to the lineage event actor field.
+        request_id: Run-scoped correlation id for the lineage event. Must be
+            non-empty; use the job-derived id from the calling optimizer run.
 
     Returns:
         int | None: ``user_playbook_id`` of the successor, or ``None`` if the
             incumbent was not CURRENT.
+
+    Raises:
+        ValueError: If ``request_id`` is empty or None.
     """
+    if not request_id:
+        raise ValueError(
+            "_supersede_user_playbook: request_id must be non-empty (run-correlation id)"
+        )
     successor = incumbent.model_copy(
         update={"user_playbook_id": 0, "content": best_content, "status": None}
     )
@@ -530,7 +566,7 @@ def _supersede_user_playbook(
     ctx = LineageContext(
         op_kind="revise",
         actor=source,
-        request_id=incumbent.request_id,
+        request_id=request_id,
     )
     ok = storage.supersede_record(
         entity_type="user_playbook",
@@ -553,6 +589,8 @@ def _supersede_agent_playbook(
     best_content: str,
     source: str,
     playbook_metadata: str = "",
+    *,
+    request_id: str,
 ) -> int | None:
     """Insert an agent-playbook successor then atomically supersede the incumbent.
 
@@ -566,11 +604,20 @@ def _supersede_agent_playbook(
         best_content: Content for the successor playbook.
         source: Provenance label written to the lineage event actor field.
         playbook_metadata: Optional metadata string for the successor row.
+        request_id: Run-scoped correlation id for the lineage event. Must be
+            non-empty; use the job-derived id from the calling optimizer run.
 
     Returns:
         int | None: ``agent_playbook_id`` of the successor, or ``None`` if the
             incumbent was not CURRENT.
+
+    Raises:
+        ValueError: If ``request_id`` is empty or None.
     """
+    if not request_id:
+        raise ValueError(
+            "_supersede_agent_playbook: request_id must be non-empty (run-correlation id)"
+        )
     successor = incumbent.model_copy(
         update={
             "agent_playbook_id": 0,
@@ -587,7 +634,7 @@ def _supersede_agent_playbook(
     ctx = LineageContext(
         op_kind="revise",
         actor=source,
-        request_id=None,
+        request_id=request_id,
     )
     ok = storage.supersede_record(
         entity_type="agent_playbook",
