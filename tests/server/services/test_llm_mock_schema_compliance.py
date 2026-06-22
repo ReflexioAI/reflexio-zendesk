@@ -17,8 +17,9 @@ import json
 import pytest
 from syrupy.extensions.json import JSONSnapshotExtension
 
+from reflexio.server.llm.llm_utils import strict_response_format_for_model
 from reflexio.test_support.llm_fixtures import load_llm_fixture_content
-from reflexio.test_support.llm_mock import _create_mock_completion
+from reflexio.test_support.llm_mock import _create_mock_completion, _find_schema_key
 from reflexio.test_support.llm_model_registry import get_model_registry
 
 # Mapping from fixture file names to their expected model registry keys.
@@ -107,6 +108,46 @@ class TestSchemaCompliance:
             pytest.skip("No model class for raw string responses")
         result = entry.model_class.model_validate(entry.minimal_valid)
         assert isinstance(result, entry.model_class)
+
+    def test_guard_finder_ignores_property_named_like_a_keyword(self):
+        """The mock guard's finder must not flag a field NAMED oneOf/discriminator.
+
+        Those are property names, not schema keywords (CodeRabbit false-positive fix).
+        """
+        from pydantic import BaseModel
+
+        class _TrickyNames(BaseModel):
+            oneOf: str = ""  # noqa: N815  (deliberately a keyword-like field name)
+            discriminator: int = 0
+
+        schema = strict_response_format_for_model(_TrickyNames)["json_schema"]["schema"]
+        assert "oneOf" in schema["properties"]
+        assert not _find_schema_key(schema, "oneOf")
+        assert not _find_schema_key(schema, "discriminator")
+
+    @pytest.mark.parametrize("entry_name", list(get_model_registry().keys()))
+    def test_registry_models_emit_strict_compatible_schema(self, entry_name):
+        """Every structured-output model must produce a provider-strict schema.
+
+        The schema actually sent (``strict_response_format_for_model``) must
+        contain no ``oneOf``/``discriminator`` — OpenAI strict structured outputs
+        reject them, which is how a Pydantic discriminated union (e.g.
+        ``PlaybookConsolidationOutput``) 400'd in production (PYTHON-FASTAPI-9J).
+        This is the provider-agnostic invariant guard for the whole registry.
+        """
+        entry = get_model_registry()[entry_name]
+        if entry.model_class is None:
+            pytest.skip("No model class for raw string responses")
+        rf = strict_response_format_for_model(entry.model_class)
+        schema = rf["json_schema"]["schema"]
+        assert not _find_schema_key(schema, "oneOf"), (
+            f"{entry.model_class.__name__} emits 'oneOf' (discriminated union); "
+            "strict structured-output providers reject it."
+        )
+        assert not _find_schema_key(schema, "discriminator"), (
+            f"{entry.model_class.__name__} emits 'discriminator'; "
+            "strict structured-output providers reject it."
+        )
 
     @pytest.mark.parametrize("fixture_name,model_key", FIXTURE_TO_MODEL)
     def test_fixtures_validate_against_models(self, fixture_name, model_key):
