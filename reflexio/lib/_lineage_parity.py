@@ -14,12 +14,51 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import Protocol
 
-from reflexio.models.api_schema.domain.entities import ProfileChangeLog, UserProfile
+from reflexio.models.api_schema.domain.entities import (
+    LineageEvent,
+    ProfileChangeLog,
+    UserProfile,
+)
 
-if TYPE_CHECKING:
-    from reflexio.server.services.storage.storage_base import BaseStorage
+# Read cap for the one-shot parity check: a side hitting exactly this many rows
+# may be truncated, so the comparison is treated as INCONCLUSIVE.
+_READ_CAP = 10_000
+
+
+class ParityReadStorage(Protocol):
+    """The storage read surface reconstruct_profile_change_log + run_parity_check use.
+
+    Both the real ``BaseStorage`` backends and the read-only ``RestStorageReader``
+    satisfy this structurally — no inheritance required — so the parity check can
+    run against either without an unsound ``cast`` to ``BaseStorage``.
+    """
+
+    org_id: str
+
+    def get_profile_change_logs(self, limit: int = ...) -> list[ProfileChangeLog]: ...
+
+    def get_lineage_events(
+        self,
+        *,
+        entity_type: str | None = ...,
+        entity_id: str | None = ...,
+        org_id: str | None = ...,
+        request_id: str | None = ...,
+    ) -> list[LineageEvent]: ...
+
+    def get_distinct_generated_from_request_ids(self) -> list[str]: ...
+
+    def get_profiles_by_generated_from_request_id(
+        self, request_id: str
+    ) -> list[UserProfile]: ...
+
+    def get_all_generated_profiles(self) -> list[UserProfile]: ...
+
+    def get_profile_by_id(
+        self, profile_id: str, *, include_tombstones: bool = ...
+    ) -> UserProfile | None: ...
 
 
 class ParityClass(StrEnum):
@@ -201,7 +240,7 @@ def classify_change_log_parity(
     return results
 
 
-def profile_reconstructible_request_ids(storage: BaseStorage) -> set[str]:
+def profile_reconstructible_request_ids(storage: ParityReadStorage) -> set[str]:
     """Compute the set of request_ids that have reconstructible signals.
 
     These are request_ids where reconstruction *could* produce a row:
@@ -229,3 +268,53 @@ def profile_reconstructible_request_ids(storage: BaseStorage) -> set[str]:
         ):
             ids.add(evt.request_id)
     return ids
+
+
+def run_parity_check(storage: ParityReadStorage) -> list[ParityResult]:
+    """Run both change-log paths against ``storage`` and classify each request_id.
+
+    Reads the legacy ``profile_change_logs`` table and the reconstruction
+    side-by-side and classifies every ``request_id`` via
+    :func:`classify_change_log_parity`. Storage-backend agnostic: any
+    :class:`ParityReadStorage` works (real backends or a read-only reader).
+
+    Pure (no I/O of its own beyond the storage reads, no process exit): when the
+    data may be truncated it returns a single INCONCLUSIVE result rather than
+    exiting, so the result is assertable in-process and the caller owns the exit
+    code. Truncation is detected from the final row counts AND from the reader's
+    ``truncated`` flag (set when an intermediate reconstruction input hit its
+    read cap — which the final-count check alone cannot see).
+
+    Args:
+        storage (ParityReadStorage): Any instance implementing the parity read
+            surface (``get_profile_change_logs`` + the lineage read methods).
+
+    Returns:
+        list[ParityResult]: Classified results, one per distinct request_id; or a
+            single INCONCLUSIVE result when the comparison may be truncated.
+    """
+    # Lazy import to avoid any import cycle with reflexio.lib._profiles.
+    from reflexio.lib._profiles import reconstruct_profile_change_log
+
+    legacy_rows = storage.get_profile_change_logs(limit=_READ_CAP)
+    recon_resp = reconstruct_profile_change_log(storage, limit=_READ_CAP)
+
+    read_cap_hit = (
+        len(legacy_rows) >= _READ_CAP
+        or len(recon_resp.profile_change_logs) >= _READ_CAP
+        # A reader sets ``truncated`` when an intermediate input read (events /
+        # profiles) hit its page cap — invisible to the final-count check above.
+        or getattr(storage, "truncated", False)
+    )
+    if read_cap_hit:
+        return classify_change_log_parity(
+            [], [], reconstructible_request_ids=set(), read_cap_hit=True
+        )
+
+    reconstructible = profile_reconstructible_request_ids(storage)
+    return classify_change_log_parity(
+        legacy_rows,
+        recon_resp.profile_change_logs,
+        reconstructible_request_ids=reconstructible,
+        read_cap_hit=False,
+    )
