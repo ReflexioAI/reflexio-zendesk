@@ -19,6 +19,7 @@ from reflexio.models.config_schema import (
 )
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient
+from reflexio.server.llm.llm_utils import ProviderSafeUnionMixin
 from reflexio.server.services.deduplication_utils import (
     BaseDeduplicator,
     format_dedup_timestamp,
@@ -201,11 +202,17 @@ ConsolidationDecision = Annotated[
 ]
 
 
-class PlaybookConsolidationOutput(BaseModel):
-    """Output schema for playbook consolidation as a 4-kind discriminated union.
+# ``PlaybookConsolidationOutput`` mixes in ``ProviderSafeUnionMixin`` so the
+# emitted JSON schema is folded into the provider-accepted union shape while the
+# discriminator is kept for keyed validation at parse time (Sentry
+# PYTHON-FASTAPI-9J). This note is a comment, NOT part of the docstring, because
+# the docstring is serialized into the wire schema's ``description`` sent to the
+# model — keep implementation tokens out of it.
+class PlaybookConsolidationOutput(ProviderSafeUnionMixin, BaseModel):
+    """Output schema for playbook consolidation as a 4-kind tagged union.
 
     Each decision is one of ``UnifyDecision``, ``RejectNewDecision``,
-    ``DifferentiateDecision``, or ``IndependentDecision``; the ``kind`` literal
+    ``DifferentiateDecision``, or ``IndependentDecision``; the ``kind`` field
     selects the concrete shape.
     """
 
