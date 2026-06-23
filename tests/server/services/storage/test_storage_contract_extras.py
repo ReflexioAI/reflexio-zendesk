@@ -8,70 +8,10 @@ from reflexio.models.api_schema.domain.enums import UserActionType
 from reflexio.models.api_schema.service_schemas import (
     Citation,
     Interaction,
-    ProfileChangeLog,
-    UserProfile,
 )
 from reflexio.server.services.storage.storage_base._extras import ExtrasMixin
 
 pytestmark = pytest.mark.integration
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_profile_change_log(user_id: str, change_description: str) -> ProfileChangeLog:
-    return ProfileChangeLog(
-        id=0,
-        user_id=user_id,
-        request_id=f"req-{user_id}",
-        created_at=1_700_000_000,
-        added_profiles=[
-            UserProfile(
-                user_id=user_id,
-                profile_id=f"prof-{user_id}",
-                content=change_description,
-                last_modified_timestamp=1_700_000_000,
-                generated_from_request_id=f"req-{user_id}",
-            )
-        ],
-        removed_profiles=[],
-        mentioned_profiles=[],
-    )
-
-
-# ---------------------------------------------------------------------------
-# TestProfileChangeLogs
-# ---------------------------------------------------------------------------
-
-
-class TestProfileChangeLogs:
-    def test_add_and_get_profile_change_logs(self, storage):
-        storage.add_profile_change_log(_make_profile_change_log("u1", "added greeting"))
-        storage.add_profile_change_log(
-            _make_profile_change_log("u2", "added preference")
-        )
-
-        logs = storage.get_profile_change_logs()
-        assert len(logs) == 2
-
-    def test_delete_profile_change_log_for_user(self, storage):
-        storage.add_profile_change_log(_make_profile_change_log("u1", "log for u1"))
-        storage.add_profile_change_log(_make_profile_change_log("u2", "log for u2"))
-
-        storage.delete_profile_change_log_for_user("u1")
-
-        logs = storage.get_profile_change_logs()
-        assert len(logs) == 1
-        assert logs[0].user_id == "u2"
-
-    def test_delete_all_profile_change_logs(self, storage):
-        storage.add_profile_change_log(_make_profile_change_log("u1", "log 1"))
-        storage.add_profile_change_log(_make_profile_change_log("u2", "log 2"))
-
-        storage.delete_all_profile_change_logs()
-        assert storage.get_profile_change_logs() == []
 
 
 # ---------------------------------------------------------------------------
@@ -209,3 +149,45 @@ def _backend_supports_application_stats(storage) -> bool:
         storage.__class__.get_playbook_application_stats
         is not ExtrasMixin.get_playbook_application_stats
     )
+
+
+# ---------------------------------------------------------------------------
+# TestProfileChangeLogDeletion — the legacy table is frozen (no add path post-T6)
+# and slated for removal in Task 8, but the GDPR ``delete_*`` methods are KEPT
+# until then. Seed rows directly so the kept methods retain behavioral coverage.
+# ---------------------------------------------------------------------------
+
+
+def _seed_change_log_row(storage, user_id: str, request_id: str) -> None:
+    """Insert a legacy profile_change_logs row directly (SQLite contract fixture)."""
+    storage._execute(
+        "INSERT INTO profile_change_logs "
+        "(user_id, request_id, created_at, added_profiles, removed_profiles, mentioned_profiles) "
+        "VALUES (?, ?, ?, '[]', '[]', '[]')",
+        (user_id, request_id, int(datetime.now(UTC).timestamp())),
+    )
+
+
+def _change_log_user_ids(storage) -> list[str]:
+    return [
+        r["user_id"]
+        for r in storage._fetchall("SELECT user_id FROM profile_change_logs")
+    ]
+
+
+class TestProfileChangeLogDeletion:
+    def test_delete_profile_change_log_for_user(self, storage) -> None:
+        _seed_change_log_row(storage, "u-keep", "r1")
+        _seed_change_log_row(storage, "u-drop", "r2")
+
+        storage.delete_profile_change_log_for_user("u-drop")
+
+        assert _change_log_user_ids(storage) == ["u-keep"]
+
+    def test_delete_all_profile_change_logs(self, storage) -> None:
+        _seed_change_log_row(storage, "u-a", "r1")
+        _seed_change_log_row(storage, "u-b", "r2")
+
+        storage.delete_all_profile_change_logs()
+
+        assert _change_log_user_ids(storage) == []
