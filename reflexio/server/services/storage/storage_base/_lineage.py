@@ -124,6 +124,55 @@ class LineageEventMixin:
         raise NotImplementedError
 
     @abstractmethod
+    def has_inbound_lineage_refs(
+        self, *, entity_type: EntityType, entity_id: str
+    ) -> bool:
+        """Return True if any row points at ``entity_id`` via merged_into/superseded_by.
+
+        Org-scoped but deliberately NOT user_id-scoped: a cross-user chain
+        (one user's tombstone pointing at another user's survivor) must be
+        detected so the survivor is purged, not hard-deleted, on erasure.
+
+        Args:
+            entity_type (EntityType): One of ``"user_playbook"``, ``"agent_playbook"``,
+                or ``"profile"``.
+            entity_id (str): The entity's primary key to check for inbound refs.
+
+        Returns:
+            bool: True if any row in the entity's table has ``merged_into == entity_id``
+                OR ``superseded_by == entity_id``; False otherwise.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def purge_content(self, *, entity_type: EntityType, entity_id: str) -> bool:
+        """Blank a record's PII body, keep its lineage skeleton, emit op=purge.
+
+        Keeps only ``{pk, status, merged_into, superseded_by, retired_at}`` and
+        non-PII bookkeeping columns (timestamps, TTL); blanks every other column
+        (text → ``''``, nullable → ``NULL``; ``user_id`` → ``''``). Irreversible.
+        Emits a single ``op=purge`` lineage event with a deterministic
+        ``request_id="purge_{entity_id}"`` so repeated calls are idempotent —
+        an already-blank row re-runs without recording a duplicate event.
+        Returns ``True`` if a row existed (whether or not new blanking was done).
+
+        Args:
+            entity_type (EntityType): One of ``"user_playbook"`` or ``"profile"``.
+                ``"agent_playbook"`` is **not** supported (agent playbooks have no
+                ``user_id`` and are out of scope for content purge) — implementations
+                must raise ``ValueError`` for that value.
+            entity_id (str): The entity's primary key as a string.
+
+        Returns:
+            bool: ``True`` if the row exists; ``False`` if the id had no matching row.
+
+        Raises:
+            ValueError: If ``entity_type`` is not a recognized entity type or is
+                ``"agent_playbook"``.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def gc_expired_tombstones(
         self, *, entity_type: str, older_than_epoch: int, limit: int = 1000
     ) -> int:
