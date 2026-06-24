@@ -1,11 +1,14 @@
 """Playbook CRUD + search methods for SQLite storage."""
 
 import json
+import logging
 import sqlite3
 import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from reflexio.models.api_schema.common import BlockingIssue
 from reflexio.models.api_schema.retriever_schema import (
@@ -25,6 +28,9 @@ from reflexio.models.api_schema.service_schemas import (
     UserPlaybook,
 )
 from reflexio.models.config_schema import SearchMode, SearchOptions
+from reflexio.server.services.storage.storage_base._playbook import (
+    AGGREGATE_REASON_PREFIX,
+)
 
 from ._base import (
     _TOMBSTONE_STATUS_VALUES,
@@ -754,6 +760,77 @@ class PlaybookMixin:
     # Agent Playbook methods
     # ------------------------------------------------------------------
 
+    def _index_agent_playbook_fts_vec(self, ap: AgentPlaybook) -> None:
+        """Update the FTS and vector indexes for a single agent playbook row.
+
+        Must be called AFTER the row's transaction has been committed.  The FTS
+        and vec helpers self-commit, so they must never be interleaved inside a
+        transaction that still has pending mutations.
+
+        Args:
+            ap (AgentPlaybook): The already-saved playbook (``agent_playbook_id``
+                must be set).
+        """
+        fts_parts = [ap.trigger or "", ap.content or ""]
+        if ap.expanded_terms:
+            fts_parts.append(ap.expanded_terms)
+        self._fts_upsert(
+            "agent_playbooks_fts",
+            ap.agent_playbook_id,
+            search_text=" ".join(p for p in fts_parts if p) or "",
+        )
+        if ap.embedding:
+            self._vec_upsert("agent_playbooks_vec", ap.agent_playbook_id, ap.embedding)
+
+    def _insert_agent_playbook_row(
+        self, conn: "sqlite3.Connection", ap: AgentPlaybook, created_at_iso: str
+    ) -> "sqlite3.Cursor":
+        """Execute the agent_playbooks INSERT and populate ``ap.agent_playbook_id``.
+
+        Runs the INSERT inside the caller's connection context; does NOT commit.
+        The caller is responsible for committing (or rolling back) the transaction.
+
+        Args:
+            conn: The open SQLite connection to execute against.
+            ap: The playbook to insert; ``agent_playbook_id`` is set on return.
+            created_at_iso: ISO-8601 timestamp string for ``created_at``.
+
+        Returns:
+            sqlite3.Cursor: The cursor from the INSERT (``lastrowid`` is the new PK).
+        """
+        cur = conn.execute(
+            """INSERT INTO agent_playbooks
+               (playbook_name, created_at, agent_version, content,
+                trigger, rationale, blocking_issue,
+                playbook_status, playbook_metadata, embedding,
+                expanded_terms, tags, status,
+                merged_into, superseded_by)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                ap.playbook_name,
+                created_at_iso,
+                ap.agent_version,
+                ap.content,
+                ap.trigger,
+                ap.rationale,
+                json.dumps(ap.blocking_issue.model_dump())
+                if ap.blocking_issue
+                else None,
+                ap.playbook_status.value
+                if isinstance(ap.playbook_status, PlaybookStatus)
+                else ap.playbook_status,
+                ap.playbook_metadata,
+                _json_dumps(ap.embedding),
+                ap.expanded_terms,
+                _json_dumps(ap.tags),
+                ap.status.value if ap.status else None,
+                ap.merged_into,
+                ap.superseded_by,
+            ),
+        )
+        ap.agent_playbook_id = cur.lastrowid or 0
+        return cur
+
     @SQLiteStorageBase.handle_exceptions
     def save_agent_playbooks(
         self, agent_playbooks: list[AgentPlaybook]
@@ -772,53 +849,88 @@ class PlaybookMixin:
 
             created_at_iso = _epoch_to_iso(ap.created_at)
             with self._lock:
-                cur = self.conn.execute(
-                    """INSERT INTO agent_playbooks
-                       (playbook_name, created_at, agent_version, content,
-                        trigger, rationale, blocking_issue,
-                        playbook_status, playbook_metadata, embedding,
-                        expanded_terms, tags, status,
-                        merged_into, superseded_by)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        ap.playbook_name,
-                        created_at_iso,
-                        ap.agent_version,
-                        ap.content,
-                        ap.trigger,
-                        ap.rationale,
-                        json.dumps(ap.blocking_issue.model_dump())
-                        if ap.blocking_issue
-                        else None,
-                        ap.playbook_status.value
-                        if isinstance(ap.playbook_status, PlaybookStatus)
-                        else ap.playbook_status,
-                        ap.playbook_metadata,
-                        _json_dumps(ap.embedding),
-                        ap.expanded_terms,
-                        _json_dumps(ap.tags),
-                        ap.status.value if ap.status else None,
-                        ap.merged_into,
-                        ap.superseded_by,
-                    ),
-                )
-                ap.agent_playbook_id = cur.lastrowid or 0
+                self._insert_agent_playbook_row(self.conn, ap, created_at_iso)
                 self.conn.commit()
 
-            fts_parts = [ap.trigger or "", ap.content or ""]
-            if ap.expanded_terms:
-                fts_parts.append(ap.expanded_terms)
-            self._fts_upsert(
-                "agent_playbooks_fts",
-                ap.agent_playbook_id,
-                search_text=" ".join(p for p in fts_parts if p) or "",
-            )
-            if ap.embedding:
-                self._vec_upsert(
-                    "agent_playbooks_vec", ap.agent_playbook_id, ap.embedding
-                )
+            self._index_agent_playbook_fts_vec(ap)
             saved.append(ap)
         return saved
+
+    @SQLiteStorageBase.handle_exceptions
+    def save_agent_playbook_with_aggregate_event(
+        self,
+        agent_playbook: AgentPlaybook,
+        *,
+        source_ids: list[str],
+        request_id: str,
+        run_mode: str,
+    ) -> AgentPlaybook:
+        """Persist an agent playbook AND its ``op=aggregate`` lineage event atomically.
+
+        The INSERT and the event are committed in a single transaction — if either
+        fails, both roll back.  The event is the sole record of the run->playbook
+        membership for reconstruction, so atomicity is critical.
+
+        Args:
+            agent_playbook (AgentPlaybook): The playbook to persist.
+            source_ids (list[str]): IDs of the source entities that produced this playbook.
+            request_id (str): The aggregation run ID.
+            run_mode (str): Aggregation run mode (e.g. ``full_archive`` or ``incremental``).
+
+        Returns:
+            AgentPlaybook: The saved playbook with ``agent_playbook_id`` populated.
+
+        Raises:
+            ValueError: If ``request_id`` is empty (would produce an unreconstructable event).
+        """
+        if not request_id or not request_id.strip():
+            raise ValueError(
+                "save_agent_playbook_with_aggregate_event requires a non-empty request_id"
+            )
+        ap = agent_playbook
+        embedding_text = ap.trigger or ap.content
+        if self._should_expand_documents():
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                emb_future = executor.submit(self._get_embedding, embedding_text)
+                exp_future = executor.submit(self._expand_document, embedding_text)
+                ap.embedding = emb_future.result(timeout=15)
+                ap.expanded_terms = exp_future.result(timeout=15)
+        else:
+            ap.embedding = self._get_embedding(embedding_text)
+
+        created_at_iso = _epoch_to_iso(ap.created_at)
+        with self._lock:
+            try:
+                self._insert_agent_playbook_row(self.conn, ap, created_at_iso)
+                _append_event_stmt(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="agent_playbook",
+                    entity_id=str(ap.agent_playbook_id),
+                    op="aggregate",
+                    prov="wasDerivedFrom",
+                    source_ids=source_ids,
+                    actor="aggregator",
+                    request_id=request_id,
+                    reason=f"{AGGREGATE_REASON_PREFIX}{run_mode}",
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+        # FTS/vec indexing AFTER commit — these helpers self-commit and must
+        # not be interleaved inside the atomic transaction above.
+        # Index failure does NOT invalidate the committed row+event; the index
+        # is reconstructable from the authoritative row.
+        try:
+            self._index_agent_playbook_fts_vec(ap)
+        except Exception:
+            logger.exception(
+                "FTS/vec indexing failed for agent_playbook %s (row committed, index skipped)",
+                ap.agent_playbook_id,
+            )
+        return ap
 
     @SQLiteStorageBase.handle_exceptions
     def get_agent_playbooks(

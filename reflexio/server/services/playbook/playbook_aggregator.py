@@ -11,8 +11,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as np
 
-from reflexio.lib._agent_playbook import _PREFIX as _AGGREGATE_PREFIX
-from reflexio.models.api_schema.domain.entities import LineageEvent
 from reflexio.models.api_schema.service_schemas import (
     AgentPlaybook,
     AgentPlaybookSourceWindow,
@@ -35,8 +33,7 @@ from reflexio.server.services.playbook.playbook_service_utils import (
     ensure_playbook_content,
 )
 from reflexio.server.services.service_utils import log_model_response
-from reflexio.server.site_var.feature_flags import is_aggregation_soft_delete_enabled
-from reflexio.server.tracing import capture_anomaly
+from reflexio.server.tracing import capture_anomaly, sentry_tags
 from reflexio.server.usage_metrics import record_usage_event
 
 logger = logging.getLogger(__name__)
@@ -708,9 +705,6 @@ class PlaybookAggregator:
                     )
                     full_archive = False
 
-            # Save playbooks (returns playbooks with playbook_id populated)
-            saved_playbooks = self.storage.save_agent_playbooks(new_playbooks)  # type: ignore[reportOptionalMemberAccess]
-
             # Build new fingerprint state
             new_fingerprints = {}
 
@@ -751,12 +745,24 @@ class PlaybookAggregator:
                     "user_playbook_ids": raw_ids,
                 }
 
-            saved_playbook_list = list(saved_playbooks)
+            saved_playbook_list: list[AgentPlaybook] = []
 
-            # Assign saved playbook ids to the exact source cluster that generated them.
-            for saved_fb, (_, cluster_playbooks) in zip(
-                saved_playbook_list, generated_pairs, strict=False
-            ):
+            # Save each playbook + its aggregate event atomically, then assign
+            # fingerprints and source-windows for the saved row.
+            for playbook, cluster_playbooks in generated_pairs:
+                run_mode = "full_archive" if full_archive else "incremental"
+                member_ids = [
+                    str(fb.user_playbook_id)
+                    for fb in cluster_playbooks
+                    if fb.user_playbook_id
+                ]
+                saved_fb = self.storage.save_agent_playbook_with_aggregate_event(  # type: ignore[reportOptionalMemberAccess]
+                    playbook,
+                    source_ids=member_ids,
+                    request_id=_run_id,
+                    run_mode=run_mode,
+                )
+                saved_playbook_list.append(saved_fb)
                 if saved_fb and saved_fb.agent_playbook_id:
                     fp_key = self._compute_cluster_fingerprint(cluster_playbooks)
                     raw_ids = sorted(fb.user_playbook_id for fb in cluster_playbooks)
@@ -777,40 +783,6 @@ class PlaybookAggregator:
                             )
                         ],
                     )
-                    # Emit set-level aggregate lineage event (W3C PROV wasDerivedFrom, M:N).
-                    # Best-effort (PB-7): save_agent_playbooks already committed; a transient
-                    # append failure must NOT abort the run. Gap is acceptable for B1 since
-                    # the legacy change log remains the source of record until B3.
-                    member_ids = [
-                        str(fb.user_playbook_id)
-                        for fb in cluster_playbooks
-                        if fb.user_playbook_id
-                    ]
-                    try:
-                        self.storage.append_lineage_event(  # pyright: ignore[reportOptionalMemberAccess]
-                            LineageEvent(
-                                org_id=self.request_context.org_id,
-                                entity_type="agent_playbook",
-                                entity_id=str(saved_fb.agent_playbook_id),
-                                op="aggregate",
-                                prov_relation="wasDerivedFrom",
-                                source_ids=member_ids,
-                                actor="aggregator",
-                                request_id=_run_id,
-                                reason=f"{_AGGREGATE_PREFIX}{'full_archive' if full_archive else 'incremental'}",
-                            )
-                        )
-                    except Exception:  # noqa: BLE001
-                        logger.warning(
-                            "aggregate lineage event failed for agent_playbook %s",
-                            saved_fb.agent_playbook_id,
-                            exc_info=True,
-                        )
-                        capture_anomaly(
-                            "lineage.aggregate.append_failed",
-                            entity_id=str(saved_fb.agent_playbook_id),
-                            org_id=self.request_context.org_id,
-                        )
 
             # Store fingerprints in operation state
             mgr.update_cluster_fingerprints(
@@ -822,28 +794,47 @@ class PlaybookAggregator:
             # Update operation state with the highest user_playbook_id processed
             self._update_operation_state(playbook_name, user_playbooks)
 
-            # Remove archived playbooks after successful aggregation.
-            # Flag ON → durable soft-supersede; Flag OFF → hard-delete (unchanged behavior).
-            soft = is_aggregation_soft_delete_enabled(self.request_context.org_id)
-            if full_archive:
-                for name in full_archive_playbook_names:
-                    if soft:
-                        # _run_id is always non-empty (uuid4); supersede methods validate request_id themselves.
-                        self.storage.supersede_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
-                            name, agent_version=self.agent_version, request_id=_run_id
+            # Remove archived playbooks after successful aggregation. ALWAYS soft-supersede
+            # (never hard-delete) so the removal is reconstructable from lineage — mirrors the
+            # profile dedup always-soft path (#206).
+            if not _run_id:
+                # Empty request_id makes the removal unreconstructable (lineage events are keyed
+                # on it). Fail loud and skip removal — never silently hard-delete.
+                capture_anomaly(
+                    "lineage.aggregation.missing_request_id",
+                    level="error",
+                    org_id=self.request_context.org_id,
+                )
+            else:
+                try:
+                    if full_archive:
+                        for name in full_archive_playbook_names:
+                            self.storage.supersede_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
+                                name,
+                                agent_version=self.agent_version,
+                                request_id=_run_id,
+                            )
+                    elif archived_playbook_ids:
+                        self.storage.supersede_agent_playbooks_by_ids(  # type: ignore[reportOptionalMemberAccess]
+                            archived_playbook_ids, request_id=_run_id
                         )
-                    else:
-                        self.storage.delete_archived_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
-                            name, agent_version=self.agent_version
+                except Exception:
+                    with sentry_tags(
+                        subsystem="playbook_aggregation",
+                        op="supersede_agent_playbooks",
+                        org_id=self.request_context.org_id,
+                        request_id=_run_id,
+                    ):
+                        logger.exception(
+                            "Failed to soft-supersede archived agent playbooks (run %s)",
+                            _run_id,
                         )
-            elif archived_playbook_ids:
-                if soft:
-                    # _run_id is always non-empty (uuid4); supersede methods validate request_id themselves.
-                    self.storage.supersede_agent_playbooks_by_ids(  # type: ignore[reportOptionalMemberAccess]
-                        archived_playbook_ids, request_id=_run_id
+                    capture_anomaly(
+                        "lineage.aggregation.supersede_failed",
+                        level="error",
+                        org_id=self.request_context.org_id,
+                        request_id=_run_id,
                     )
-                else:
-                    self.storage.delete_agent_playbooks_by_ids(archived_playbook_ids)  # type: ignore[reportOptionalMemberAccess]
 
             self._enqueue_playbook_optimization(saved_playbook_list)
 
