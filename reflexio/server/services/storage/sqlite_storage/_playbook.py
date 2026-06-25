@@ -101,6 +101,32 @@ def _emit_supersede_playbook(
     )
 
 
+def _emit_supersede_user_playbook(
+    conn: sqlite3.Connection,
+    *,
+    org_id: str,
+    entity_id: str,
+    old_status: str | None,
+    request_id: str,
+) -> None:
+    """Emit a single status_change->superseded lineage event for a user playbook."""
+    _append_event_stmt(
+        conn,
+        org_id=org_id,
+        entity_type="user_playbook",
+        entity_id=entity_id,
+        op="status_change",
+        prov="wasInvalidatedBy",
+        source_ids=[],
+        actor="consolidator",
+        request_id=request_id,
+        reason=f"{old_status or 'None'}->superseded",
+        from_status=old_status,
+        to_status=Status.SUPERSEDED.value,
+        status_namespace="lifecycle_status",
+    )
+
+
 def _row_to_playbook_optimization_candidate(
     row: sqlite3.Row,
 ) -> PlaybookOptimizationCandidate:
@@ -112,6 +138,7 @@ def _row_to_playbook_optimization_candidate(
         parent_candidate_ids=_json_loads(row["parent_candidate_ids"]) or [],
         aggregate_score=row["aggregate_score"],
         is_winner=bool(row["is_winner"]),
+        metadata_json=row["metadata_json"] or "{}",
         created_at=row["created_at"],
     )
 
@@ -1249,7 +1276,10 @@ class PlaybookMixin:
             params.append(_json_dumps(tags))
         if updates:
             params.append(user_playbook_id)
-            op = "revise" if content is not None else "status_change"
+            semantic_change = any(
+                value is not None for value in (content, trigger, rationale)
+            )
+            op = "revise" if semantic_change else "status_change"
             prov = "wasRevisionOf" if op == "revise" else "wasInvalidatedBy"
             with self._lock:
                 cur = self.conn.execute(
@@ -1273,6 +1303,54 @@ class PlaybookMixin:
                         status_namespace=None,
                     )
                 self.conn.commit()
+
+    @SQLiteStorageBase.handle_exceptions
+    def supersede_user_playbooks_by_ids(
+        self, user_playbook_ids: list[int], request_id: str
+    ) -> int:
+        """Soft-delete user playbooks by setting status to SUPERSEDED.
+
+        Preserves the row content for strict point-in-time attribution reads.
+        Eligible rows are any non-tombstoned status (CURRENT / PENDING /
+        ARCHIVED). Atomic: all updates and lineage events commit together.
+        """
+        if not user_playbook_ids:
+            return 0
+        if not request_id:
+            raise ValueError("request_id must be non-empty for supersede")
+        now_ts = _epoch_now()
+        updated = 0
+        with self._lock:
+            for upid in user_playbook_ids:
+                row = self.conn.execute(
+                    "SELECT status FROM user_playbooks WHERE user_playbook_id = ?",
+                    (upid,),
+                ).fetchone()
+                if row is None:
+                    continue
+                old_status = row["status"]
+                cur = self.conn.execute(
+                    "UPDATE user_playbooks SET status = ?, retired_at = ?"
+                    " WHERE user_playbook_id = ?"
+                    " AND (status IS NULL OR status NOT IN (?, ?))",
+                    (
+                        Status.SUPERSEDED.value,
+                        now_ts,
+                        upid,
+                        *_TOMBSTONE_STATUS_VALUES,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    _emit_supersede_user_playbook(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_id=str(upid),
+                        old_status=old_status,
+                        request_id=request_id,
+                    )
+                    updated += 1
+            self.conn.commit()
+        return updated
 
     @SQLiteStorageBase.handle_exceptions
     def archive_agent_playbooks_by_playbook_name(
@@ -1678,8 +1756,8 @@ class PlaybookMixin:
             cur = self.conn.execute(
                 """INSERT INTO playbook_optimization_candidates
                    (job_id, candidate_index, content, parent_candidate_ids,
-                    aggregate_score, is_winner, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    aggregate_score, is_winner, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     candidate.job_id,
                     candidate.candidate_index,
@@ -1687,6 +1765,7 @@ class PlaybookMixin:
                     _json_dumps(candidate.parent_candidate_ids) or "[]",
                     candidate.aggregate_score,
                     1 if candidate.is_winner else 0,
+                    candidate.metadata_json,
                     candidate.created_at,
                 ),
             )
