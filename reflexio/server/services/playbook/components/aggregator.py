@@ -789,10 +789,6 @@ class PlaybookAggregator:
                     len(archived_playbook_ids),
                 )
 
-                # Selectively archive only playbooks from changed/disappeared clusters
-                if archived_playbook_ids:
-                    self.storage.archive_agent_playbooks_by_ids(archived_playbook_ids)  # type: ignore[reportOptionalMemberAccess]
-
         try:
             # Emit the started event inside the protected block so any failure
             # from here on is paired with an aggregation_failed event.
@@ -813,6 +809,37 @@ class PlaybookAggregator:
                 direction_overlap_threshold=playbook_aggregator_config.direction_overlap_threshold,
             )
             new_playbooks = [playbook for playbook, _ in generated_pairs]
+
+            previous_fingerprints_for_changed_clusters = {}
+            changed_fps_by_previous_fp = {}
+            changed_fps_with_replacements = set()
+            previous_playbook_id_by_fp = {}
+            if not playbook_aggregator_request.rerun and prev_fingerprints:
+                for cluster_playbooks in changed_clusters.values():
+                    fp = self._compute_cluster_fingerprint(cluster_playbooks)
+                    current_user_ids = {
+                        fb.user_playbook_id
+                        for fb in cluster_playbooks
+                        if fb.user_playbook_id is not None
+                    }
+                    matched_prev_fingerprints = {
+                        prev_fp: fp_data
+                        for prev_fp, fp_data in prev_fingerprints.items()
+                        if fp_data.get("agent_playbook_id") is not None
+                        and current_user_ids
+                        & set(fp_data.get("user_playbook_ids") or [])
+                    }
+                    if matched_prev_fingerprints:
+                        previous_fingerprints_for_changed_clusters[fp] = (
+                            matched_prev_fingerprints
+                        )
+                        for prev_fp, fp_data in matched_prev_fingerprints.items():
+                            changed_fps_by_previous_fp.setdefault(prev_fp, set()).add(
+                                fp
+                            )
+                            playbook_id = fp_data.get("agent_playbook_id")
+                            if playbook_id is not None:
+                                previous_playbook_id_by_fp[prev_fp] = playbook_id
 
             # Lazy archive: only full-archive when the LLM produced replacements.
             # Skipping the archive when new_playbooks is empty preserves existing
@@ -836,9 +863,7 @@ class PlaybookAggregator:
 
             if not playbook_aggregator_request.rerun:
                 # Carry forward unchanged fingerprints from previous state
-                prev_fps = mgr.get_cluster_fingerprints(
-                    name=playbook_name, version=self.agent_version
-                )
+                prev_fps = prev_fingerprints
                 current_fp_set = set()
                 for cluster_playbooks in clusters.values():
                     fp = self._compute_cluster_fingerprint(cluster_playbooks)
@@ -859,19 +884,9 @@ class PlaybookAggregator:
                     }
                 )
 
-            # Initialize changed cluster fingerprints before assigning saved IDs
-            # below. ``generated_pairs`` preserves the exact source cluster for
-            # every non-duplicate playbook the LLM produced.
-            for cluster_playbooks in changed_clusters.values():
-                fp = self._compute_cluster_fingerprint(cluster_playbooks)
-                raw_ids = sorted(fb.user_playbook_id for fb in cluster_playbooks)
-
-                new_fingerprints[fp] = {
-                    "agent_playbook_id": None,
-                    "user_playbook_ids": raw_ids,
-                }
-
             saved_playbook_list: list[AgentPlaybook] = []
+            selective_supersede_playbook_ids = set()
+            replaced_previous_fingerprints = set()
 
             # Save each playbook + its aggregate event atomically, then assign
             # fingerprints and source-windows for the saved row.
@@ -891,11 +906,25 @@ class PlaybookAggregator:
                 saved_playbook_list.append(saved_fb)
                 if saved_fb and saved_fb.agent_playbook_id:
                     fp_key = self._compute_cluster_fingerprint(cluster_playbooks)
+                    changed_fps_with_replacements.add(fp_key)
                     raw_ids = sorted(fb.user_playbook_id for fb in cluster_playbooks)
                     new_fingerprints[fp_key] = {
                         "agent_playbook_id": saved_fb.agent_playbook_id,
                         "user_playbook_ids": raw_ids,
                     }
+                    for prev_fp in previous_fingerprints_for_changed_clusters.get(
+                        fp_key, {}
+                    ):
+                        all_overlapping_clusters_replaced = (
+                            changed_fps_by_previous_fp.get(prev_fp, set()).issubset(
+                                changed_fps_with_replacements
+                            )
+                        )
+                        playbook_id = previous_playbook_id_by_fp.get(prev_fp)
+                        if all_overlapping_clusters_replaced:
+                            replaced_previous_fingerprints.add(prev_fp)
+                            if playbook_id is not None:
+                                selective_supersede_playbook_ids.add(playbook_id)
                     self.storage.set_source_windows_for_agent_playbook(  # type: ignore[reportOptionalMemberAccess]
                         saved_fb.agent_playbook_id,
                         [
@@ -909,6 +938,33 @@ class PlaybookAggregator:
                             )
                         ],
                     )
+
+            # Changed clusters that did not get a replacement keep their previous
+            # fingerprint/playbook mapping so a later successful replacement can
+            # supersede the old playbook. Brand-new duplicate clusters still get
+            # a None marker to avoid repeated LLM calls for the same fingerprint.
+            for cluster_playbooks in changed_clusters.values():
+                fp = self._compute_cluster_fingerprint(cluster_playbooks)
+                if fp in new_fingerprints:
+                    continue
+
+                previous_for_cluster = previous_fingerprints_for_changed_clusters.get(
+                    fp, {}
+                )
+                preserved_previous = {
+                    prev_fp: fp_data
+                    for prev_fp, fp_data in previous_for_cluster.items()
+                    if prev_fp not in replaced_previous_fingerprints
+                }
+                if preserved_previous:
+                    new_fingerprints.update(preserved_previous)
+                    continue
+
+                raw_ids = sorted(fb.user_playbook_id for fb in cluster_playbooks)
+                new_fingerprints[fp] = {
+                    "agent_playbook_id": None,
+                    "user_playbook_ids": raw_ids,
+                }
 
             # Store fingerprints in operation state
             mgr.update_cluster_fingerprints(
@@ -940,9 +996,16 @@ class PlaybookAggregator:
                                 agent_version=self.agent_version,
                                 request_id=_run_id,
                             )
-                    elif archived_playbook_ids:
+                    elif selective_supersede_playbook_ids:
                         self.storage.supersede_agent_playbooks_by_ids(  # type: ignore[reportOptionalMemberAccess]
-                            archived_playbook_ids, request_id=_run_id
+                            sorted(selective_supersede_playbook_ids),
+                            request_id=_run_id,
+                        )
+                    elif archived_playbook_ids:
+                        logger.info(
+                            "Skipping selective supersede of %s (agent_version=%s): LLM produced 0 new playbooks; existing PENDING/APPROVED playbooks preserved",
+                            archived_playbook_ids,
+                            self.agent_version,
                         )
                 except Exception:
                     with sentry_tags(
