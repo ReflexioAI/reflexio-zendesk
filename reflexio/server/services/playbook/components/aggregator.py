@@ -30,8 +30,10 @@ from reflexio.server.services.playbook.playbook_service_constants import (
 from reflexio.server.services.playbook.playbook_service_utils import (
     PlaybookAggregationOutput,
     PlaybookAggregatorRequest,
+    StructuredPlaybookContent,
     ensure_playbook_content,
 )
+from reflexio.server.services.playbook.user_detail_stripping import UserDetailStripper
 from reflexio.server.services.service_utils import log_model_response
 from reflexio.server.tracing import capture_anomaly, sentry_tags
 from reflexio.server.usage_metrics import record_usage_event
@@ -50,16 +52,32 @@ class PlaybookAggregator:
         llm_client: LiteLLMClient,
         request_context: RequestContext,
         agent_version: str,
+        user_detail_stripper: UserDetailStripper | None = None,
     ) -> None:
         self.client = llm_client
         self.storage = request_context.storage
         self.configurator = request_context.configurator
         self.request_context = request_context
         self.agent_version = agent_version
+        self.user_detail_stripper = user_detail_stripper
+        prompt_extra_instructions = getattr(
+            user_detail_stripper, "prompt_extra_instructions", None
+        )
+        if not isinstance(prompt_extra_instructions, str):
+            prompt_extra_instructions = None
+        self.aggregation_prompt_extra_instructions = (
+            self._format_prompt_extra_instructions(prompt_extra_instructions)
+        )
 
     # ===============================
     # private methods - operation state
     # ===============================
+
+    @staticmethod
+    def _format_prompt_extra_instructions(instructions: str | None) -> str:
+        if not instructions or not instructions.strip():
+            return ""
+        return f"{instructions.strip()}\n"
 
     def _create_state_manager(self) -> OperationStateManager:
         """
@@ -191,6 +209,108 @@ class PlaybookAggregator:
                 lines.append(f'Rationale: "{fb.rationale}"')
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks) if blocks else "(No playbook items)"
+
+    def _strip_prompt_field(
+        self,
+        text: str | None,
+        shared_mapping: dict[str, int],
+    ) -> str | None:
+        if text is None or self.user_detail_stripper is None:
+            return text
+        return self.user_detail_stripper.strip_user_details(
+            text, shared_mapping=shared_mapping
+        ).text
+
+    def _strip_user_playbook_for_prompt(
+        self,
+        playbook: UserPlaybook,
+        shared_mapping: dict[str, int],
+    ) -> UserPlaybook:
+        if self.user_detail_stripper is None:
+            return playbook
+        return playbook.model_copy(
+            update={
+                "content": self._strip_prompt_field(playbook.content, shared_mapping)
+                or "",
+                "trigger": self._strip_prompt_field(playbook.trigger, shared_mapping),
+                "rationale": self._strip_prompt_field(
+                    playbook.rationale, shared_mapping
+                ),
+            }
+        )
+
+    def _sanitize_aggregation_output_text(
+        self,
+        text: str | None,
+    ) -> tuple[str | None, int]:
+        if self.user_detail_stripper is None:
+            return text, 0
+        return self.user_detail_stripper.sanitize_aggregation_output_text(text)
+
+    def _sanitize_aggregation_response(
+        self, response: PlaybookAggregationOutput
+    ) -> tuple[PlaybookAggregationOutput, int]:
+        structured = response.playbook
+        if structured is None:
+            return response, 0
+
+        updates: dict[str, str | None] = {}
+        placeholder_count = 0
+        for field_name, value in structured.model_dump().items():
+            if not isinstance(value, str):
+                continue
+            sanitized, field_count = self._sanitize_aggregation_output_text(value)
+            placeholder_count += field_count
+            if sanitized != value:
+                updates[field_name] = sanitized
+
+        if not updates:
+            return response, 0
+        return response.model_copy(
+            update={"playbook": structured.model_copy(update=updates)}
+        ), placeholder_count
+
+    def _sanitize_aggregation_log_value(self, value: object) -> tuple[object, int]:
+        if isinstance(value, str):
+            return self._sanitize_aggregation_output_text(value)
+
+        if isinstance(value, dict):
+            sanitized: dict[object, object] = {}
+            placeholder_count = 0
+            for key, item in value.items():
+                sanitized_key, key_count = self._sanitize_aggregation_log_value(key)
+                sanitized_item, item_count = self._sanitize_aggregation_log_value(item)
+                sanitized[sanitized_key] = sanitized_item
+                placeholder_count += key_count + item_count
+            return sanitized, placeholder_count
+
+        if isinstance(value, list):
+            sanitized_items: list[object] = []
+            placeholder_count = 0
+            for item in value:
+                sanitized_item, item_count = self._sanitize_aggregation_log_value(item)
+                sanitized_items.append(sanitized_item)
+                placeholder_count += item_count
+            return sanitized_items, placeholder_count
+
+        if isinstance(value, tuple):
+            sanitized_items: list[object] = []
+            placeholder_count = 0
+            for item in value:
+                sanitized_item, item_count = self._sanitize_aggregation_log_value(item)
+                sanitized_items.append(sanitized_item)
+                placeholder_count += item_count
+            return tuple(sanitized_items), placeholder_count
+
+        return value, 0
+
+    def _record_placeholder_leakage(self, placeholder_count: int) -> None:
+        if placeholder_count <= 0:
+            return
+        logger.warning(
+            "Replaced %d residual user-detail placeholders in aggregated playbook output",
+            placeholder_count,
+        )
 
     @staticmethod
     def _get_direction_key(fb: UserPlaybook) -> str:
@@ -570,6 +690,12 @@ class PlaybookAggregator:
             "Running user playbook aggregation for '%s' (agent_version=%s)",
             playbook_name,
             self.agent_version,
+        )
+        logger.info(
+            "User detail stripping for aggregation: %s",
+            type(self.user_detail_stripper).__name__
+            if self.user_detail_stripper is not None
+            else "disabled",
         )
 
         # Get existing APPROVED and PENDING playbooks before archiving (to pass to LLM for deduplication).
@@ -1113,17 +1239,24 @@ class PlaybookAggregator:
         direction_overlap_threshold: float = 0.6,
     ) -> list[tuple[AgentPlaybook, list[UserPlaybook]]]:
         """Generate agent playbooks while preserving their exact source cluster."""
-        # Format existing approved playbooks for the prompt
+        new_playbooks: list[tuple[AgentPlaybook, list[UserPlaybook]]] = []
         approved_playbooks_str = (
             "\n".join([f"- {fb.content}" for fb in existing_approved_playbooks])
             if existing_approved_playbooks
             else "None"
         )
-
-        new_playbooks: list[tuple[AgentPlaybook, list[UserPlaybook]]] = []
         for cluster_playbooks in clusters.values():
+            shared_mapping: dict[str, int] = {}
+            if self.user_detail_stripper is None:
+                prompt_cluster_playbooks = cluster_playbooks
+            else:
+                prompt_cluster_playbooks = [
+                    self._strip_user_playbook_for_prompt(playbook, shared_mapping)
+                    for playbook in cluster_playbooks
+                ]
+
             playbook = self._generate_playbook_from_cluster(
-                cluster_playbooks,
+                prompt_cluster_playbooks,
                 approved_playbooks_str,
                 direction_overlap_threshold=direction_overlap_threshold,
             )
@@ -1205,14 +1338,18 @@ class PlaybookAggregator:
             # Build content directly as a freeform summary
             content_text = f"When {trigger}, {first_content}."
 
-            return AgentPlaybook(
-                playbook_name=cluster_playbooks[0].playbook_name,
-                agent_version=cluster_playbooks[0].agent_version,
-                content=content_text,
-                trigger=trigger,
-                playbook_status=PlaybookStatus.PENDING,
-                playbook_metadata="mock_generated",
+            response = PlaybookAggregationOutput(
+                playbook=StructuredPlaybookContent(
+                    content=content_text,
+                    trigger=trigger,
+                )
             )
+            response, placeholder_count = self._sanitize_aggregation_response(response)
+            self._record_placeholder_leakage(placeholder_count)
+            playbook = self._process_aggregation_response(response, cluster_playbooks)
+            if playbook is None:
+                return None
+            return playbook.model_copy(update={"playbook_metadata": "mock_generated"})
 
         # Format raw playbooks for prompt using structured format
         raw_playbooks_str = self._format_structured_cluster_input(
@@ -1228,6 +1365,7 @@ class PlaybookAggregator:
                     {
                         "user_playbooks": raw_playbooks_str,
                         "existing_approved_playbooks": existing_approved_playbooks_str,
+                        "aggregation_prompt_extra_instructions": self.aggregation_prompt_extra_instructions,
                     },
                 ),
             }
@@ -1240,6 +1378,16 @@ class PlaybookAggregator:
                 response_format=PlaybookAggregationOutput,
                 parse_structured_output=True,
             )
+            if isinstance(response, PlaybookAggregationOutput):
+                response, placeholder_count = self._sanitize_aggregation_response(
+                    response
+                )
+                self._record_placeholder_leakage(placeholder_count)
+            else:
+                response, placeholder_count = self._sanitize_aggregation_log_value(
+                    response
+                )
+                self._record_placeholder_leakage(placeholder_count)
             log_model_response(logger, "Aggregation structured response", response)
 
             if not isinstance(response, PlaybookAggregationOutput):
@@ -1251,9 +1399,13 @@ class PlaybookAggregator:
 
             return self._process_aggregation_response(response, cluster_playbooks)
         except Exception as exc:
+            sanitized_error, placeholder_count = self._sanitize_aggregation_log_value(
+                str(exc)
+            )
+            self._record_placeholder_leakage(placeholder_count)
             logger.error(
                 "AgentPlaybook aggregation failed due to %s, returning None.",
-                str(exc),
+                sanitized_error,
             )
             return None
 
@@ -1265,13 +1417,17 @@ class PlaybookAggregator:
 
         Args:
             response: Parsed PlaybookAggregationOutput from LLM
-            cluster_playbooks: Original cluster playbooks for metadata
+            cluster_playbooks: Cluster playbooks used only for non-user metadata
+                such as playbook name and agent version. Callers may pass
+                prompt-sanitized copies here, so this method must not read
+                user-authored fields from them.
 
         Returns:
             AgentPlaybook or None if no playbook should be generated
         """
         if not response:
             return None
+        response, _placeholder_count = self._sanitize_aggregation_response(response)
 
         structured = response.playbook
         if structured is None:

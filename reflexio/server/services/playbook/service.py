@@ -537,10 +537,21 @@ class PlaybookGenerationService(
         )
 
         # Initialize and run aggregator (synchronous)
+        from reflexio.server.services.playbook.user_detail_stripping import (
+            create_aggregation_user_detail_stripper,
+        )
+
+        user_detail_stripper = create_aggregation_user_detail_stripper(
+            self.request_context.configurator
+        )
+        aggregator_kwargs = {}
+        if user_detail_stripper is not None:
+            aggregator_kwargs["user_detail_stripper"] = user_detail_stripper
         aggregator = PlaybookAggregator(
             llm_client=self.client,
             request_context=self.request_context,
             agent_version=self.service_config.agent_version,  # type: ignore[reportOptionalMemberAccess]
+            **aggregator_kwargs,
         )
         try:
             run_with_operation_limit(

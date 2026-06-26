@@ -21,6 +21,7 @@ from reflexio.models.api_schema.service_schemas import (
     RerunProfileGenerationRequest,
     RerunProfileGenerationResponse,
 )
+from reflexio.server.services.playbook.user_detail_stripping import PassthroughStripper
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,8 +49,14 @@ def _make_mixin(*, storage_configured: bool = True) -> GenerationMixin:
 
 
 class TestRunPlaybookAggregation:
+    @patch(
+        "reflexio.server.services.playbook.user_detail_stripping.create_aggregation_user_detail_stripper",
+        return_value=None,
+    )
     @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
-    def test_calls_aggregator_run_with_correct_args(self, mock_agg_cls):
+    def test_calls_aggregator_run_with_correct_args(
+        self, mock_agg_cls, mock_create_stripper
+    ):
         """Constructs PlaybookAggregator and calls run() with correct request."""
         mixin = _make_mixin()
         mock_agg_instance = MagicMock()
@@ -63,10 +70,57 @@ class TestRunPlaybookAggregation:
             request_context=mixin.request_context,
             agent_version="v2",
         )
+        mock_create_stripper.assert_called_once_with(mixin.request_context.configurator)
         mock_agg_instance.run.assert_called_once()
         request_arg = mock_agg_instance.run.call_args[0][0]
         assert request_arg.agent_version == "v2"
         assert request_arg.rerun is True
+
+    @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
+    def test_injects_factory_stripper(self, mock_agg_cls):
+        """Passes a configured user-detail stripper to manual aggregation."""
+        stripper = PassthroughStripper()
+        mixin = _make_mixin()
+
+        mock_agg_instance = MagicMock()
+        mock_agg_cls.return_value = mock_agg_instance
+
+        with patch(
+            "reflexio.server.services.playbook.user_detail_stripping.create_aggregation_user_detail_stripper",
+            return_value=stripper,
+        ) as mock_create_stripper:
+            mixin.run_playbook_aggregation(agent_version="v2")
+
+        mock_agg_cls.assert_called_once_with(
+            llm_client=mixin.llm_client,
+            request_context=mixin.request_context,
+            agent_version="v2",
+            user_detail_stripper=stripper,
+        )
+        mock_create_stripper.assert_called_once_with(mixin.request_context.configurator)
+        mock_agg_instance.run.assert_called_once()
+
+    @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
+    def test_does_not_thread_stripper_prompt_text_as_separate_kwarg(self, mock_agg_cls):
+        mixin = _make_mixin()
+        stripper = PassthroughStripper()
+        stripper.prompt_extra_instructions = "Extra aggregation instruction."
+        mock_agg_instance = MagicMock()
+        mock_agg_cls.return_value = mock_agg_instance
+
+        with patch(
+            "reflexio.server.services.playbook.user_detail_stripping.create_aggregation_user_detail_stripper",
+            return_value=stripper,
+        ):
+            mixin.run_playbook_aggregation(agent_version="v2")
+
+        mock_agg_cls.assert_called_once_with(
+            llm_client=mixin.llm_client,
+            request_context=mixin.request_context,
+            agent_version="v2",
+            user_detail_stripper=stripper,
+        )
+        mock_agg_instance.run.assert_called_once()
 
     def test_raises_when_storage_not_configured(self):
         """Raises ValueError when storage is not configured."""
