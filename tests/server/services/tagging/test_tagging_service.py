@@ -14,7 +14,7 @@ from reflexio.models.config_schema import (
     StorageConfigSQLite,
     UserPlaybookExtractorConfig,
 )
-from reflexio.server.services.tagging.tagging_service import TaggingService, TagsOutput
+from reflexio.server.services.tagging.service import TaggingService, TagsOutput
 
 
 class FakeStorage:
@@ -142,10 +142,10 @@ def make_config(
     )
 
 
-def test_tagging_service_updates_profiles_and_playbooks(monkeypatch: Any) -> None:
+def test_tagging_updates_profiles_and_playbooks(monkeypatch: Any) -> None:
     monkeypatch.delenv("MOCK_LLM_RESPONSE", raising=False)
     monkeypatch.setattr(
-        "reflexio.server.services.tagging.tagging_service.SiteVarManager.get_site_var",
+        "reflexio.server.services.tagging.service.SiteVarManager.get_site_var",
         lambda *_: {},
     )
     storage = FakeStorage()
@@ -178,12 +178,12 @@ def test_tagging_service_updates_profiles_and_playbooks(monkeypatch: Any) -> Non
     ]
 
 
-def test_tagging_service_skips_entity_types_without_tagging_prompts(
+def test_tagging_skips_entity_types_without_tagging_prompts(
     monkeypatch: Any,
 ) -> None:
     monkeypatch.delenv("MOCK_LLM_RESPONSE", raising=False)
     monkeypatch.setattr(
-        "reflexio.server.services.tagging.tagging_service.SiteVarManager.get_site_var",
+        "reflexio.server.services.tagging.service.SiteVarManager.get_site_var",
         lambda *_: {},
     )
     storage = FakeStorage()
@@ -201,10 +201,10 @@ def test_tagging_service_skips_entity_types_without_tagging_prompts(
     assert client.calls == []
 
 
-def test_tagging_service_can_scope_to_profiles_only(monkeypatch: Any) -> None:
+def test_tagging_can_scope_to_profiles_only(monkeypatch: Any) -> None:
     monkeypatch.delenv("MOCK_LLM_RESPONSE", raising=False)
     monkeypatch.setattr(
-        "reflexio.server.services.tagging.tagging_service.SiteVarManager.get_site_var",
+        "reflexio.server.services.tagging.service.SiteVarManager.get_site_var",
         lambda *_: {},
     )
     storage = FakeStorage()
@@ -223,10 +223,10 @@ def test_tagging_service_can_scope_to_profiles_only(monkeypatch: Any) -> None:
     assert len(context.prompt_manager.calls) == 1
 
 
-def test_tagging_service_skips_already_tagged_entities(monkeypatch: Any) -> None:
+def test_tagging_skips_already_tagged_entities(monkeypatch: Any) -> None:
     monkeypatch.delenv("MOCK_LLM_RESPONSE", raising=False)
     monkeypatch.setattr(
-        "reflexio.server.services.tagging.tagging_service.SiteVarManager.get_site_var",
+        "reflexio.server.services.tagging.service.SiteVarManager.get_site_var",
         lambda *_: {},
     )
     storage = FakeStorage()
