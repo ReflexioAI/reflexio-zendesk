@@ -50,6 +50,11 @@ from ._base import (
 )
 from ._lineage import _GC_ELIGIBLE_STATUSES, _append_event_stmt
 
+_AGENT_PLAYBOOK_DEFAULT_EXCLUDED_STATUSES = (
+    *_TOMBSTONE_STATUS_VALUES,
+    Status.ARCHIVE_IN_PROGRESS.value,
+)
+
 
 def _emit_hard_delete_playbook(
     conn: sqlite3.Connection,
@@ -280,6 +285,7 @@ class PlaybookMixin:
         end_time: int | None = None,
         include_embedding: bool = False,
         tags: list[str] | None = None,
+        offset: int = 0,
     ) -> list[UserPlaybook]:
         sql = "SELECT * FROM user_playbooks WHERE 1=1"
         params: list[Any] = []
@@ -312,8 +318,8 @@ class PlaybookMixin:
             sql += f" AND {tag_frag}"
             params.extend(tag_params)
 
-        sql += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
+        sql += " ORDER BY created_at DESC, user_playbook_id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
         rows = self._fetchall(sql, params)
         return [
             _row_to_user_playbook(r, include_embedding=include_embedding) for r in rows
@@ -1007,8 +1013,11 @@ class PlaybookMixin:
     ) -> AgentPlaybook | None:
         sql = "SELECT * FROM agent_playbooks WHERE agent_playbook_id = ?"
         if not include_tombstones:
-            sql += " AND (status IS NULL OR status NOT IN (?, ?))"
-            row = self._fetchone(sql, (agent_playbook_id, *_TOMBSTONE_STATUS_VALUES))
+            sql += " AND (status IS NULL OR status NOT IN (?, ?, ?))"
+            row = self._fetchone(
+                sql,
+                (agent_playbook_id, *_AGENT_PLAYBOOK_DEFAULT_EXCLUDED_STATUSES),
+            )
         else:
             row = self._fetchone(sql, (agent_playbook_id,))
         return _row_to_agent_playbook(row) if row else None
@@ -1950,9 +1959,8 @@ class PlaybookMixin:
             conditions.append(frag)
             params.extend(sparams)
         else:
-            # Default: exclude tombstone statuses (MERGED/SUPERSEDED)
-            conditions.append("(ap.status IS NULL OR ap.status NOT IN (?, ?))")
-            params.extend(_TOMBSTONE_STATUS_VALUES)
+            conditions.append("(ap.status IS NULL OR ap.status NOT IN (?, ?, ?))")
+            params.extend(_AGENT_PLAYBOOK_DEFAULT_EXCLUDED_STATUSES)
         tag_frag, tag_params = _build_tags_sql("ap", request.tags)
         if tag_frag:
             conditions.append(tag_frag)

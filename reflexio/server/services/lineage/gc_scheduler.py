@@ -1,10 +1,10 @@
-"""Process-local scheduler for lineage tombstone garbage collection.
+"""Process-local scheduler for lineage cleanup.
 
-The scheduler is per-org and config-gated: each tick it discovers every org,
-reads that org's ``lineage_gc`` config, and — if enabled — hard-deletes
-tombstone rows older than the configured grace window.  One org's failure
-never stalls the loop; errors are captured as Sentry anomalies and the
-scheduler continues to the next org.
+Startup is bootstrap-config-gated. Each tick then evaluates every org
+independently, running tombstone GC from ``lineage_gc`` and governance
+retention GC from ``governance_retention`` according to that org's config.
+One org's failure never stalls the loop; errors are captured as Sentry
+anomalies and the scheduler continues to the next org.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable
 
+from reflexio.models.config_schema import GovernanceRetentionConfig
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.tracing import capture_anomaly
 
@@ -24,13 +25,20 @@ _MIN_POLL_SECONDS = 1
 
 # Window-misconfiguration tripwire: if a single tick deletes more than this
 # many tombstones for one org, something is likely wrong with the grace window.
+# Governance retention uses separate policy knobs and must not trigger this.
 _HIGH_VOLUME_THRESHOLD = 1000
 
 _ENTITY_TYPES = ("user_playbook", "agent_playbook", "profile")
 
 
+def _is_governance_retention_enabled(
+    governance_retention: GovernanceRetentionConfig,
+) -> bool:
+    return governance_retention.audit_events_retention_enabled
+
+
 class LineageGCScheduler:
-    """Polling daemon that garbage-collects expired lineage tombstones per org."""
+    """Polling daemon that runs tombstone GC and governance retention per org."""
 
     def __init__(
         self,
@@ -97,32 +105,52 @@ class LineageGCScheduler:
             try:
                 ctx = self.request_context_factory(org_id)
                 cfg = ctx.configurator.get_config()
-                if not cfg.lineage_gc.enabled:
-                    continue
                 if ctx.storage is None:
                     continue
-                older_than_epoch = (
-                    int(time.time())
-                    - cfg.lineage_gc.tombstone_grace_window_days * 86400
+                run_tombstone_gc = cfg.lineage_gc.enabled
+                governance_retention = getattr(
+                    cfg, "governance_retention", GovernanceRetentionConfig()
                 )
-                total_deleted = 0
-                for entity_type in _ENTITY_TYPES:
-                    count = ctx.storage.gc_expired_tombstones(
-                        entity_type=entity_type,
-                        older_than_epoch=older_than_epoch,
+                run_governance_gc = _is_governance_retention_enabled(
+                    governance_retention
+                )
+                if not run_tombstone_gc and not run_governance_gc:
+                    continue
+
+                tombstone_deleted = 0
+                if run_tombstone_gc:
+                    older_than_epoch = (
+                        int(time.time())
+                        - cfg.lineage_gc.tombstone_grace_window_days * 86400
                     )
-                    total_deleted += count
+                    for entity_type in _ENTITY_TYPES:
+                        count = ctx.storage.gc_expired_tombstones(
+                            entity_type=entity_type,
+                            older_than_epoch=older_than_epoch,
+                        )
+                        tombstone_deleted += count
+                governance_deleted = 0
+                if run_governance_gc:
+                    governance_deleted = ctx.storage.gc_governance_retention(
+                        config=governance_retention
+                    )
+                total_deleted = tombstone_deleted + governance_deleted
                 if total_deleted:
                     logger.info(
-                        "event=lineage_gc_tick org_id=%s deleted=%d",
+                        (
+                            "event=lineage_gc_tick org_id=%s deleted=%d "
+                            "tombstone_deleted=%d governance_deleted=%d"
+                        ),
                         org_id,
                         total_deleted,
+                        tombstone_deleted,
+                        governance_deleted,
                     )
-                if total_deleted > _HIGH_VOLUME_THRESHOLD:
+                if tombstone_deleted > _HIGH_VOLUME_THRESHOLD:
                     capture_anomaly(
                         "lineage.gc.high_volume",
                         org_id=org_id,
-                        count=total_deleted,
+                        count=tombstone_deleted,
                     )
             except Exception:
                 capture_anomaly("lineage.gc.run_failed", org_id=org_id)
@@ -147,10 +175,11 @@ def maybe_start_lineage_gc(
     *,
     bootstrap_org_id: str,
 ) -> LineageGCScheduler | None:
-    """Start the GC scheduler only when the bootstrap-org config enables it.
+    """Start the scheduler only when bootstrap config enables some GC work.
 
-    Off by default. Enablement criteria (must ALL hold before enabling for a
-    production org):
+    Off by default. Startup requires bootstrap-org config to enable tombstone GC
+    or any governance retention gate. Tombstone-GC enablement criteria (must
+    ALL hold before enabling for a production org):
 
     1. **Mechanism**: GC ages tombstones by ``retired_at`` (the INTEGER epoch
        written at every tombstone write-path).  Rows with ``retired_at = NULL``
@@ -175,7 +204,12 @@ def maybe_start_lineage_gc(
     try:
         ctx = request_context_factory(bootstrap_org_id)
         cfg = ctx.configurator.get_config()
-        if not cfg.lineage_gc.enabled:
+        governance_retention = getattr(
+            cfg, "governance_retention", GovernanceRetentionConfig()
+        )
+        if not cfg.lineage_gc.enabled and not _is_governance_retention_enabled(
+            governance_retention
+        ):
             return None
     except Exception as exc:
         logger.warning(
