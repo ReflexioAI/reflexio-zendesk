@@ -3,6 +3,7 @@
 from reflexio.server.services.storage.postgres_storage._query import (
     PostgresQuery,
     _parse_or_expression,
+    _prepare_value,
 )
 
 
@@ -67,3 +68,15 @@ def test_text_id_range_filter_converts_delete_sentinel() -> None:
     query._where_sql(params)
 
     assert params == ["0"]
+
+
+def test_profile_source_interaction_ids_prepare_as_jsonb() -> None:
+    value = _prepare_value("source_interaction_ids", [1, 2], table="profiles")
+
+    assert value.adapted == [1, 2]
+
+
+def test_user_playbook_source_interaction_ids_prepare_as_array() -> None:
+    value = _prepare_value("source_interaction_ids", [1, 2], table="user_playbooks")
+
+    assert value == [1, 2]

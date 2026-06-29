@@ -295,6 +295,10 @@ class ProfileExtractor:
         """
         new_profiles = []
         profile_source_interaction_ids = list(source_interaction_ids or [])
+        extractor_names = [get_extractor_name(self.config)]
+        configured_name = self.config.extractor_name
+        if configured_name and configured_name not in extractor_names:
+            extractor_names.append(configured_name)
         for profile_content in raw_profiles:
             if (
                 not isinstance(profile_content, dict)
@@ -322,7 +326,7 @@ class ProfileExtractor:
                 profile_time_to_live=ttl,
                 expiration_timestamp=calculate_expiration_timestamp(now_ts, ttl),
                 custom_features=custom_features or None,
-                extractor_names=None,
+                extractor_names=extractor_names,
                 source_interaction_ids=profile_source_interaction_ids,
             )
 

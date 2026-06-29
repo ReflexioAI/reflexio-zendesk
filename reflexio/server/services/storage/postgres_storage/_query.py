@@ -246,7 +246,7 @@ class PostgresQuery:
                 k: v for k, v in row.items() if v is not None or k != "embedding"
             }
             columns = list(cleaned)
-            values = [_prepare_value(k, cleaned[k]) for k in columns]
+            values = [_prepare_value(k, cleaned[k], table=self.table) for k in columns]
             query = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
                 self._table_sql(),
                 sql.SQL(", ").join(
@@ -283,7 +283,7 @@ class PostgresQuery:
     def _execute_update(self) -> PostgresResponse:
         payload = self._payload or {}
         columns = list(payload)
-        params = [_prepare_value(k, payload[k]) for k in columns]
+        params = [_prepare_value(k, payload[k], table=self.table) for k in columns]
         query = sql.SQL("UPDATE {} SET {}").format(
             self._table_sql(),
             sql.SQL(", ").join(
@@ -403,9 +403,11 @@ class PostgresRpc:
         return PostgresResponse(data=rows)
 
 
-def _prepare_value(column: str, value: Any) -> Any:
+def _prepare_value(column: str, value: Any, *, table: str | None = None) -> Any:
     if column == "embedding" and isinstance(value, list):
         return _vector_literal(value)
+    if table == "profiles" and column == "source_interaction_ids":
+        return Json(value)
     if column in _JSON_COLUMNS and isinstance(value, (dict, list)):
         return Json(value)
     if isinstance(value, (dict,)) or (
