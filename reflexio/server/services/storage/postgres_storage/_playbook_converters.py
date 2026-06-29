@@ -39,7 +39,10 @@ def agent_playbook_to_data(agent_playbook: AgentPlaybook) -> dict[str, Any]:
         "playbook_metadata": agent_playbook.playbook_metadata,
         "embedding": agent_playbook.embedding,
         "expanded_terms": agent_playbook.expanded_terms,
+        "tags": agent_playbook.tags,
         "status": agent_playbook.status,
+        "merged_into": agent_playbook.merged_into,
+        "superseded_by": agent_playbook.superseded_by,
     }
 
 
@@ -73,9 +76,12 @@ def user_playbook_to_data(user_playbook: UserPlaybook) -> dict[str, Any]:
         "source": user_playbook.source,
         "embedding": user_playbook.embedding,
         "expanded_terms": user_playbook.expanded_terms,
+        "tags": user_playbook.tags,
         "source_span": user_playbook.source_span,
         "notes": user_playbook.notes,
         "reader_angle": user_playbook.reader_angle,
+        "merged_into": user_playbook.merged_into,
+        "superseded_by": user_playbook.superseded_by,
     }
 
 

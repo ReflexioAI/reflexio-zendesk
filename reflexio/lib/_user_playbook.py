@@ -24,7 +24,7 @@ from reflexio.models.api_schema.service_schemas import (
     UpgradeUserPlaybooksResponse,
 )
 from reflexio.models.config_schema import SearchOptions
-from reflexio.server.services.playbook.playbook_generation_service import (
+from reflexio.server.services.playbook.service import (
     PlaybookGenerationService,
 )
 from reflexio.server.tracing import profile_step
@@ -57,6 +57,7 @@ class UserPlaybookMixin(ReflexioBase):
                 playbook_name=request.playbook_name,
                 agent_version=request.agent_version,
                 status_filter=request.status_filter,
+                tags=request.tags,
             )
             return GetUserPlaybooksResponse(
                 success=True,

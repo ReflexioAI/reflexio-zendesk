@@ -95,7 +95,13 @@ def _migrate_dict(data: Any, mapping: dict[str, str]) -> Any:
     if isinstance(data, dict):
         data = dict(data)
         for old, new in mapping.items():
-            if old in data and new not in data:
+            if old not in data:
+                continue
+            # New name wins when both are present; always drop the old key so it
+            # doesn't survive into validation and trip ``extra="forbid"``.
+            if new in data:
+                data.pop(old)
+            else:
                 data[new] = data.pop(old)
     return data
 
@@ -423,7 +429,7 @@ class ProfileExtractorConfig(_ExtractorWindowOverrideCompatMixin, BaseModel):
     extractor_name: NonEmptyStr | None = None
     extraction_definition_prompt: SanitizedNonEmptyStr
     context_prompt: str | None = None
-    metadata_definition_prompt: str | None = None
+    tagging_definition_prompt: str | None = None
     should_extract_profile_prompt_override: str | None = None
     request_sources_enabled: list[str] | None = (
         None  # default enabled for all sources, if set, only extract profiles from the enabled request sources
@@ -474,7 +480,7 @@ class UserPlaybookExtractorConfig(_ExtractorWindowOverrideCompatMixin, BaseModel
     extractor_name: NonEmptyStr | None = None
     extraction_definition_prompt: SanitizedNonEmptyStr
     context_prompt: str | None = None
-    metadata_definition_prompt: str | None = None
+    tagging_definition_prompt: str | None = None
     aggregation_config: PlaybookAggregatorConfig | None = None
     deduplication_config: DeduplicationConfig | None = None
     request_sources_enabled: list[str] | None = (
@@ -666,6 +672,56 @@ class PlaybookOptimizerConfig(BaseModel):
         return self
 
 
+class LineageGCConfig(BaseModel):
+    """Configuration for the tombstone garbage-collection job (enabled by default).
+
+    Purpose
+    -------
+    Retains tombstone content for ``tombstone_grace_window_days`` days after the
+    row's *retirement instant* (``retired_at``) to support audit, replay of dedup
+    and aggregation runs, and rollback.  After the window expires the row is
+    hard-deleted and a ``hard_delete`` lineage event is recorded.
+
+    Age basis
+    ---------
+    The GC ages on ``retired_at`` — the INTEGER epoch set when a row is tombstoned
+    (merged, superseded, or archived).  Rows with ``retired_at = NULL`` (created
+    before the column was added) are never eligible; they have no retirement clock.
+
+    Grace window
+    ------------
+    90 days is the default grace window.  This matches common 90-day soft-delete
+    retention policies and satisfies GDPR Art. 5(1)(e) storage-limitation for
+    personal data in profiles.  The value is a per-deployment policy knob; ratify
+    with your DPO before shortening it in production.  The 90-day floor also
+    preserves tombstones long enough for B3 changelog replay and rollback
+    consumers — raise ``tombstone_grace_window_days`` further if your replay
+    horizon exceeds 90 days.
+
+    Enabled by default
+    ------------------
+    GC is ON by default so tombstones created by the soft-delete flags (also ON by
+    default) are reclaimed automatically.  Disabling GC while soft-delete is enabled
+    allows tombstone counts to grow without bound — only do this deliberately (e.g.
+    extended audit hold) and with a plan to re-enable.
+
+    Disabling
+    ---------
+    Set ``enabled = False`` in your deployment config to hold all tombstones
+    indefinitely (e.g. for an extended audit window or rollback standby period).
+    """
+
+    enabled: bool = True
+    tombstone_grace_window_days: int = Field(default=90, gt=0)
+    poll_interval_seconds: int = Field(default=86400, gt=0)
+
+
+class GovernanceRetentionConfig(BaseModel):
+    audit_events_retention_enabled: bool = False
+    audit_events_retention_days: int = Field(default=365, gt=0)
+    audit_events_delete_batch_limit: int = Field(default=500, gt=0)
+
+
 @dataclass(frozen=True)
 class EffectivePendingToolCallConfig:
     """Resolved pending-tool-call settings after applying tool overrides."""
@@ -765,6 +821,8 @@ def _default_user_playbook_extractor_config() -> UserPlaybookExtractorConfig:
 
 
 class Config(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     # define where user configuration is stored at
     storage_config: StorageConfig
     storage_config_test: StorageConfigTest | None = StorageConfigTest.UNKNOWN
@@ -800,6 +858,11 @@ class Config(BaseModel):
     # Optional GEPA-backed playbook content optimizer
     playbook_optimizer_config: PlaybookOptimizerConfig = Field(
         default_factory=PlaybookOptimizerConfig
+    )
+    # Tombstone GC job gate (opt-in, off by default — see LineageGCConfig)
+    lineage_gc: LineageGCConfig = Field(default_factory=LineageGCConfig)
+    governance_retention: GovernanceRetentionConfig = Field(
+        default_factory=GovernanceRetentionConfig
     )
     # Optional non-blocking async information tools for classic extraction.
     pending_tool_call_config: PendingToolCallConfig = Field(
@@ -858,6 +921,8 @@ class Config(BaseModel):
                 "stride_size",
                 "reflection_config",
                 "playbook_optimizer_config",
+                "lineage_gc",
+                "governance_retention",
                 "pending_tool_call_config",
                 "retrieval_floor",
             ):

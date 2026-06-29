@@ -341,12 +341,12 @@ def _run_component_eval(
 def _prompt_id(component: Component) -> str:
     """Return the prompt-bank id for a component."""
     if component == "consolidation":
-        from reflexio.server.services.playbook.playbook_consolidator import (
+        from reflexio.server.services.playbook.components.consolidator import (
             PlaybookConsolidator,
         )
 
         return PlaybookConsolidator.DEDUPLICATION_PROMPT_ID
-    from reflexio.server.services.reflection.reflection_extractor import (
+    from reflexio.server.services.reflection.components.extractor import (
         REFLECTION_PROMPT_ID,
     )
 

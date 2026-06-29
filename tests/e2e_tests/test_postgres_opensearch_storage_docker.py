@@ -17,12 +17,17 @@ import psycopg2
 import pytest
 from psycopg2 import sql
 
-from reflexio.models.api_schema.retriever_schema import SearchUserProfileRequest
+from reflexio.models.api_schema.retriever_schema import (
+    SearchUserPlaybookRequest,
+    SearchUserProfileRequest,
+)
 from reflexio.models.api_schema.service_schemas import (
     NEVER_EXPIRES_TIMESTAMP,
     Interaction,
+    LineageContext,
     ProfileTimeToLive,
     Request,
+    UserPlaybook,
     UserProfile,
 )
 from reflexio.models.config_schema import PostgresSearchBackend, StorageConfigPostgres
@@ -178,3 +183,56 @@ def test_postgres_opensearch_delete_all_requests_clears_interaction_index(
     assert (
         postgres_opensearch_storage._opensearch.client.count(index=index)["count"] == 0
     )
+
+
+@skip_in_precommit
+def test_postgres_opensearch_user_playbook_search_excludes_superseded(
+    postgres_opensearch_storage: PostgresStorage,
+) -> None:
+    run_id = uuid.uuid4().hex[:8]
+    user_id = f"os-playbook-user-{run_id}"
+    request_id = f"os-playbook-request-{run_id}"
+
+    first = UserPlaybook(
+        user_id=user_id,
+        request_id=request_id,
+        agent_version="codex",
+        playbook_name="opensearch-retrieval",
+        content="Use the stale OpenSearch retrieval procedure.",
+        tags=["storage"],
+    )
+    successor = UserPlaybook(
+        user_id=user_id,
+        request_id=request_id,
+        agent_version="codex",
+        playbook_name="opensearch-retrieval",
+        content="Use the current OpenSearch retrieval procedure.",
+        tags=["storage"],
+    )
+    postgres_opensearch_storage.save_user_playbooks([first, successor])
+
+    assert first.user_playbook_id
+    assert successor.user_playbook_id
+    assert postgres_opensearch_storage.supersede_record(
+        entity_type="user_playbook",
+        incumbent_id=str(first.user_playbook_id),
+        successor_id=str(successor.user_playbook_id),
+        context=LineageContext(
+            op_kind="revise",
+            actor="postgres-opensearch-e2e",
+            request_id=request_id,
+            reason="verify opensearch tombstone filtering",
+        ),
+    )
+
+    results = postgres_opensearch_storage.search_user_playbooks(
+        SearchUserPlaybookRequest(
+            user_id=user_id,
+            query="OpenSearch retrieval procedure",
+            tags=["storage"],
+            top_k=5,
+            threshold=0.1,
+        )
+    )
+
+    assert [item.user_playbook_id for item in results] == [successor.user_playbook_id]

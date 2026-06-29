@@ -1,10 +1,19 @@
 import inspect
 import logging
 import os
+import sys
 from copy import deepcopy
 from typing import Any
 
 from pydantic import BaseModel
+
+from reflexio.models.structured_output import find_schema_keyword
+
+logger = logging.getLogger(__name__)
+
+# JSON-Schema keywords that strict structured-output endpoints (OpenAI, minimax)
+# reject; see PYTHON-FASTAPI-9J.
+PROVIDER_UNSAFE_KEYWORDS = ("oneOf", "discriminator")
 
 
 def positive_int_env(name: str, default: int, logger: logging.Logger) -> int:
@@ -89,10 +98,12 @@ def make_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
             node.pop(keyword, None)
 
         # Strict structured output (OpenAI) permits ``anyOf`` but rejects
-        # ``oneOf`` and ``discriminator``. Pydantic emits ``oneOf`` for
-        # discriminated unions; fold it into ``anyOf`` so generation is
-        # constrained to the same variants. Pydantic still enforces the
-        # discriminator after parse, so semantics are preserved.
+        # ``oneOf`` and ``discriminator``. Folded inline here, fused into this
+        # single structure-aware pass (the shared ``_fold_oneof_to_anyof`` helper
+        # does the same fold for the model-boundary hook; kept inline here to
+        # avoid a second full-tree walk). ``visit`` only ever recurses into
+        # property/$def *values*, never the name maps, so a field literally named
+        # ``oneOf`` is preserved — same contract as the helper.
         one_of = node.pop("oneOf", None)
         node.pop("discriminator", None)
         if isinstance(one_of, list):
@@ -127,14 +138,65 @@ def make_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return strict_schema
 
 
-def strict_response_format_for_model(model: type[BaseModel]) -> dict[str, Any]:
-    """Build a LiteLLM/OpenAI-compatible strict ``json_schema`` response format."""
+def assert_provider_safe_schema(schema: dict[str, Any], *, name: str = "") -> None:
+    """Enforce that an emitted structured-output schema is provider-safe.
+
+    Strict structured-output endpoints (OpenAI, minimax) reject ``oneOf`` /
+    ``discriminator`` (Sentry PYTHON-FASTAPI-9J). Models that inherit
+    ``StrictStructuredOutput`` are safe by construction; this is the runtime net
+    at the call boundary for anything that bypasses that guarantee — a model that
+    forgot the base, or a tool-argument / dynamically-built schema not covered by
+    the registry contract test.
+
+    Enforcement: under pytest (``"pytest" in sys.modules``) it RAISES so a
+    regression fails CI loudly — including at import/collection time, which a
+    per-test signal like ``PYTEST_CURRENT_TEST`` would miss. In prod it logs a
+    warning (observability) and returns; it does NOT mutate what is sent. So a
+    forgot-the-base model is meant to be caught **pre-merge** (by this raise plus
+    the registry contract test), not auto-repaired at runtime: on the strict /
+    allowlisted path ``make_strict_json_schema`` independently folds the schema,
+    but on the raw passthrough path the warning is the only signal and an unfolded
+    ``oneOf`` would still reach the provider. Keep every output model on
+    ``StrictStructuredOutput``.
+
+    Args:
+        schema (dict[str, Any]): The emitted JSON schema to check.
+        name (str): Identifier for the schema's source, used in the message.
+    """
+    offenders = [
+        kw for kw in PROVIDER_UNSAFE_KEYWORDS if find_schema_keyword(schema, kw)
+    ]
+    if not offenders:
+        return
+    msg = (
+        f"Structured-output schema {name or '<unnamed>'!r} contains provider-unsafe "
+        f"keyword(s) {offenders}; strict providers reject these. Inherit "
+        "StrictStructuredOutput so the schema folds oneOf->anyOf by construction "
+        "(Sentry PYTHON-FASTAPI-9J)."
+    )
+    if "pytest" in sys.modules:
+        raise ValueError(msg)
+    logger.warning(msg)
+
+
+def strict_response_format_for_model(
+    model: type[BaseModel], schema: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build a LiteLLM/OpenAI-compatible strict ``json_schema`` response format.
+
+    Args:
+        model: The Pydantic model (supplies the schema ``name``).
+        schema: Optional pre-built ``model.model_json_schema()`` to reuse, avoiding
+            a second schema build when the caller already has one.
+    """
 
     return {
         "type": "json_schema",
         "json_schema": {
             "name": model.__name__,
-            "schema": make_strict_json_schema(model.model_json_schema()),
+            "schema": make_strict_json_schema(
+                schema if schema is not None else model.model_json_schema()
+            ),
             "strict": True,
         },
     }

@@ -24,12 +24,12 @@ from reflexio.models.config_schema import ProfileExtractorConfig
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient, LiteLLMConfig
 from reflexio.server.services.base_generation_service import StatusChangeOperation
-from reflexio.server.services.profile.profile_generation_service import (
-    ProfileGenerationService,
-    ProfileGenerationServiceConfig,
-)
 from reflexio.server.services.profile.profile_generation_service_utils import (
     ProfileGenerationRequest,
+)
+from reflexio.server.services.profile.service import (
+    ProfileGenerationService,
+    ProfileGenerationServiceConfig,
 )
 
 # ===============================
@@ -338,42 +338,23 @@ class TestProcessResults:
         service._process_results([[sample_profile]])
 
         request_context.storage.delete_user_profile.assert_not_called()
-        request_context.storage.add_profile_change_log.assert_not_called()
 
-    def test_changelog_created_after_profiles_saved(
+    def test_profiles_persisted_on_save_path(
         self, service, request_context, sample_profile
     ):
-        """Profile changelog is created when new profiles are saved."""
+        """Profile generation persists new profiles on the save path.
+
+        The change log is served by reconstruction from lineage events (see
+        reconstruct_profile_change_log); the legacy ``profile_change_logs`` table
+        is no longer part of the storage write interface.
+        """
         self._setup_service_config(service)
 
         service._process_results([[sample_profile]])
 
-        request_context.storage.add_profile_change_log.assert_called_once()
-        changelog = request_context.storage.add_profile_change_log.call_args[0][0]
-        assert changelog.user_id == "user_1"
-        assert changelog.request_id == "req_1"
-        assert changelog.added_profiles == [sample_profile]
-
-    def test_changelog_failure_is_handled(
-        self, service, request_context, sample_profile
-    ):
-        """When add_profile_change_log fails, exception is caught and logged."""
-        self._setup_service_config(service)
-        request_context.storage.add_profile_change_log.side_effect = RuntimeError(
-            "Changelog error"
+        request_context.storage.add_user_profile.assert_called_once_with(
+            "user_1", [sample_profile]
         )
-
-        service._process_results([[sample_profile]])
-
-        request_context.storage.add_user_profile.assert_called_once()
-
-    def test_no_changelog_when_no_profiles(self, service, request_context):
-        """No changelog is created when there are no new or superseded profiles."""
-        self._setup_service_config(service)
-
-        service._process_results([])
-
-        request_context.storage.add_profile_change_log.assert_not_called()
 
 
 # ===============================

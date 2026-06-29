@@ -64,6 +64,7 @@ class SearchUserProfileRequest(BaseModel):
     extractor_name: str | None = (
         None  # Deprecated compatibility field; accepted but ignored.
     )
+    tags: list[str] | None = None
     threshold: float | None = Field(default=0.4, ge=0.0, le=1.0)
     enable_reformulation: bool | None = False
     search_mode: SearchMode = SearchMode.HYBRID
@@ -190,6 +191,7 @@ class GetUserProfilesRequest(BaseModel):
     end_time: datetime | None = None
     top_k: int | None = Field(default=30, gt=0)
     status_filter: list[Status | None] | None = None
+    tags: list[str] | None = None
 
     @model_validator(mode="after")
     def check_time_range(self) -> Self:
@@ -224,6 +226,7 @@ class GetUserPlaybooksRequest(BaseModel):
     playbook_name: str | None = None
     agent_version: str | None = None
     status_filter: list[Status | None] | None = None
+    tags: list[str] | None = None
 
 
 class GetUserPlaybooksResponse(BaseModel):
@@ -238,6 +241,7 @@ class GetAgentPlaybooksRequest(BaseModel):
     agent_version: str | None = None
     status_filter: list[Status | None] | None = None
     playbook_status_filter: PlaybookStatus | None = None
+    tags: list[str] | None = None
     # Caller correlation IDs for billing attribution on the Application line.
     # Optional; consumed by _meter_applied_learnings in server/api.py.
     request_id: str | None = None
@@ -247,6 +251,30 @@ class GetAgentPlaybooksRequest(BaseModel):
 class GetAgentPlaybooksResponse(BaseModel):
     success: bool
     agent_playbooks: list[AgentPlaybook]
+    msg: str | None = None
+
+
+class GetLearningProvenanceRequest(BaseModel):
+    kind: Literal["profile", "user_playbook", "agent_playbook"]
+    id: str
+
+
+class SourceUserPlaybookProvenanceView(BaseModel):
+    user_playbook: UserPlaybookView
+    interactions: list[InteractionView] = Field(default_factory=list)
+    source_interaction_ids: list[int] = Field(default_factory=list)
+
+
+class LearningProvenanceViewResponse(BaseModel):
+    success: bool
+    target_kind: Literal["profile", "user_playbook", "agent_playbook"]
+    target_id: str
+    provenance_status: Literal["exact", "best_effort", "unavailable"] = "unavailable"
+    trigger_request_id: str | None = None
+    interactions: list[InteractionView] = Field(default_factory=list)
+    source_user_playbooks: list[SourceUserPlaybookProvenanceView] = Field(
+        default_factory=list
+    )
     msg: str | None = None
 
 
@@ -272,6 +300,7 @@ class SearchUserPlaybookRequest(BaseModel):
     start_time: datetime | None = None
     end_time: datetime | None = None
     status_filter: list[Status | None] | None = None
+    tags: list[str] | None = None
     top_k: int | None = Field(default=10, gt=0)
     threshold: float | None = Field(default=0.4, ge=0.0, le=1.0)
     enable_reformulation: bool | None = False
@@ -329,6 +358,7 @@ class SearchAgentPlaybookRequest(BaseModel):
     end_time: datetime | None = None
     status_filter: list[Status | None] | None = None
     playbook_status_filter: PlaybookStatus | list[PlaybookStatus] | None = None
+    tags: list[str] | None = None
     top_k: int | None = Field(default=10, gt=0)
     threshold: float | None = Field(default=0.4, ge=0.0, le=1.0)
     enable_reformulation: bool | None = False
@@ -642,6 +672,7 @@ class UnifiedSearchRequest(BaseModel):
     # Optional; consumed by _meter_applied_learnings in server/api.py.
     request_id: str | None = None
     session_id: str | None = None
+    interaction_id: int | None = Field(default=None, gt=0)
 
 
 class UnifiedSearchResponse(BaseModel):

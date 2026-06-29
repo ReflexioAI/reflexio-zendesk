@@ -25,12 +25,19 @@ from reflexio.models.api_schema.service_schemas import (
     Status,
 )
 from reflexio.models.config_schema import SINGLETON_USER_PLAYBOOK_NAME
-from reflexio.server.services.agent_success_evaluation.group_evaluation_runner import (
+from reflexio.server.services.agent_success_evaluation.runner import (
     run_group_evaluation,
 )
+from reflexio.server.services.storage.storage_base import BaseStorage
 from tests.server.test_utils import skip_in_precommit, skip_low_priority
 
 pytestmark = pytest.mark.e2e
+
+
+def _storage(instance: Reflexio) -> BaseStorage:
+    storage = instance.request_context.storage
+    assert storage is not None
+    return storage
 
 
 @skip_in_precommit
@@ -41,14 +48,13 @@ def test_complete_workflow_end_to_end(
 ):
     """Test complete end-to-end workflow: publish, search, get, delete."""
     user_id = "test_user_complete"
+    storage = _storage(reflexio_instance)
 
     # Get initial state
-    initial_interactions = (
-        reflexio_instance.request_context.storage.get_all_interactions()
-    )
-    initial_profiles = reflexio_instance.request_context.storage.get_all_profiles()
+    initial_interactions = storage.get_all_interactions()
+    initial_profiles = storage.get_all_profiles()
     initial_change_logs = (
-        reflexio_instance.request_context.storage.get_profile_change_logs()
+        reflexio_instance.get_profile_change_logs().profile_change_logs
     )
 
     # Step 1: Publish interactions (request_id will be auto-generated)
@@ -64,27 +70,21 @@ def test_complete_workflow_end_to_end(
     assert publish_response.success is True
 
     # Get the auto-generated request_id from stored interactions for THIS user
-    user_interactions = reflexio_instance.request_context.storage.get_user_interaction(
-        user_id
-    )
+    user_interactions = storage.get_user_interaction(user_id)
     assert len(user_interactions) > 0, "Should have interactions for user"
-    request_id = user_interactions[0].request_id if user_interactions else None
+    request_id = user_interactions[0].request_id
 
     # Verify Request was stored
-    stored_request = reflexio_instance.request_context.storage.get_request(request_id)
+    stored_request = storage.get_request(request_id)
     assert stored_request is not None
     assert stored_request.request_id == request_id
     assert stored_request.user_id == user_id
     assert stored_request.agent_version == "test_agent_complete"
 
     # Verify data was stored
-    stored_interactions = (
-        reflexio_instance.request_context.storage.get_all_interactions()
-    )
-    stored_profiles = reflexio_instance.request_context.storage.get_all_profiles()
-    stored_change_logs = (
-        reflexio_instance.request_context.storage.get_profile_change_logs()
-    )
+    stored_interactions = storage.get_all_interactions()
+    stored_profiles = storage.get_all_profiles()
+    stored_change_logs = reflexio_instance.get_profile_change_logs().profile_change_logs
     assert len(stored_interactions) > len(initial_interactions)
     assert len(stored_profiles) > len(initial_profiles)
     assert len(stored_change_logs) > len(initial_change_logs)
@@ -143,9 +143,7 @@ def test_complete_workflow_end_to_end(
         assert delete_interaction_response.success is True
 
         # Verify interaction was deleted from storage
-        final_interactions = (
-            reflexio_instance.request_context.storage.get_all_interactions()
-        )
+        final_interactions = storage.get_all_interactions()
         assert len(final_interactions) < len(stored_interactions)
 
     # Step 8: Delete a profile
@@ -160,7 +158,7 @@ def test_complete_workflow_end_to_end(
         assert delete_profile_response.success is True
 
         # Verify profile was deleted from storage
-        final_profiles = reflexio_instance.request_context.storage.get_all_profiles()
+        final_profiles = storage.get_all_profiles()
         assert len(final_profiles) < len(stored_profiles)
 
 
@@ -581,6 +579,7 @@ def test_rerun_profile_generation_with_filters(
     assert rerun_response.success is True
     # In mock mode, initial publish may already generate profiles, so rerun may generate 0
     # The important assertion is that the API call succeeds
+    assert rerun_response.profiles_generated is not None
     assert rerun_response.profiles_generated >= 0
 
     # Check operation status
@@ -680,6 +679,7 @@ def test_full_workflow_with_all_features(
     user_id = "test_user_full_workflow"
     agent_version = "test_agent_full"
     session_id = "test_session_full_workflow"
+    storage = _storage(reflexio_instance)
 
     # Step 1: Publish interactions (all configs are enabled in reflexio_instance)
     publish_response = reflexio_instance.publish_interaction(
@@ -694,20 +694,18 @@ def test_full_workflow_with_all_features(
     assert publish_response.success is True
 
     # Get auto-generated request_id
-    stored_interactions = (
-        reflexio_instance.request_context.storage.get_all_interactions()
-    )
+    stored_interactions = storage.get_all_interactions()
     assert len(stored_interactions) > 0
     request_id = stored_interactions[0].request_id
 
     # Step 2: Verify profiles were generated
-    stored_profiles = reflexio_instance.request_context.storage.get_all_profiles()
+    stored_profiles = storage.get_all_profiles()
     assert len(stored_profiles) > 0, "Profiles should be generated"
     assert stored_profiles[0].content.strip() != ""
     assert stored_profiles[0].generated_from_request_id == request_id
 
     # Step 3: Verify playbooks were generated
-    user_playbooks = reflexio_instance.request_context.storage.get_user_playbooks(
+    user_playbooks = storage.get_user_playbooks(
         playbook_name=SINGLETON_USER_PLAYBOOK_NAME
     )
     assert len(user_playbooks) > 0, "User playbooks should be generated"
@@ -724,10 +722,8 @@ def test_full_workflow_with_all_features(
         request_context=reflexio_instance.request_context,
         llm_client=reflexio_instance.llm_client,
     )
-    agent_success_results = (
-        reflexio_instance.request_context.storage.get_agent_success_evaluation_results(
-            agent_version=agent_version
-        )
+    agent_success_results = storage.get_agent_success_evaluation_results(
+        agent_version=agent_version
     )
     assert len(agent_success_results) > 0, (
         "Agent success evaluations should be generated"
@@ -737,7 +733,7 @@ def test_full_workflow_with_all_features(
     assert isinstance(agent_success_results[0].is_success, bool)
 
     # Step 5: Verify profile change logs were created
-    change_logs = reflexio_instance.request_context.storage.get_profile_change_logs()
+    change_logs = reflexio_instance.get_profile_change_logs().profile_change_logs
     assert len(change_logs) > 0, "Profile change logs should be created"
 
     # Step 6: Test search operations work correctly
@@ -812,6 +808,7 @@ def test_rerun_operations_consistency(
     user_id = "test_user_rerun_consistency"
     agent_version = "test_agent_rerun"
     session_id = "test_session_rerun"
+    storage = _storage(reflexio_instance)
 
     # Step 1: Initial publish
     publish_response = reflexio_instance.publish_interaction(
@@ -837,21 +834,15 @@ def test_rerun_operations_consistency(
     )
 
     # Record initial state
-    initial_interactions = (
-        reflexio_instance.request_context.storage.get_all_interactions()
+    initial_interactions = storage.get_all_interactions()
+    initial_current_profiles = storage.get_user_profile(
+        user_id, status_filter=[None]
     )
-    initial_current_profiles = (
-        reflexio_instance.request_context.storage.get_user_profile(
-            user_id, status_filter=[None]
-        )
-    )
-    initial_playbooks = reflexio_instance.request_context.storage.get_user_playbooks(
+    initial_playbooks = storage.get_user_playbooks(
         playbook_name="test_playbook"
     )
-    initial_agent_success = (
-        reflexio_instance.request_context.storage.get_agent_success_evaluation_results(
-            agent_version=agent_version
-        )
+    initial_agent_success = storage.get_agent_success_evaluation_results(
+        agent_version=agent_version
     )
 
     initial_interaction_count = len(initial_interactions)
@@ -866,13 +857,12 @@ def test_rerun_operations_consistency(
         RerunProfileGenerationRequest(user_id=user_id)
     )
     assert rerun_response.success is True
+    assert rerun_response.profiles_generated is not None
     assert rerun_response.profiles_generated > 0
 
     # Step 3: Verify CURRENT profiles unchanged
-    current_profiles_after_rerun = (
-        reflexio_instance.request_context.storage.get_user_profile(
-            user_id, status_filter=[None]
-        )
+    current_profiles_after_rerun = storage.get_user_profile(
+        user_id, status_filter=[None]
     )
     assert len(current_profiles_after_rerun) == initial_profile_count, (
         "CURRENT profiles should remain unchanged"
@@ -884,34 +874,28 @@ def test_rerun_operations_consistency(
         assert profile.content == initial_current_profiles[i].content
 
     # Step 4: Verify PENDING profiles were created
-    pending_profiles = reflexio_instance.request_context.storage.get_user_profile(
+    pending_profiles = storage.get_user_profile(
         user_id, status_filter=[Status.PENDING]
     )
     assert len(pending_profiles) > 0, "PENDING profiles should be created"
 
     # Step 5: Verify interactions unchanged
-    interactions_after_rerun = (
-        reflexio_instance.request_context.storage.get_all_interactions()
-    )
+    interactions_after_rerun = storage.get_all_interactions()
     assert len(interactions_after_rerun) == initial_interaction_count, (
         "Interactions should remain unchanged"
     )
 
     # Step 6: Verify playbooks unchanged
-    playbooks_after_rerun = (
-        reflexio_instance.request_context.storage.get_user_playbooks(
-            playbook_name="test_playbook"
-        )
+    playbooks_after_rerun = storage.get_user_playbooks(
+        playbook_name="test_playbook"
     )
     assert len(playbooks_after_rerun) == initial_playbook_count, (
         "User playbooks should remain unchanged"
     )
 
     # Step 7: Verify agent success results unchanged
-    agent_success_after_rerun = (
-        reflexio_instance.request_context.storage.get_agent_success_evaluation_results(
-            agent_version=agent_version
-        )
+    agent_success_after_rerun = storage.get_agent_success_evaluation_results(
+        agent_version=agent_version
     )
     assert len(agent_success_after_rerun) == initial_agent_success_count, (
         "Agent success results should remain unchanged"
@@ -926,10 +910,8 @@ def test_rerun_operations_consistency(
     assert rerun_response_2.success is True
 
     # Get all PENDING profiles after second rerun
-    pending_profiles_after_second = (
-        reflexio_instance.request_context.storage.get_user_profile(
-            user_id, status_filter=[Status.PENDING]
-        )
+    pending_profiles_after_second = storage.get_user_profile(
+        user_id, status_filter=[Status.PENDING]
     )
 
     # Verify the total PENDING profiles increased (new ones were created)
@@ -937,7 +919,7 @@ def test_rerun_operations_consistency(
     assert len(pending_profiles_after_second) >= pending_count_before_second_rerun
 
     # Step 9: Verify CURRENT profiles still unchanged after second rerun
-    current_profiles_final = reflexio_instance.request_context.storage.get_user_profile(
+    current_profiles_final = storage.get_user_profile(
         user_id, status_filter=[None]
     )
     assert len(current_profiles_final) == initial_profile_count, (

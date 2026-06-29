@@ -22,33 +22,34 @@ from reflexio.models.api_schema.service_schemas import (
 from reflexio.models.config_schema import Config
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient
-from reflexio.server.services.agent_success_evaluation.delayed_group_evaluator import (
-    GroupEvaluationScheduler,
-)
-from reflexio.server.services.agent_success_evaluation.group_evaluation_runner import (
+from reflexio.server.services.agent_success_evaluation.runner import (
     run_group_evaluation,
 )
-from reflexio.server.services.operation_state_utils import OperationStateManager
-from reflexio.server.services.playbook.playbook_generation_service import (
-    PlaybookGenerationService,
+from reflexio.server.services.agent_success_evaluation.scheduler import (
+    GroupEvaluationScheduler,
 )
+from reflexio.server.services.operation_state_utils import OperationStateManager
 from reflexio.server.services.playbook.playbook_service_utils import (
     PlaybookGenerationRequest,
 )
-from reflexio.server.services.profile.profile_generation_service import (
-    ProfileGenerationService,
+from reflexio.server.services.playbook.service import (
+    PlaybookGenerationService,
 )
 from reflexio.server.services.profile.profile_generation_service_utils import (
     ProfileGenerationRequest,
 )
-from reflexio.server.services.reflection.reflection_service import ReflectionService
+from reflexio.server.services.profile.service import (
+    ProfileGenerationService,
+)
 from reflexio.server.services.reflection.reflection_service_utils import (
     ReflectionServiceRequest,
 )
+from reflexio.server.services.reflection.service import ReflectionService
 from reflexio.server.services.storage.retention import (
     delete_count_for_retention,
     get_row_retention_limits,
 )
+from reflexio.server.services.tagging.tagging_scheduler import schedule_tagging
 from reflexio.server.tracing import sentry_tags
 from reflexio.server.usage_metrics import record_usage_event
 
@@ -298,7 +299,10 @@ class GenerationService:
             # profile/playbook context. Wrapped in a broad except so a
             # reflection bug never breaks the publish.
             self._maybe_run_reflection(
-                user_id=user_id, agent_version=agent_version, source=source
+                user_id=user_id,
+                request_id=request_id,
+                agent_version=agent_version,
+                source=source,
             )
 
             # Create generation services and requests
@@ -378,6 +382,23 @@ class GenerationService:
                         result.warnings.append(msg)
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
+
+            # Tagging runs an LLM call per newly generated entity, so defer it off
+            # the publish path. The scheduler debounces bursts and is idempotent
+            # (already-tagged entities are skipped).
+            try:
+                schedule_tagging(
+                    org_id=self.org_id,
+                    user_id=user_id,
+                    agent_version=agent_version,
+                    request_context=self.request_context,
+                    llm_client=self.client,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to schedule tagging for publish request %s",
+                    request_id,
+                )
 
             # Schedule delayed group evaluation for the required session.
             self._schedule_group_evaluation_if_needed(
@@ -525,7 +546,7 @@ class GenerationService:
         )
 
     def _maybe_run_reflection(
-        self, *, user_id: str, agent_version: str, source: str | None
+        self, *, user_id: str, request_id: str, agent_version: str, source: str | None
     ) -> None:
         """Best-effort reflection pass before extraction.
 
@@ -540,6 +561,7 @@ class GenerationService:
             service.run(
                 ReflectionServiceRequest(
                     user_id=user_id,
+                    request_id=request_id,
                     agent_version=agent_version,
                     source=source,
                 )

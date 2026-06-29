@@ -17,7 +17,8 @@ from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, cast
 
 from reflexio.models.api_schema.retriever_schema import (
     ConversationTurn,
@@ -41,6 +42,13 @@ from reflexio.models.config_schema import (
 from reflexio.server.llm.litellm_client import LiteLLMClient
 from reflexio.server.prompt.prompt_manager import PromptManager
 from reflexio.server.services.pre_retrieval import QueryReformulator
+from reflexio.server.services.retrieval.recency import (
+    RecencyConfig,
+    ScoredItem,
+    additive_penalty,
+    decay_for_item,
+    multiplicative_factor,
+)
 from reflexio.server.services.retrieval.relevance_floor import apply_relevance_floors
 from reflexio.server.services.storage.storage_base import BaseStorage
 from reflexio.server.tracing import profile_step, set_span_data
@@ -50,6 +58,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _DEFAULT_ENTITY_TYPES = frozenset({"profiles", "agent_playbooks", "user_playbooks"})
+_SOURCE_USER_PLAYBOOK_IDS_KEY = "_source_user_playbook_ids"
 # Statuses returned for agent_playbooks when the caller does not pass an
 # explicit ``agent_playbook_status_filter``. Excludes REJECTED so that a
 # rejection in the dashboard immediately suppresses the playbook from search
@@ -77,6 +86,20 @@ _embedding_cache_lock = threading.Lock()
 _embedding_cache: OrderedDict[tuple[str, int, str, str], tuple[float, list[float]]] = (
     OrderedDict()
 )
+RetrievalCaptureHook = Callable[
+    [UnifiedSearchRequest, UnifiedSearchResponse, BaseStorage, str], None
+]
+_retrieval_capture_hook: RetrievalCaptureHook | None = None
+
+
+def configure_retrieval_capture_hook(hook: RetrievalCaptureHook | None) -> None:
+    """Register an optional final-response retrieval capture hook.
+
+    Deployments that capture retrieval logs install the hook; OSS leaves it
+    unset so unified search behavior is unchanged by default.
+    """
+    global _retrieval_capture_hook
+    _retrieval_capture_hook = hook
 
 
 def run_unified_search(
@@ -87,6 +110,7 @@ def run_unified_search(
     prompt_manager: PromptManager,
     pre_retrieval_model_name: str | None = None,
     retrieval_floor: RetrievalFloorConfig | None = None,
+    recency: RecencyConfig | None = None,
 ) -> UnifiedSearchResponse:
     """
     Search across all entity types (profiles, agent playbooks, user playbooks) in parallel.
@@ -114,7 +138,12 @@ def run_unified_search(
 
     floor_cfg = retrieval_floor or RetrievalFloorConfig()
     floor_on = floor_cfg.enabled
-    fetch_k = max(top_k, floor_cfg.pool_size) if floor_on else top_k
+    recency_on = bool(recency and recency.enabled)
+    fetch_k = max(
+        top_k,
+        floor_cfg.pool_size if floor_on else 0,
+        recency.pool_size if recency_on and recency is not None else 0,
+    )
 
     # --- Phase A: query reformulation + embedding generation ---
     reformulated_query, embedding = _run_phase_a(
@@ -138,6 +167,7 @@ def run_unified_search(
         query=reformulated_query,
         top_k=fetch_k,
         threshold=threshold,
+        recency_on=recency_on,
     )
 
     if profiles is None:
@@ -151,9 +181,36 @@ def run_unified_search(
             user_playbooks=user_playbooks,  # type: ignore[arg-type]
             top_k=top_k,
             cfg=floor_cfg,
+            recency=recency if recency_on else None,
         )
+    elif recency_on and recency is not None:
+        profiles = _apply_combined_score_recency(
+            profiles or [], entity_type="profiles", top_k=top_k, cfg=recency
+        )
+        agent_playbooks = _apply_combined_score_recency(
+            agent_playbooks or [],
+            entity_type="agent_playbooks",
+            top_k=top_k,
+            cfg=recency,
+        )
+        user_playbooks = _apply_combined_score_recency(
+            user_playbooks or [],
+            entity_type="user_playbooks",
+            top_k=top_k,
+            cfg=recency,
+        )
+    else:
+        profiles = _unwrap_items(profiles or [])[:top_k]
+        agent_playbooks = _unwrap_items(agent_playbooks or [])[:top_k]
+        user_playbooks = _unwrap_items(user_playbooks or [])[:top_k]
 
-    return UnifiedSearchResponse(
+    user_playbooks = _suppress_source_user_playbooks(
+        storage=storage,
+        agent_playbooks=agent_playbooks or [],
+        user_playbooks=user_playbooks or [],
+    )
+
+    response = UnifiedSearchResponse(
         success=True,
         profiles=profiles,
         agent_playbooks=agent_playbooks,  # type: ignore[reportArgumentType]
@@ -162,6 +219,32 @@ def run_unified_search(
         if reformulated_query != request.query
         else None,
     )
+    _maybe_capture_final_response(
+        request=request,
+        response=response,
+        storage=storage,
+        org_id=org_id,
+    )
+    return response
+
+
+def _maybe_capture_final_response(
+    *,
+    request: UnifiedSearchRequest,
+    response: UnifiedSearchResponse,
+    storage: BaseStorage,
+    org_id: str,
+) -> None:
+    hook = _retrieval_capture_hook
+    if hook is None:
+        return
+    try:
+        hook(request, response, storage, org_id)
+    except Exception:
+        logger.warning(
+            "Unified search retrieval capture hook failed",
+            exc_info=True,
+        )
 
 
 def _run_phase_a(
@@ -237,10 +320,11 @@ def _run_phase_b(
     query: str,
     top_k: int,
     threshold: float,
+    recency_on: bool = False,
 ) -> tuple[
-    list[UserProfile] | None,
-    list[AgentPlaybook] | None,
-    list[UserPlaybook] | None,
+    list[Any] | None,
+    list[Any] | None,
+    list[Any] | None,
 ]:
     """Run parallel searches across all entity types by delegating to storage methods.
 
@@ -267,9 +351,18 @@ def _run_phase_b(
             entity_types=sorted(entity_types),
             top_k=top_k,
         ) as span:
-            if (
+            # Recency needs the per-row ``combined_score``, which only the scored
+            # single-RPC method threads back. Backends that don't advertise
+            # ``supports_unified_hybrid_search`` (e.g. native Postgres, which still
+            # inherits ``unified_hybrid_search_scored`` and runs it via the same
+            # ``_rpc`` it already uses for ``hybrid_match_*``) opt into the scored
+            # path only when recency is on, so non-recency routing is unchanged.
+            wants_scored_single_rpc = recency_on and callable(
+                getattr(storage, "unified_hybrid_search_scored", None)
+            )
+            if _unified_single_rpc_enabled() and (
                 getattr(storage, "supports_unified_hybrid_search", False)
-                and _unified_single_rpc_enabled()
+                or wants_scored_single_rpc
             ):
                 combined = _run_phase_b_single_rpc(
                     request=request,
@@ -280,6 +373,7 @@ def _run_phase_b(
                     threshold=threshold,
                     entity_types=entity_types,
                     allowed_agent_statuses=allowed_agent_statuses,
+                    recency_on=recency_on,
                 )
                 if combined is not None:
                     profiles, agent_playbooks, user_playbooks = combined
@@ -390,7 +484,8 @@ def _run_phase_b_single_rpc(
     threshold: float,
     entity_types: set[str],
     allowed_agent_statuses: list[PlaybookStatus] | None,
-) -> tuple[list[UserProfile], list[AgentPlaybook], list[UserPlaybook]] | None:
+    recency_on: bool = False,
+) -> tuple[list[Any], list[Any], list[Any]] | None:
     """Run all Phase B arms through one combined storage round trip.
 
     Trades the per-arm round-trip overhead for serialized execution of the
@@ -411,8 +506,16 @@ def _run_phase_b_single_rpc(
     )
     # Resolve storage.unified_hybrid_search before submit so missing or stale
     # capability flags can fall back to the fan-out path.
-    unified_hybrid_search = getattr(storage, "unified_hybrid_search", None)
+    method_name = (
+        "unified_hybrid_search_scored" if recency_on else "unified_hybrid_search"
+    )
+    unified_hybrid_search = getattr(storage, method_name, None)
     if not callable(unified_hybrid_search):
+        if recency_on:
+            logger.warning(
+                "event=search_recency_missing_scores source=single_rpc method=%s",
+                method_name,
+            )
         return None
 
     future = _submit_with_current_context(
@@ -443,13 +546,14 @@ def _run_phase_b_single_rpc(
         return None
 
     # Mirror _search_agent_playbooks_via_storage: dedupe by id, cap at top_k.
-    deduped: list[AgentPlaybook] = []
+    deduped: list[Any] = []
     seen_ids: set[str] = set()
-    for playbook in agent_playbooks:
+    for candidate in agent_playbooks:
+        playbook = _unwrap_item(candidate)
         playbook_id = str(getattr(playbook, "agent_playbook_id", ""))
         if playbook_id and playbook_id not in seen_ids:
             seen_ids.add(playbook_id)
-            deduped.append(playbook)
+            deduped.append(candidate)
             if len(deduped) >= top_k:
                 break
     return profiles, deduped, user_playbooks
@@ -462,6 +566,7 @@ def _apply_floors(
     user_playbooks: list[UserPlaybook],
     top_k: int,
     cfg: RetrievalFloorConfig,
+    recency: RecencyConfig | None = None,
 ) -> tuple[list[UserProfile], list[AgentPlaybook], list[UserPlaybook]]:
     """Apply the per-arm relevance floor with one batched cross-encoder call."""
     floored_profiles, floored_agent, floored_user = apply_relevance_floors(
@@ -472,8 +577,152 @@ def _apply_floors(
             ("user_playbooks", user_playbooks, cfg.user_playbook_floor),
         ],
         top_k,
+        content_of=lambda item: _unwrap_item(item).content,
     )
-    return floored_profiles, floored_agent, floored_user
+    return (
+        _finalize_floor_arm(
+            floored_profiles, entity_type="profiles", top_k=top_k, recency=recency
+        ),
+        _finalize_floor_arm(
+            floored_agent,
+            entity_type="agent_playbooks",
+            top_k=top_k,
+            recency=recency,
+        ),
+        _finalize_floor_arm(
+            floored_user,
+            entity_type="user_playbooks",
+            top_k=top_k,
+            recency=recency,
+        ),
+    )
+
+
+def _finalize_floor_arm(
+    result: Any,
+    *,
+    entity_type: str,
+    top_k: int,
+    recency: RecencyConfig | None,
+) -> list[Any]:
+    if not recency or not recency.enabled:
+        return _unwrap_items(result.items)[:top_k]
+    if result.scores is None:
+        return _apply_combined_score_recency(
+            result.items, entity_type=entity_type, top_k=top_k, cfg=recency
+        )
+    now = int(datetime.now(UTC).timestamp())
+    rescored = []
+    for item, score in zip(result.items, result.scores, strict=True):
+        unwrapped = _unwrap_item(item)
+        freshness = decay_for_item(unwrapped, entity_type=entity_type, now=now)
+        rescored.append(
+            (unwrapped, score - additive_penalty(freshness, recency.max_penalty_logit))
+        )
+    rescored.sort(key=lambda pair: pair[1], reverse=True)
+    return [item for item, _score in rescored[:top_k]]
+
+
+def _apply_combined_score_recency(
+    items: list[Any],
+    *,
+    entity_type: str,
+    top_k: int,
+    cfg: RecencyConfig,
+) -> list[Any]:
+    if not items:
+        return []
+    scored_items: list[tuple[Any, float]] = []
+    for item in items:
+        if not isinstance(item, ScoredItem) or item.score is None:
+            logger.warning(
+                "event=search_recency_missing_scores entity_type=%s items=%d",
+                entity_type,
+                len(items),
+            )
+            return _unwrap_items(items)[:top_k]
+        scored_items.append((item.item, item.score))
+    now = int(datetime.now(UTC).timestamp())
+    rescored = []
+    for item, score in scored_items:
+        freshness = decay_for_item(item, entity_type=entity_type, now=now)
+        rescored.append(
+            (
+                item,
+                score * multiplicative_factor(freshness, cfg.max_penalty_frac),
+            )
+        )
+    rescored.sort(key=lambda pair: pair[1], reverse=True)
+    return [item for item, _score in rescored[:top_k]]
+
+
+def _unwrap_item(item: Any) -> Any:
+    return item.item if isinstance(item, ScoredItem) else item
+
+
+def _unwrap_items(items: list[Any]) -> list[Any]:
+    return [_unwrap_item(item) for item in items]
+
+
+def _suppress_source_user_playbooks(
+    *,
+    storage: BaseStorage,
+    agent_playbooks: list[AgentPlaybook],
+    user_playbooks: list[UserPlaybook],
+) -> list[UserPlaybook]:
+    """Drop user playbooks already represented by returned agent playbooks."""
+    if not agent_playbooks or not user_playbooks:
+        return user_playbooks
+
+    source_user_playbook_ids: set[int] = set()
+    agent_ids_needing_lookup: list[int] = []
+    for playbook in agent_playbooks:
+        source_ids = getattr(playbook, _SOURCE_USER_PLAYBOOK_IDS_KEY, None)
+        if source_ids is None:
+            agent_playbook_id = int(getattr(playbook, "agent_playbook_id", 0) or 0)
+            if agent_playbook_id:
+                agent_ids_needing_lookup.append(agent_playbook_id)
+            continue
+        source_user_playbook_ids.update(int(source_id) for source_id in source_ids)
+
+    if agent_ids_needing_lookup:
+        lookup = getattr(
+            storage, "get_source_user_playbook_ids_for_agent_playbooks", None
+        )
+        if callable(lookup):
+            try:
+                source_ids_by_agent = cast(
+                    dict[int, list[int]], lookup(agent_ids_needing_lookup)
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to resolve source user playbooks for unified search suppression",
+                    exc_info=True,
+                )
+            else:
+                for source_ids in source_ids_by_agent.values():
+                    source_user_playbook_ids.update(
+                        int(source_id) for source_id in source_ids
+                    )
+
+    if not source_user_playbook_ids:
+        return user_playbooks
+
+    filtered = [
+        playbook
+        for playbook in user_playbooks
+        if int(getattr(playbook, "user_playbook_id", 0) or 0)
+        not in source_user_playbook_ids
+    ]
+    suppressed_count = len(user_playbooks) - len(filtered)
+    if suppressed_count:
+        with profile_step(
+            "search.suppress_source_user_playbooks",
+            suppressed_count=suppressed_count,
+            source_user_playbook_count=len(source_user_playbook_ids),
+        ):
+            pass
+    return filtered
 
 
 def _get_cached_query_embedding(

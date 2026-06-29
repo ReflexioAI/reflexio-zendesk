@@ -1,9 +1,14 @@
 """Playbook CRUD + search methods for SQLite storage."""
 
 import json
+import logging
 import sqlite3
+import uuid
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from reflexio.models.api_schema.common import BlockingIssue
 from reflexio.models.api_schema.retriever_schema import (
@@ -23,11 +28,16 @@ from reflexio.models.api_schema.service_schemas import (
     UserPlaybook,
 )
 from reflexio.models.config_schema import SearchMode, SearchOptions
+from reflexio.server.services.storage.storage_base._playbook import (
+    AGGREGATE_REASON_PREFIX,
+)
 
 from ._base import (
+    _TOMBSTONE_STATUS_VALUES,
     SQLiteStorageBase,
     _build_status_sql,
     _effective_search_mode,
+    _epoch_now,
     _epoch_to_iso,
     _json_dumps,
     _json_loads,
@@ -38,6 +48,88 @@ from ._base import (
     _true_rrf_merge,
     _vector_rank_rows,
 )
+from ._lineage import _GC_ELIGIBLE_STATUSES, _append_event_stmt
+
+_AGENT_PLAYBOOK_DEFAULT_EXCLUDED_STATUSES = (
+    *_TOMBSTONE_STATUS_VALUES,
+    Status.ARCHIVE_IN_PROGRESS.value,
+)
+
+
+def _emit_hard_delete_playbook(
+    conn: sqlite3.Connection,
+    *,
+    org_id: str,
+    entity_type: str,
+    entity_id: str,
+    request_id: str,
+    actor: str = "api",
+) -> None:
+    """Emit a single hard_delete lineage event for a playbook entity."""
+    _append_event_stmt(
+        conn,
+        org_id=org_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        op="hard_delete",
+        prov="wasInvalidatedBy",
+        source_ids=[],
+        actor=actor,
+        request_id=request_id,
+        reason="erasure",
+    )
+
+
+def _emit_supersede_playbook(
+    conn: sqlite3.Connection,
+    *,
+    org_id: str,
+    entity_id: str,
+    old_status: str | None,
+    request_id: str,
+) -> None:
+    """Emit a single status_change->superseded lineage event for an agent playbook."""
+    _append_event_stmt(
+        conn,
+        org_id=org_id,
+        entity_type="agent_playbook",
+        entity_id=entity_id,
+        op="status_change",
+        prov="wasInvalidatedBy",
+        source_ids=[],
+        actor="aggregator",
+        request_id=request_id,
+        reason=f"{old_status or 'None'}->superseded",
+        from_status=old_status,
+        to_status=Status.SUPERSEDED.value,
+        status_namespace="lifecycle_status",
+    )
+
+
+def _emit_supersede_user_playbook(
+    conn: sqlite3.Connection,
+    *,
+    org_id: str,
+    entity_id: str,
+    old_status: str | None,
+    request_id: str,
+) -> None:
+    """Emit a single status_change->superseded lineage event for a user playbook."""
+    _append_event_stmt(
+        conn,
+        org_id=org_id,
+        entity_type="user_playbook",
+        entity_id=entity_id,
+        op="status_change",
+        prov="wasInvalidatedBy",
+        source_ids=[],
+        actor="consolidator",
+        request_id=request_id,
+        reason=f"{old_status or 'None'}->superseded",
+        from_status=old_status,
+        to_status=Status.SUPERSEDED.value,
+        status_namespace="lifecycle_status",
+    )
 
 
 def _row_to_playbook_optimization_candidate(
@@ -51,6 +143,7 @@ def _row_to_playbook_optimization_candidate(
         parent_candidate_ids=_json_loads(row["parent_candidate_ids"]) or [],
         aggregate_score=row["aggregate_score"],
         is_winner=bool(row["is_winner"]),
+        metadata_json=row["metadata_json"] or "{}",
         created_at=row["created_at"],
     )
 
@@ -77,12 +170,23 @@ def _row_to_playbook_optimization_evaluation(
     )
 
 
+def _build_tags_sql(alias: str, tags: list[str] | None) -> tuple[str, list[Any]]:
+    if not tags:
+        return "", []
+    placeholders = ",".join("?" for _ in tags)
+    return (
+        f"EXISTS (SELECT 1 FROM json_each({alias}.tags) WHERE value IN ({placeholders}))",
+        list(tags),
+    )
+
+
 class PlaybookMixin:
     """Mixin providing user playbook, agent playbook, and evaluation CRUD + search."""
 
     # Type hints for instance attributes/methods provided by SQLiteStorageBase via MRO
     _lock: Any
     conn: sqlite3.Connection
+    org_id: str
     _execute: Any
     _fetchone: Any
     _fetchall: Any
@@ -93,6 +197,7 @@ class PlaybookMixin:
     _fts_delete: Any
     _vec_upsert: Any
     _vec_delete: Any
+    _delete_playbook_search_rows: Any
     _has_sqlite_vec: bool
 
     # ------------------------------------------------------------------
@@ -125,8 +230,9 @@ class PlaybookMixin:
                         content, trigger, rationale, blocking_issue,
                         source_interaction_ids,
                         status, source, embedding, expanded_terms,
-                        source_span, notes, reader_angle)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        source_span, notes, reader_angle, tags,
+                        merged_into, superseded_by)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         up.user_id,
                         up.playbook_name,
@@ -147,6 +253,9 @@ class PlaybookMixin:
                         up.source_span,
                         up.notes,
                         up.reader_angle,
+                        _json_dumps(up.tags),
+                        up.merged_into,
+                        up.superseded_by,
                     ),
                 )
                 upid = cur.lastrowid or 0
@@ -175,6 +284,8 @@ class PlaybookMixin:
         start_time: int | None = None,
         end_time: int | None = None,
         include_embedding: bool = False,
+        tags: list[str] | None = None,
+        offset: int = 0,
     ) -> list[UserPlaybook]:
         sql = "SELECT * FROM user_playbooks WHERE 1=1"
         params: list[Any] = []
@@ -198,9 +309,17 @@ class PlaybookMixin:
             frag, sparams = _build_status_sql(status_filter)
             sql += f" AND {frag}"
             params.extend(sparams)
+        else:
+            # Default: exclude tombstone statuses (MERGED/SUPERSEDED)
+            sql += " AND (status IS NULL OR status NOT IN (?, ?))"
+            params.extend(_TOMBSTONE_STATUS_VALUES)
+        tag_frag, tag_params = _build_tags_sql("user_playbooks", tags)
+        if tag_frag:
+            sql += f" AND {tag_frag}"
+            params.extend(tag_params)
 
-        sql += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
+        sql += " ORDER BY created_at DESC, user_playbook_id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
         rows = self._fetchall(sql, params)
         return [
             _row_to_user_playbook(r, include_embedding=include_embedding) for r in rows
@@ -234,6 +353,10 @@ class PlaybookMixin:
             frag, sparams = _build_status_sql(status_filter)
             sql += f" AND {frag}"
             params.extend(sparams)
+        else:
+            # Default: exclude tombstone statuses (MERGED/SUPERSEDED)
+            sql += " AND (status IS NULL OR status NOT IN (?, ?))"
+            params.extend(_TOMBSTONE_STATUS_VALUES)
 
         row = self._fetchone(sql, params)
         return row["cnt"] if row else 0
@@ -243,25 +366,51 @@ class PlaybookMixin:
         row = self._fetchone(
             """SELECT COUNT(*) as cnt FROM user_playbooks up
                JOIN requests r ON up.request_id = r.request_id
-               WHERE r.session_id = ?""",
-            (session_id,),
+               WHERE r.session_id = ?
+                 AND (up.status IS NULL OR up.status NOT IN (?, ?))""",
+            (session_id, *_TOMBSTONE_STATUS_VALUES),
         )
         return row["cnt"] if row else 0
 
     @SQLiteStorageBase.handle_exceptions
     def delete_all_user_playbooks(self) -> None:
+        batch_request_id = uuid.uuid4().hex
         with self._lock:
-            self.conn.execute("DELETE FROM user_playbooks_fts")
+            ids = [
+                r["user_playbook_id"]
+                for r in self.conn.execute(
+                    "SELECT user_playbook_id FROM user_playbooks"
+                ).fetchall()
+            ]
             self.conn.execute("DELETE FROM user_playbooks")
+            for upid in ids:
+                _emit_hard_delete_playbook(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="user_playbook",
+                    entity_id=str(upid),
+                    request_id=batch_request_id,
+                )
             self.conn.commit()
+        self._delete_playbook_search_rows("user", ids)
 
     @SQLiteStorageBase.handle_exceptions
     def delete_user_playbook(self, user_playbook_id: int) -> None:
-        self._fts_delete("user_playbooks_fts", user_playbook_id)
-        self._vec_delete("user_playbooks_vec", user_playbook_id)
-        self._execute(
-            "DELETE FROM user_playbooks WHERE user_playbook_id = ?", (user_playbook_id,)
-        )
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM user_playbooks WHERE user_playbook_id = ?",
+                (user_playbook_id,),
+            )
+            if cur.rowcount > 0:
+                _emit_hard_delete_playbook(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="user_playbook",
+                    entity_id=str(user_playbook_id),
+                    request_id=uuid.uuid4().hex,
+                )
+            self._delete_playbook_search_rows("user", [user_playbook_id], commit=False)
+            self.conn.commit()
 
     @SQLiteStorageBase.handle_exceptions
     def delete_all_user_playbooks_by_playbook_name(
@@ -272,37 +421,60 @@ class PlaybookMixin:
         if agent_version is not None:
             sql += " AND agent_version = ?"
             params.append(agent_version)
-        ids = [r["user_playbook_id"] for r in self._fetchall(sql, params)]
-        if ids:
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            ids = [
+                r["user_playbook_id"] for r in self.conn.execute(sql, params).fetchall()
+            ]
+            if not ids:
+                return
             ph = ",".join("?" for _ in ids)
-            with self._lock:
-                self.conn.execute(
-                    f"DELETE FROM user_playbooks_fts WHERE rowid IN ({ph})", ids
+            self.conn.execute(
+                f"DELETE FROM user_playbooks WHERE user_playbook_id IN ({ph})", ids
+            )
+            for upid in ids:
+                _emit_hard_delete_playbook(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="user_playbook",
+                    entity_id=str(upid),
+                    request_id=batch_request_id,
                 )
-                self.conn.commit()
-
-        del_sql = "DELETE FROM user_playbooks WHERE playbook_name = ?"
-        del_params: list[Any] = [playbook_name]
-        if agent_version is not None:
-            del_sql += " AND agent_version = ?"
-            del_params.append(agent_version)
-        self._execute(del_sql, del_params)
+            self.conn.commit()
+        self._delete_playbook_search_rows("user", ids)
 
     @SQLiteStorageBase.handle_exceptions
-    def delete_user_playbooks_by_ids(self, user_playbook_ids: list[int]) -> int:
+    def delete_user_playbooks_by_ids(
+        self, user_playbook_ids: list[int], *, emit_hard_delete: bool = True
+    ) -> int:
         if not user_playbook_ids:
             return 0
         ph = ",".join("?" for _ in user_playbook_ids)
+        batch_request_id = uuid.uuid4().hex
         with self._lock:
-            self.conn.execute(
-                f"DELETE FROM user_playbooks_fts WHERE rowid IN ({ph})",
-                user_playbook_ids,
-            )
+            existing = [
+                r["user_playbook_id"]
+                for r in self.conn.execute(
+                    f"SELECT user_playbook_id FROM user_playbooks WHERE user_playbook_id IN ({ph})",
+                    user_playbook_ids,
+                ).fetchall()
+            ]
             cur = self.conn.execute(
                 f"DELETE FROM user_playbooks WHERE user_playbook_id IN ({ph})",
                 user_playbook_ids,
             )
+            if emit_hard_delete:
+                for upid in existing:
+                    _emit_hard_delete_playbook(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_type="user_playbook",
+                        entity_id=str(upid),
+                        request_id=batch_request_id,
+                        actor="system",
+                    )
             self.conn.commit()
+        self._delete_playbook_search_rows("user", user_playbook_ids)
         return cur.rowcount
 
     @SQLiteStorageBase.handle_exceptions
@@ -314,26 +486,63 @@ class PlaybookMixin:
         playbook_name: str | None = None,
     ) -> int:
         new_val = new_status.value if new_status else None
-        params: list[Any] = [new_val]
+        now_ts = _epoch_now()
+        old_val_str = old_status.value if old_status else "None"
+        new_val_str = new_status.value if new_status else "None"
+        reason = f"{old_val_str}->{new_val_str}"
 
         if old_status is None or (
             hasattr(old_status, "value") and old_status.value is None
         ):
             where = "status IS NULL"
+            select_params: list[Any] = []
         else:
             where = "status = ?"
-            params.append(old_status.value)
+            select_params = [old_status.value]
 
+        extra_params: list[Any] = []
         if agent_version is not None:
             where += " AND agent_version = ?"
-            params.append(agent_version)
+            extra_params.append(agent_version)
         if playbook_name is not None:
             where += " AND playbook_name = ?"
-            params.append(playbook_name)
+            extra_params.append(playbook_name)
 
-        cur = self._execute(
-            f"UPDATE user_playbooks SET status = ? WHERE {where}", params
-        )
+        # Set retired_at = now when transitioning to a GC-eligible status; clear to NULL otherwise.
+        retired_at_val = now_ts if new_val in _GC_ELIGIBLE_STATUSES else None
+
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            affected = [
+                r["user_playbook_id"]
+                for r in self.conn.execute(
+                    f"SELECT user_playbook_id FROM user_playbooks WHERE {where}",
+                    select_params + extra_params,
+                ).fetchall()
+            ]
+            cur = self.conn.execute(
+                f"UPDATE user_playbooks SET status = ?, retired_at = ? WHERE {where}",
+                [new_val, retired_at_val] + select_params + extra_params,
+            )
+            from_val = old_status.value if old_status else None
+            to_val = new_status.value if new_status else None
+            for upid in affected:
+                _append_event_stmt(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="user_playbook",
+                    entity_id=str(upid),
+                    op="status_change",
+                    prov="wasInvalidatedBy",
+                    source_ids=[],
+                    actor="api",
+                    request_id=batch_request_id,
+                    reason=reason,
+                    from_status=from_val,
+                    to_status=to_val,
+                    status_namespace="lifecycle_status",
+                )
+            self.conn.commit()
         return cur.rowcount
 
     @SQLiteStorageBase.handle_exceptions
@@ -343,6 +552,10 @@ class PlaybookMixin:
         agent_version: str | None = None,
         playbook_name: str | None = None,
     ) -> int:
+        # Bulk delete-by-status emits no hard_delete lineage events (parity with
+        # the Supabase backend, which routes this through _hard_delete_and_log with
+        # emit_hard_delete=False). Accepts any status: the upgrade flow legitimately
+        # deletes old ARCHIVED playbooks via _delete_items_by_status(Status.ARCHIVED).
         where = "status = ?"
         params: list[Any] = [status.value]
         if agent_version is not None:
@@ -352,22 +565,23 @@ class PlaybookMixin:
             where += " AND playbook_name = ?"
             params.append(playbook_name)
 
-        # Clean up FTS
-        ids = [
-            r["user_playbook_id"]
-            for r in self._fetchall(
-                f"SELECT user_playbook_id FROM user_playbooks WHERE {where}", params
-            )
-        ]
-        if ids:
+        with self._lock:
+            ids = [
+                r["user_playbook_id"]
+                for r in self.conn.execute(
+                    f"SELECT user_playbook_id FROM user_playbooks WHERE {where}",
+                    params,  # noqa: S608
+                ).fetchall()
+            ]
+            if not ids:
+                return 0
             ph = ",".join("?" for _ in ids)
-            with self._lock:
-                self.conn.execute(
-                    f"DELETE FROM user_playbooks_fts WHERE rowid IN ({ph})", ids
-                )
-                self.conn.commit()
-
-        cur = self._execute(f"DELETE FROM user_playbooks WHERE {where}", params)
+            cur = self.conn.execute(
+                f"DELETE FROM user_playbooks WHERE user_playbook_id IN ({ph})",  # noqa: S608
+                ids,
+            )
+            self._delete_playbook_search_rows("user", ids, commit=False)
+            self.conn.commit()
         return cur.rowcount
 
     @SQLiteStorageBase.handle_exceptions
@@ -393,9 +607,9 @@ class PlaybookMixin:
     @SQLiteStorageBase.handle_exceptions
     def archive_user_playbook_by_id(self, user_id: str, user_playbook_id: int) -> bool:
         cur = self._execute(
-            "UPDATE user_playbooks SET status = ? "
+            "UPDATE user_playbooks SET status = ?, retired_at = ? "
             "WHERE user_playbook_id = ? AND user_id = ? AND status IS NULL",
-            (Status.ARCHIVED.value, user_playbook_id, user_id),
+            (Status.ARCHIVED.value, _epoch_now(), user_playbook_id, user_id),
         )
         return cur.rowcount > 0
 
@@ -470,6 +684,14 @@ class PlaybookMixin:
             frag, sparams = _build_status_sql(status_filter)
             conditions.append(frag)
             params.extend(sparams)
+        else:
+            # Default: exclude tombstone statuses (MERGED/SUPERSEDED)
+            conditions.append("(up.status IS NULL OR up.status NOT IN (?, ?))")
+            params.extend(_TOMBSTONE_STATUS_VALUES)
+        tag_frag, tag_params = _build_tags_sql("up", request.tags)
+        if tag_frag:
+            conditions.append(tag_frag)
+            params.extend(tag_params)
 
         where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
         overfetch = match_count * 5 if mode != SearchMode.FTS else match_count
@@ -534,11 +756,15 @@ class PlaybookMixin:
         return [_row_to_user_playbook(r) for r in rows]
 
     @SQLiteStorageBase.handle_exceptions
-    def get_user_playbook_by_id(self, user_playbook_id: int) -> UserPlaybook | None:
-        row = self._fetchone(
-            "SELECT * FROM user_playbooks WHERE user_playbook_id = ?",
-            (user_playbook_id,),
-        )
+    def get_user_playbook_by_id(
+        self, user_playbook_id: int, *, include_tombstones: bool = False
+    ) -> UserPlaybook | None:
+        sql = "SELECT * FROM user_playbooks WHERE user_playbook_id = ?"
+        if not include_tombstones:
+            sql += " AND (status IS NULL OR status NOT IN (?, ?))"
+            row = self._fetchone(sql, (user_playbook_id, *_TOMBSTONE_STATUS_VALUES))
+        else:
+            row = self._fetchone(sql, (user_playbook_id,))
         return _row_to_user_playbook(row) if row else None
 
     @SQLiteStorageBase.handle_exceptions
@@ -567,6 +793,77 @@ class PlaybookMixin:
     # Agent Playbook methods
     # ------------------------------------------------------------------
 
+    def _index_agent_playbook_fts_vec(self, ap: AgentPlaybook) -> None:
+        """Update the FTS and vector indexes for a single agent playbook row.
+
+        Must be called AFTER the row's transaction has been committed.  The FTS
+        and vec helpers self-commit, so they must never be interleaved inside a
+        transaction that still has pending mutations.
+
+        Args:
+            ap (AgentPlaybook): The already-saved playbook (``agent_playbook_id``
+                must be set).
+        """
+        fts_parts = [ap.trigger or "", ap.content or ""]
+        if ap.expanded_terms:
+            fts_parts.append(ap.expanded_terms)
+        self._fts_upsert(
+            "agent_playbooks_fts",
+            ap.agent_playbook_id,
+            search_text=" ".join(p for p in fts_parts if p) or "",
+        )
+        if ap.embedding:
+            self._vec_upsert("agent_playbooks_vec", ap.agent_playbook_id, ap.embedding)
+
+    def _insert_agent_playbook_row(
+        self, conn: "sqlite3.Connection", ap: AgentPlaybook, created_at_iso: str
+    ) -> "sqlite3.Cursor":
+        """Execute the agent_playbooks INSERT and populate ``ap.agent_playbook_id``.
+
+        Runs the INSERT inside the caller's connection context; does NOT commit.
+        The caller is responsible for committing (or rolling back) the transaction.
+
+        Args:
+            conn: The open SQLite connection to execute against.
+            ap: The playbook to insert; ``agent_playbook_id`` is set on return.
+            created_at_iso: ISO-8601 timestamp string for ``created_at``.
+
+        Returns:
+            sqlite3.Cursor: The cursor from the INSERT (``lastrowid`` is the new PK).
+        """
+        cur = conn.execute(
+            """INSERT INTO agent_playbooks
+               (playbook_name, created_at, agent_version, content,
+                trigger, rationale, blocking_issue,
+                playbook_status, playbook_metadata, embedding,
+                expanded_terms, tags, status,
+                merged_into, superseded_by)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                ap.playbook_name,
+                created_at_iso,
+                ap.agent_version,
+                ap.content,
+                ap.trigger,
+                ap.rationale,
+                json.dumps(ap.blocking_issue.model_dump())
+                if ap.blocking_issue
+                else None,
+                ap.playbook_status.value
+                if isinstance(ap.playbook_status, PlaybookStatus)
+                else ap.playbook_status,
+                ap.playbook_metadata,
+                _json_dumps(ap.embedding),
+                ap.expanded_terms,
+                _json_dumps(ap.tags),
+                ap.status.value if ap.status else None,
+                ap.merged_into,
+                ap.superseded_by,
+            ),
+        )
+        ap.agent_playbook_id = cur.lastrowid or 0
+        return cur
+
     @SQLiteStorageBase.handle_exceptions
     def save_agent_playbooks(
         self, agent_playbooks: list[AgentPlaybook]
@@ -585,49 +882,88 @@ class PlaybookMixin:
 
             created_at_iso = _epoch_to_iso(ap.created_at)
             with self._lock:
-                cur = self.conn.execute(
-                    """INSERT INTO agent_playbooks
-                       (playbook_name, created_at, agent_version, content,
-                        trigger, rationale, blocking_issue,
-                        playbook_status, playbook_metadata, embedding,
-                        expanded_terms, status)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        ap.playbook_name,
-                        created_at_iso,
-                        ap.agent_version,
-                        ap.content,
-                        ap.trigger,
-                        ap.rationale,
-                        json.dumps(ap.blocking_issue.model_dump())
-                        if ap.blocking_issue
-                        else None,
-                        ap.playbook_status.value
-                        if isinstance(ap.playbook_status, PlaybookStatus)
-                        else ap.playbook_status,
-                        ap.playbook_metadata,
-                        _json_dumps(ap.embedding),
-                        ap.expanded_terms,
-                        ap.status.value if ap.status else None,
-                    ),
-                )
-                ap.agent_playbook_id = cur.lastrowid or 0
+                self._insert_agent_playbook_row(self.conn, ap, created_at_iso)
                 self.conn.commit()
 
-            fts_parts = [ap.trigger or "", ap.content or ""]
-            if ap.expanded_terms:
-                fts_parts.append(ap.expanded_terms)
-            self._fts_upsert(
-                "agent_playbooks_fts",
-                ap.agent_playbook_id,
-                search_text=" ".join(p for p in fts_parts if p) or "",
-            )
-            if ap.embedding:
-                self._vec_upsert(
-                    "agent_playbooks_vec", ap.agent_playbook_id, ap.embedding
-                )
+            self._index_agent_playbook_fts_vec(ap)
             saved.append(ap)
         return saved
+
+    @SQLiteStorageBase.handle_exceptions
+    def save_agent_playbook_with_aggregate_event(
+        self,
+        agent_playbook: AgentPlaybook,
+        *,
+        source_ids: list[str],
+        request_id: str,
+        run_mode: str,
+    ) -> AgentPlaybook:
+        """Persist an agent playbook AND its ``op=aggregate`` lineage event atomically.
+
+        The INSERT and the event are committed in a single transaction — if either
+        fails, both roll back.  The event is the sole record of the run->playbook
+        membership for reconstruction, so atomicity is critical.
+
+        Args:
+            agent_playbook (AgentPlaybook): The playbook to persist.
+            source_ids (list[str]): IDs of the source entities that produced this playbook.
+            request_id (str): The aggregation run ID.
+            run_mode (str): Aggregation run mode (e.g. ``full_archive`` or ``incremental``).
+
+        Returns:
+            AgentPlaybook: The saved playbook with ``agent_playbook_id`` populated.
+
+        Raises:
+            ValueError: If ``request_id`` is empty (would produce an unreconstructable event).
+        """
+        if not request_id or not request_id.strip():
+            raise ValueError(
+                "save_agent_playbook_with_aggregate_event requires a non-empty request_id"
+            )
+        ap = agent_playbook
+        embedding_text = ap.trigger or ap.content
+        if self._should_expand_documents():
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                emb_future = executor.submit(self._get_embedding, embedding_text)
+                exp_future = executor.submit(self._expand_document, embedding_text)
+                ap.embedding = emb_future.result(timeout=15)
+                ap.expanded_terms = exp_future.result(timeout=15)
+        else:
+            ap.embedding = self._get_embedding(embedding_text)
+
+        created_at_iso = _epoch_to_iso(ap.created_at)
+        with self._lock:
+            try:
+                self._insert_agent_playbook_row(self.conn, ap, created_at_iso)
+                _append_event_stmt(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="agent_playbook",
+                    entity_id=str(ap.agent_playbook_id),
+                    op="aggregate",
+                    prov="wasDerivedFrom",
+                    source_ids=source_ids,
+                    actor="aggregator",
+                    request_id=request_id,
+                    reason=f"{AGGREGATE_REASON_PREFIX}{run_mode}",
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+        # FTS/vec indexing AFTER commit — these helpers self-commit and must
+        # not be interleaved inside the atomic transaction above.
+        # Index failure does NOT invalidate the committed row+event; the index
+        # is reconstructable from the authoritative row.
+        try:
+            self._index_agent_playbook_fts_vec(ap)
+        except Exception:
+            logger.exception(
+                "FTS/vec indexing failed for agent_playbook %s (row committed, index skipped)",
+                ap.agent_playbook_id,
+            )
+        return ap
 
     @SQLiteStorageBase.handle_exceptions
     def get_agent_playbooks(
@@ -637,6 +973,7 @@ class PlaybookMixin:
         agent_version: str | None = None,
         status_filter: list[Status | None] | None = None,
         playbook_status_filter: list[PlaybookStatus] | None = None,
+        tags: list[str] | None = None,
     ) -> list[AgentPlaybook]:
         sql = "SELECT * FROM agent_playbooks WHERE 1=1"
         params: list[Any] = []
@@ -660,6 +997,10 @@ class PlaybookMixin:
             ph = ",".join("?" for _ in playbook_status_filter)
             sql += f" AND playbook_status IN ({ph})"
             params.extend(ps.value for ps in playbook_status_filter)
+        tag_frag, tag_params = _build_tags_sql("agent_playbooks", tags)
+        if tag_frag:
+            sql += f" AND {tag_frag}"
+            params.extend(tag_params)
 
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
@@ -667,28 +1008,61 @@ class PlaybookMixin:
         return [_row_to_agent_playbook(r) for r in rows]
 
     @SQLiteStorageBase.handle_exceptions
-    def get_agent_playbook_by_id(self, agent_playbook_id: int) -> AgentPlaybook | None:
-        row = self._fetchone(
-            "SELECT * FROM agent_playbooks WHERE agent_playbook_id = ?",
-            (agent_playbook_id,),
-        )
+    def get_agent_playbook_by_id(
+        self, agent_playbook_id: int, *, include_tombstones: bool = False
+    ) -> AgentPlaybook | None:
+        sql = "SELECT * FROM agent_playbooks WHERE agent_playbook_id = ?"
+        if not include_tombstones:
+            sql += " AND (status IS NULL OR status NOT IN (?, ?, ?))"
+            row = self._fetchone(
+                sql,
+                (agent_playbook_id, *_AGENT_PLAYBOOK_DEFAULT_EXCLUDED_STATUSES),
+            )
+        else:
+            row = self._fetchone(sql, (agent_playbook_id,))
         return _row_to_agent_playbook(row) if row else None
 
     @SQLiteStorageBase.handle_exceptions
     def delete_all_agent_playbooks(self) -> None:
+        batch_request_id = uuid.uuid4().hex
         with self._lock:
-            self.conn.execute("DELETE FROM agent_playbooks_fts")
+            ids = [
+                r["agent_playbook_id"]
+                for r in self.conn.execute(
+                    "SELECT agent_playbook_id FROM agent_playbooks"
+                ).fetchall()
+            ]
             self.conn.execute("DELETE FROM agent_playbooks")
+            for apid in ids:
+                _emit_hard_delete_playbook(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="agent_playbook",
+                    entity_id=str(apid),
+                    request_id=batch_request_id,
+                )
             self.conn.commit()
+        self._delete_playbook_search_rows("agent", ids)
 
     @SQLiteStorageBase.handle_exceptions
     def delete_agent_playbook(self, agent_playbook_id: int) -> None:
-        self._fts_delete("agent_playbooks_fts", agent_playbook_id)
-        self._vec_delete("agent_playbooks_vec", agent_playbook_id)
-        self._execute(
-            "DELETE FROM agent_playbooks WHERE agent_playbook_id = ?",
-            (agent_playbook_id,),
-        )
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM agent_playbooks WHERE agent_playbook_id = ?",
+                (agent_playbook_id,),
+            )
+            if cur.rowcount > 0:
+                _emit_hard_delete_playbook(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="agent_playbook",
+                    entity_id=str(agent_playbook_id),
+                    request_id=uuid.uuid4().hex,
+                )
+            self._delete_playbook_search_rows(
+                "agent", [agent_playbook_id], commit=False
+            )
+            self.conn.commit()
 
     @SQLiteStorageBase.handle_exceptions
     def delete_all_agent_playbooks_by_playbook_name(
@@ -699,52 +1073,103 @@ class PlaybookMixin:
         if agent_version is not None:
             sql += " AND agent_version = ?"
             params.append(agent_version)
-        ids = [r["agent_playbook_id"] for r in self._fetchall(sql, params)]
-        if ids:
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            ids = [
+                r["agent_playbook_id"]
+                for r in self.conn.execute(sql, params).fetchall()
+            ]
+            if not ids:
+                return
             ph = ",".join("?" for _ in ids)
-            with self._lock:
-                self.conn.execute(
-                    f"DELETE FROM agent_playbooks_fts WHERE rowid IN ({ph})", ids
+            self.conn.execute(
+                f"DELETE FROM agent_playbooks WHERE agent_playbook_id IN ({ph})", ids
+            )
+            for apid in ids:
+                _emit_hard_delete_playbook(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="agent_playbook",
+                    entity_id=str(apid),
+                    request_id=batch_request_id,
                 )
-                self.conn.commit()
-
-        del_sql = "DELETE FROM agent_playbooks WHERE playbook_name = ?"
-        del_params: list[Any] = [playbook_name]
-        if agent_version is not None:
-            del_sql += " AND agent_version = ?"
-            del_params.append(agent_version)
-        self._execute(del_sql, del_params)
+            self.conn.commit()
+        self._delete_playbook_search_rows("agent", ids)
 
     @SQLiteStorageBase.handle_exceptions
-    def delete_agent_playbooks_by_ids(self, agent_playbook_ids: list[int]) -> None:
+    def delete_agent_playbooks_by_ids(
+        self, agent_playbook_ids: list[int], *, emit_hard_delete: bool = True
+    ) -> None:
         if not agent_playbook_ids:
             return
         ph = ",".join("?" for _ in agent_playbook_ids)
+        batch_request_id = uuid.uuid4().hex
         with self._lock:
-            self.conn.execute(
-                f"DELETE FROM agent_playbooks_fts WHERE rowid IN ({ph})",
-                agent_playbook_ids,
-            )
+            existing = [
+                r["agent_playbook_id"]
+                for r in self.conn.execute(
+                    f"SELECT agent_playbook_id FROM agent_playbooks WHERE agent_playbook_id IN ({ph})",
+                    agent_playbook_ids,
+                ).fetchall()
+            ]
             self.conn.execute(
                 f"DELETE FROM agent_playbooks WHERE agent_playbook_id IN ({ph})",
                 agent_playbook_ids,
             )
+            if emit_hard_delete:
+                for apid in existing:
+                    _emit_hard_delete_playbook(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_type="agent_playbook",
+                        entity_id=str(apid),
+                        request_id=batch_request_id,
+                        actor="system",
+                    )
             self.conn.commit()
+        self._delete_playbook_search_rows("agent", agent_playbook_ids)
 
     @SQLiteStorageBase.handle_exceptions
     def update_agent_playbook_status(
         self, agent_playbook_id: int, playbook_status: PlaybookStatus
     ) -> None:
-        row = self._fetchone(
-            "SELECT agent_playbook_id FROM agent_playbooks WHERE agent_playbook_id = ?",
-            (agent_playbook_id,),
-        )
-        if not row:
-            raise ValueError(f"Agent playbook with ID {agent_playbook_id} not found")
-        self._execute(
-            "UPDATE agent_playbooks SET playbook_status = ? WHERE agent_playbook_id = ?",
-            (playbook_status.value, agent_playbook_id),
-        )
+        """Update an agent playbook's status and emit a status_change lineage event.
+
+        Each call generates a fresh request_id so every status change is recorded as
+        a distinct audit event (not collapsed by the idempotency key).
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT playbook_status FROM agent_playbooks WHERE agent_playbook_id = ?",
+                (agent_playbook_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(
+                    f"Agent playbook with ID {agent_playbook_id} not found"
+                )
+            prior_playbook_status = row["playbook_status"]
+            old_status = prior_playbook_status or "None"
+            cur = self.conn.execute(
+                "UPDATE agent_playbooks SET playbook_status = ? WHERE agent_playbook_id = ?",
+                (playbook_status.value, agent_playbook_id),
+            )
+            if cur.rowcount > 0:
+                _append_event_stmt(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="agent_playbook",
+                    entity_id=str(agent_playbook_id),
+                    op="status_change",
+                    prov="wasInvalidatedBy",
+                    source_ids=[],
+                    actor="api",
+                    request_id=uuid.uuid4().hex,
+                    reason=f"{old_status}->{playbook_status.value}",
+                    from_status=prior_playbook_status,
+                    to_status=playbook_status.value,
+                    status_namespace="playbook_status",
+                )
+            self.conn.commit()
 
     @SQLiteStorageBase.handle_exceptions
     def update_agent_playbook(
@@ -756,13 +1181,8 @@ class PlaybookMixin:
         rationale: str | None = None,
         blocking_issue: BlockingIssue | None = None,
         playbook_status: PlaybookStatus | None = None,
+        tags: list[str] | None = None,
     ) -> None:
-        row = self._fetchone(
-            "SELECT agent_playbook_id FROM agent_playbooks WHERE agent_playbook_id = ?",
-            (agent_playbook_id,),
-        )
-        if not row:
-            raise ValueError(f"Agent playbook with ID {agent_playbook_id} not found")
         updates: list[str] = []
         params: list[Any] = []
         if playbook_name is not None:
@@ -783,12 +1203,54 @@ class PlaybookMixin:
         if playbook_status is not None:
             updates.append("playbook_status = ?")
             params.append(playbook_status.value)
+        if tags is not None:
+            updates.append("tags = ?")
+            params.append(_json_dumps(tags))
         if updates:
             params.append(agent_playbook_id)
-            self._execute(
-                f"UPDATE agent_playbooks SET {', '.join(updates)} WHERE agent_playbook_id = ?",
-                tuple(params),
-            )
+            op = "revise" if content is not None else "status_change"
+            prov = "wasRevisionOf" if op == "revise" else "wasInvalidatedBy"
+            with self._lock:
+                prior_row = self.conn.execute(
+                    "SELECT playbook_status FROM agent_playbooks WHERE agent_playbook_id = ?",
+                    (agent_playbook_id,),
+                ).fetchone()
+                if not prior_row:
+                    raise ValueError(
+                        f"Agent playbook with ID {agent_playbook_id} not found"
+                    )
+                prior_playbook_status = prior_row["playbook_status"]
+                cur = self.conn.execute(
+                    f"UPDATE agent_playbooks SET {', '.join(updates)} WHERE agent_playbook_id = ?",
+                    tuple(params),
+                )
+                if cur.rowcount > 0:
+                    # Populate structured status fields only when playbook_status is
+                    # among the updated fields and the op is status_change (not revise).
+                    if op == "status_change" and playbook_status is not None:
+                        from_status = prior_playbook_status
+                        to_status = playbook_status.value
+                        status_namespace: str | None = "playbook_status"
+                    else:
+                        from_status = None
+                        to_status = None
+                        status_namespace = None
+                    _append_event_stmt(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_type="agent_playbook",
+                        entity_id=str(agent_playbook_id),
+                        op=op,
+                        prov=prov,
+                        source_ids=[],
+                        actor="api",
+                        request_id=uuid.uuid4().hex,
+                        reason="in-place update",
+                        from_status=from_status,
+                        to_status=to_status,
+                        status_namespace=status_namespace,
+                    )
+                self.conn.commit()
 
     @SQLiteStorageBase.handle_exceptions
     def update_user_playbook(
@@ -799,13 +1261,8 @@ class PlaybookMixin:
         trigger: str | None = None,
         rationale: str | None = None,
         blocking_issue: BlockingIssue | None = None,
+        tags: list[str] | None = None,
     ) -> None:
-        row = self._fetchone(
-            "SELECT user_playbook_id FROM user_playbooks WHERE user_playbook_id = ?",
-            (user_playbook_id,),
-        )
-        if not row:
-            raise ValueError(f"User playbook with ID {user_playbook_id} not found")
         updates: list[str] = []
         params: list[Any] = []
         if playbook_name is not None:
@@ -823,39 +1280,298 @@ class PlaybookMixin:
         if blocking_issue is not None:
             updates.append("blocking_issue = ?")
             params.append(json.dumps(blocking_issue.model_dump()))
+        if tags is not None:
+            updates.append("tags = ?")
+            params.append(_json_dumps(tags))
         if updates:
             params.append(user_playbook_id)
-            self._execute(
-                f"UPDATE user_playbooks SET {', '.join(updates)} WHERE user_playbook_id = ?",
-                tuple(params),
+            semantic_change = any(
+                value is not None for value in (content, trigger, rationale)
             )
+            op = "revise" if semantic_change else "status_change"
+            prov = "wasRevisionOf" if op == "revise" else "wasInvalidatedBy"
+            with self._lock:
+                cur = self.conn.execute(
+                    f"UPDATE user_playbooks SET {', '.join(updates)} WHERE user_playbook_id = ?",
+                    tuple(params),
+                )
+                if cur.rowcount > 0:
+                    _append_event_stmt(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_type="user_playbook",
+                        entity_id=str(user_playbook_id),
+                        op=op,
+                        prov=prov,
+                        source_ids=[],
+                        actor="api",
+                        request_id=uuid.uuid4().hex,
+                        reason="in-place update",
+                        from_status=None,
+                        to_status=None,
+                        status_namespace=None,
+                    )
+                self.conn.commit()
+
+    @SQLiteStorageBase.handle_exceptions
+    def supersede_user_playbooks_by_ids(
+        self, user_playbook_ids: list[int], request_id: str
+    ) -> int:
+        """Soft-delete user playbooks by setting status to SUPERSEDED.
+
+        Preserves the row content for strict point-in-time attribution reads.
+        Eligible rows are any non-tombstoned status (CURRENT / PENDING /
+        ARCHIVED). Atomic: all updates and lineage events commit together.
+        """
+        if not user_playbook_ids:
+            return 0
+        if not request_id:
+            raise ValueError("request_id must be non-empty for supersede")
+        now_ts = _epoch_now()
+        updated = 0
+        with self._lock:
+            for upid in user_playbook_ids:
+                row = self.conn.execute(
+                    "SELECT status FROM user_playbooks WHERE user_playbook_id = ?",
+                    (upid,),
+                ).fetchone()
+                if row is None:
+                    continue
+                old_status = row["status"]
+                cur = self.conn.execute(
+                    "UPDATE user_playbooks SET status = ?, retired_at = ?"
+                    " WHERE user_playbook_id = ?"
+                    " AND (status IS NULL OR status NOT IN (?, ?))",
+                    (
+                        Status.SUPERSEDED.value,
+                        now_ts,
+                        upid,
+                        *_TOMBSTONE_STATUS_VALUES,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    _emit_supersede_user_playbook(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_id=str(upid),
+                        old_status=old_status,
+                        request_id=request_id,
+                    )
+                    updated += 1
+            self.conn.commit()
+        return updated
 
     @SQLiteStorageBase.handle_exceptions
     def archive_agent_playbooks_by_playbook_name(
         self, playbook_name: str, agent_version: str | None = None
     ) -> None:
-        sql = "UPDATE agent_playbooks SET status = 'archived' WHERE playbook_name = ? AND playbook_status != ?"
+        where = (
+            "playbook_name = ? AND playbook_status != ?"
+            " AND (status IS NULL OR status != 'archived')"
+        )
         params: list[Any] = [playbook_name, PlaybookStatus.APPROVED.value]
         if agent_version is not None:
-            sql += " AND agent_version = ?"
+            where += " AND agent_version = ?"
             params.append(agent_version)
-        self._execute(sql, params)
+        now_ts = _epoch_now()
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            affected = self.conn.execute(
+                f"SELECT agent_playbook_id, status FROM agent_playbooks WHERE {where}",
+                params,
+            ).fetchall()
+            self.conn.execute(
+                f"UPDATE agent_playbooks SET status = 'archived', retired_at = ? WHERE {where}",
+                [now_ts, *params],
+            )
+            for row in affected:
+                prior = row["status"] or "None"
+                _append_event_stmt(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="agent_playbook",
+                    entity_id=str(row["agent_playbook_id"]),
+                    op="status_change",
+                    prov="wasInvalidatedBy",
+                    source_ids=[],
+                    actor="api",
+                    request_id=batch_request_id,
+                    reason=f"{prior}->archived",
+                    from_status=row["status"],
+                    to_status="archived",
+                    status_namespace="lifecycle_status",
+                )
+            self.conn.commit()
 
     @SQLiteStorageBase.handle_exceptions
     def archive_agent_playbooks_by_ids(self, agent_playbook_ids: list[int]) -> None:
         if not agent_playbook_ids:
             return
         ph = ",".join("?" for _ in agent_playbook_ids)
-        self._execute(
-            f"UPDATE agent_playbooks SET status = 'archived' WHERE agent_playbook_id IN ({ph}) AND playbook_status != ?",
-            [*agent_playbook_ids, PlaybookStatus.APPROVED.value],
+        now_ts = _epoch_now()
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            affected = self.conn.execute(
+                f"SELECT agent_playbook_id, status FROM agent_playbooks"
+                f" WHERE agent_playbook_id IN ({ph}) AND playbook_status != ?"
+                f" AND (status IS NULL OR status != 'archived')",
+                [*agent_playbook_ids, PlaybookStatus.APPROVED.value],
+            ).fetchall()
+            self.conn.execute(
+                f"UPDATE agent_playbooks SET status = 'archived', retired_at = ?"
+                f" WHERE agent_playbook_id IN ({ph}) AND playbook_status != ?"
+                f" AND (status IS NULL OR status != 'archived')",
+                [now_ts, *agent_playbook_ids, PlaybookStatus.APPROVED.value],
+            )
+            for row in affected:
+                prior = row["status"] or "None"
+                _append_event_stmt(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="agent_playbook",
+                    entity_id=str(row["agent_playbook_id"]),
+                    op="status_change",
+                    prov="wasInvalidatedBy",
+                    source_ids=[],
+                    actor="api",
+                    request_id=batch_request_id,
+                    reason=f"{prior}->archived",
+                    from_status=row["status"],
+                    to_status="archived",
+                    status_namespace="lifecycle_status",
+                )
+            self.conn.commit()
+
+    @SQLiteStorageBase.handle_exceptions
+    def supersede_agent_playbooks_by_ids(
+        self, agent_playbook_ids: list[int], request_id: str
+    ) -> int:
+        """Soft-delete agent playbooks by setting status to SUPERSEDED, emitting set-based lineage.
+
+        For each eligible id (not APPROVED, not already tombstoned), updates status to
+        SUPERSEDED and emits one ``status_change`` event under the shared ``request_id``.
+        Atomic: one ``conn.commit()`` at the end, guarded on rowcount per id.
+        FTS/vec rows are NOT removed — reads exclude tombstones by status filter.
+
+        Args:
+            agent_playbook_ids (list[int]): Agent playbook ids to supersede.
+            request_id (str): Shared request id for all emitted lineage events.
+
+        Returns:
+            int: Number of agent playbooks actually updated.
+        """
+        if not agent_playbook_ids:
+            return 0
+        if not request_id:
+            raise ValueError("request_id must be non-empty for supersede")
+        now_ts = _epoch_now()
+        updated = 0
+        with self._lock:
+            for apid in agent_playbook_ids:
+                row = self.conn.execute(
+                    "SELECT status FROM agent_playbooks WHERE agent_playbook_id = ?",
+                    (apid,),
+                ).fetchone()
+                if row is None:
+                    continue
+                old_status = row["status"]
+                # NOTE (M3): The model supersede_profiles_by_ids adds an eligible-check
+                # `if old_status_val not in eligible: continue` before the UPDATE. For
+                # agent_playbooks the ineligible condition spans two columns (status in
+                # _TOMBSTONE_STATUS_VALUES OR playbook_status == APPROVED), so aligning
+                # would require adding playbook_status to the SELECT. The UPDATE WHERE
+                # clause already excludes those rows atomically; the extra continue here
+                # would be a no-op and not worth the added complexity.
+                cur = self.conn.execute(
+                    "UPDATE agent_playbooks SET status = ?, retired_at = ?"
+                    " WHERE agent_playbook_id = ? AND playbook_status != ?"
+                    " AND (status IS NULL OR status NOT IN (?, ?))",
+                    (
+                        Status.SUPERSEDED.value,
+                        now_ts,
+                        apid,
+                        PlaybookStatus.APPROVED.value,
+                        *_TOMBSTONE_STATUS_VALUES,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    _emit_supersede_playbook(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_id=str(apid),
+                        old_status=old_status,
+                        request_id=request_id,
+                    )
+                    updated += 1
+            self.conn.commit()
+        return updated
+
+    @SQLiteStorageBase.handle_exceptions
+    def supersede_agent_playbooks_by_playbook_name(
+        self, playbook_name: str, agent_version: str | None, request_id: str
+    ) -> int:
+        """Soft-delete archived agent playbooks by name/version via SUPERSEDED status.
+
+        Mirrors ``delete_archived_agent_playbooks_by_playbook_name`` but converts
+        the hard-delete to a soft-supersede with status_change lineage events.
+        Atomic: one ``conn.commit()`` at the end.
+        FTS/vec rows are NOT removed.
+
+        Args:
+            playbook_name (str): Playbook name to supersede.
+            agent_version (str | None): Agent version filter. None matches all versions.
+            request_id (str): Shared request id for all emitted lineage events.
+
+        Returns:
+            int: Number of agent playbooks actually updated.
+        """
+        if not request_id:
+            raise ValueError("request_id must be non-empty for supersede")
+        sql = (
+            "SELECT agent_playbook_id, status FROM agent_playbooks"
+            " WHERE playbook_name = ? AND status = 'archived'"
         )
+        params: list[Any] = [playbook_name]
+        if agent_version is not None:
+            sql += " AND agent_version = ?"
+            params.append(agent_version)
+        updated = 0
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+            if not rows:
+                return 0
+            now_ts = _epoch_now()
+            for row in rows:
+                apid = row["agent_playbook_id"]
+                old_status = row["status"]
+                cur = self.conn.execute(
+                    "UPDATE agent_playbooks SET status = ?, retired_at = ?"
+                    " WHERE agent_playbook_id = ? AND playbook_status != ?"
+                    " AND status = 'archived'",
+                    (
+                        Status.SUPERSEDED.value,
+                        now_ts,
+                        apid,
+                        PlaybookStatus.APPROVED.value,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    _emit_supersede_playbook(
+                        self.conn,
+                        org_id=self.org_id,
+                        entity_id=str(apid),
+                        old_status=old_status,
+                        request_id=request_id,
+                    )
+                    updated += 1
+            self.conn.commit()
+        return updated
 
     @SQLiteStorageBase.handle_exceptions
     def restore_archived_agent_playbooks_by_playbook_name(
         self, playbook_name: str, agent_version: str | None = None
     ) -> None:
-        sql = "UPDATE agent_playbooks SET status = NULL WHERE playbook_name = ? AND status = 'archived'"
+        sql = "UPDATE agent_playbooks SET status = NULL, retired_at = NULL WHERE playbook_name = ? AND status = 'archived'"
         params: list[Any] = [playbook_name]
         if agent_version is not None:
             sql += " AND agent_version = ?"
@@ -870,7 +1586,7 @@ class PlaybookMixin:
             return
         ph = ",".join("?" for _ in agent_playbook_ids)
         self._execute(
-            f"UPDATE agent_playbooks SET status = NULL WHERE agent_playbook_id IN ({ph}) AND status = 'archived'",
+            f"UPDATE agent_playbooks SET status = NULL, retired_at = NULL WHERE agent_playbook_id IN ({ph}) AND status = 'archived'",
             agent_playbook_ids,
         )
 
@@ -900,6 +1616,32 @@ class PlaybookMixin:
             window.user_playbook_id
             for window in self.get_source_windows_for_agent_playbook(agent_playbook_id)
         ]
+
+    @SQLiteStorageBase.handle_exceptions
+    def get_source_user_playbook_ids_for_agent_playbooks(
+        self, agent_playbook_ids: Sequence[int]
+    ) -> dict[int, list[int]]:
+        if not agent_playbook_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(int(apid) for apid in agent_playbook_ids))
+        ph = ",".join("?" for _ in unique_ids)
+        rows = self._fetchall(
+            f"""SELECT agent_playbook_id, user_playbook_id
+                FROM agent_playbook_source_user_playbooks
+                WHERE agent_playbook_id IN ({ph})
+                ORDER BY agent_playbook_id ASC, user_playbook_id ASC""",
+            unique_ids,
+        )
+        by_agent_id: dict[int, list[int]] = {apid: [] for apid in unique_ids}
+        seen_by_agent_id: dict[int, set[int]] = {apid: set() for apid in unique_ids}
+        for row in rows:
+            agent_playbook_id = int(row["agent_playbook_id"])
+            user_playbook_id = int(row["user_playbook_id"])
+            seen = seen_by_agent_id.setdefault(agent_playbook_id, set())
+            if user_playbook_id not in seen:
+                by_agent_id.setdefault(agent_playbook_id, []).append(user_playbook_id)
+                seen.add(user_playbook_id)
+        return by_agent_id
 
     @SQLiteStorageBase.handle_exceptions
     def set_source_windows_for_agent_playbook(
@@ -1023,8 +1765,8 @@ class PlaybookMixin:
             cur = self.conn.execute(
                 """INSERT INTO playbook_optimization_candidates
                    (job_id, candidate_index, content, parent_candidate_ids,
-                    aggregate_score, is_winner, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    aggregate_score, is_winner, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     candidate.job_id,
                     candidate.candidate_index,
@@ -1032,6 +1774,7 @@ class PlaybookMixin:
                     _json_dumps(candidate.parent_candidate_ids) or "[]",
                     candidate.aggregate_score,
                     1 if candidate.is_winner else 0,
+                    candidate.metadata_json,
                     candidate.created_at,
                 ),
             )
@@ -1135,27 +1878,33 @@ class PlaybookMixin:
     def delete_archived_agent_playbooks_by_playbook_name(
         self, playbook_name: str, agent_version: str | None = None
     ) -> None:
-        # Get IDs for FTS cleanup
         sql = "SELECT agent_playbook_id FROM agent_playbooks WHERE playbook_name = ? AND status = 'archived'"
         params: list[Any] = [playbook_name]
         if agent_version is not None:
             sql += " AND agent_version = ?"
             params.append(agent_version)
-        ids = [r["agent_playbook_id"] for r in self._fetchall(sql, params)]
-        if ids:
+        batch_request_id = uuid.uuid4().hex
+        with self._lock:
+            ids = [
+                r["agent_playbook_id"]
+                for r in self.conn.execute(sql, params).fetchall()
+            ]
+            if not ids:
+                return
             ph = ",".join("?" for _ in ids)
-            with self._lock:
-                self.conn.execute(
-                    f"DELETE FROM agent_playbooks_fts WHERE rowid IN ({ph})", ids
+            self.conn.execute(
+                f"DELETE FROM agent_playbooks WHERE agent_playbook_id IN ({ph})", ids
+            )
+            for apid in ids:
+                _emit_hard_delete_playbook(
+                    self.conn,
+                    org_id=self.org_id,
+                    entity_type="agent_playbook",
+                    entity_id=str(apid),
+                    request_id=batch_request_id,
                 )
-                self.conn.commit()
-
-        del_sql = "DELETE FROM agent_playbooks WHERE playbook_name = ? AND status = 'archived'"
-        del_params: list[Any] = [playbook_name]
-        if agent_version is not None:
-            del_sql += " AND agent_version = ?"
-            del_params.append(agent_version)
-        self._execute(del_sql, del_params)
+            self.conn.commit()
+        self._delete_playbook_search_rows("agent", ids)
 
     @SQLiteStorageBase.handle_exceptions
     def search_agent_playbooks(  # noqa: C901
@@ -1209,6 +1958,13 @@ class PlaybookMixin:
             frag, sparams = _build_status_sql(status_filter)
             conditions.append(frag)
             params.extend(sparams)
+        else:
+            conditions.append("(ap.status IS NULL OR ap.status NOT IN (?, ?, ?))")
+            params.extend(_AGENT_PLAYBOOK_DEFAULT_EXCLUDED_STATUSES)
+        tag_frag, tag_params = _build_tags_sql("ap", request.tags)
+        if tag_frag:
+            conditions.append(tag_frag)
+            params.extend(tag_params)
 
         where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
         overfetch = match_count * 5 if mode != SearchMode.FTS else match_count
@@ -1290,12 +2046,13 @@ class PlaybookMixin:
             created_at_iso = _epoch_to_iso(result.created_at)
             self._execute(
                 """INSERT INTO agent_success_evaluation_result
-                   (session_id, agent_version, evaluation_name, is_success,
+                   (user_id, session_id, agent_version, evaluation_name, is_success,
                     failure_type, failure_reason, regular_vs_shadow,
                     number_of_correction_per_session, user_turns_to_resolution,
                     is_escalated, embedding, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
+                    result.user_id,
                     result.session_id,
                     result.agent_version,
                     result.evaluation_name,
@@ -1328,19 +2085,61 @@ class PlaybookMixin:
         return [_row_to_eval_result(r) for r in rows]
 
     @SQLiteStorageBase.handle_exceptions
+    def get_agent_success_evaluation_results_in_window(
+        self,
+        from_ts: int,
+        to_ts: int,
+        agent_version: str | None = None,
+        limit: int | None = None,
+    ) -> list[AgentSuccessEvaluationResult]:
+        sql = """SELECT * FROM agent_success_evaluation_result
+                 WHERE created_at >= ? AND created_at <= ?"""
+        params: list[Any] = [_epoch_to_iso(from_ts), _epoch_to_iso(to_ts)]
+        if agent_version is not None:
+            sql += " AND agent_version = ?"
+            params.append(agent_version)
+        sql += " ORDER BY created_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._fetchall(sql, params)
+        return [_row_to_eval_result(r) for r in rows]
+
+    @SQLiteStorageBase.handle_exceptions
+    def get_agent_success_evaluation_result_ids(
+        self,
+        user_id: str,
+        session_id: str,
+        evaluation_name: str,
+        agent_version: str,
+    ) -> list[int]:
+        rows = self._fetchall(
+            """SELECT result_id FROM agent_success_evaluation_result
+               WHERE user_id = ?
+                 AND session_id = ?
+                 AND evaluation_name = ?
+                 AND agent_version = ?
+               ORDER BY created_at DESC""",
+            (user_id, session_id, evaluation_name, agent_version),
+        )
+        return [int(r["result_id"]) for r in rows]
+
+    @SQLiteStorageBase.handle_exceptions
     def delete_all_agent_success_evaluation_results(self) -> None:
         self._execute("DELETE FROM agent_success_evaluation_result")
 
     @SQLiteStorageBase.handle_exceptions
     def delete_agent_success_evaluation_results_for_session(
         self,
+        user_id: str,
         session_id: str,
         evaluation_name: str,
         agent_version: str,
     ) -> int:
-        """Delete results scoped to (session_id, evaluation_name, agent_version).
+        """Delete results scoped to (user_id, session_id, evaluation_name, agent_version).
 
         Args:
+            user_id (str): User whose session results to clear.
             session_id (str): Session whose results to clear.
             evaluation_name (str): Which evaluator's results to clear.
             agent_version (str): Agent version scope.
@@ -1350,8 +2149,11 @@ class PlaybookMixin:
         """
         cur = self._execute(
             """DELETE FROM agent_success_evaluation_result
-               WHERE session_id = ? AND evaluation_name = ? AND agent_version = ?""",
-            (session_id, evaluation_name, agent_version),
+               WHERE user_id = ?
+                 AND session_id = ?
+                 AND evaluation_name = ?
+                 AND agent_version = ?""",
+            (user_id, session_id, evaluation_name, agent_version),
         )
         return cur.rowcount
 

@@ -22,13 +22,13 @@ from reflexio.models.api_schema.domain.entities import (
 from reflexio.models.api_schema.domain.enums import ProfileTimeToLive, Status
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.services.operation_state_utils import OperationStateManager
-from reflexio.server.services.reflection.reflection_service import ReflectionService
 from reflexio.server.services.reflection.reflection_service_utils import (
     REFLECTION_OPERATION_NAME,
     ReflectionDecision,
     ReflectionOutput,
     ReflectionServiceRequest,
 )
+from reflexio.server.services.reflection.service import ReflectionService
 
 pytestmark = pytest.mark.integration
 
@@ -281,7 +281,7 @@ class TestCitedRowsAlreadyArchived:
 
 
 class TestReplaceProfile:
-    def test_replace_archives_cited_and_inserts_new_current(
+    def test_replace_supersedes_cited_and_inserts_new_current(
         self, request_context, service, llm_client
     ):
         _set_config(request_context)
@@ -317,9 +317,9 @@ class TestReplaceProfile:
         assert result.no_change_count == 0
 
         current = storage.get_user_profile("u1", status_filter=[None])
-        archived = storage.get_user_profile("u1", status_filter=[Status.ARCHIVED])
+        superseded = storage.get_user_profile("u1", status_filter=[Status.SUPERSEDED])
         assert len(current) == 1
-        assert len(archived) == 1
+        assert len(superseded) == 1
         assert current[0].profile_id != "p1"
         assert current[0].content == "new content"
         assert current[0].profile_time_to_live == ProfileTimeToLive.ONE_QUARTER
@@ -327,7 +327,9 @@ class TestReplaceProfile:
         assert current[0].user_id == "u1"
         assert current[0].custom_features == {"k": "v"}
         assert current[0].source == "seed"
-        assert archived[0].profile_id == "p1"
+        assert superseded[0].profile_id == "p1"
+        # superseded_by pointer must reference the new current profile.
+        assert superseded[0].superseded_by == current[0].profile_id
 
 
 class TestReplacePlaybook:
@@ -369,14 +371,14 @@ class TestReplacePlaybook:
         assert result.revised_count == 1
 
         current = storage.get_user_playbooks(user_id="u1", status_filter=[None])
-        archived = storage.get_user_playbooks(
-            user_id="u1", status_filter=[Status.ARCHIVED]
+        superseded = storage.get_user_playbooks(
+            user_id="u1", status_filter=[Status.SUPERSEDED]
         )
         assert len(current) == 1
-        assert len(archived) == 1
+        assert len(superseded) == 1
         assert current[0].user_playbook_id != 1
         assert current[0].content == "new rule"
-        # Trigger falls back to archived row's value; rationale is the supplied one.
+        # Trigger falls back to superseded row's value; rationale is the supplied one.
         assert current[0].trigger == "when X"
         assert current[0].rationale == "rewritten because Y was wrong"
         assert current[0].user_id == "u1"
@@ -536,11 +538,11 @@ class TestPerDecisionMalformed:
         assert result.ran is True
         assert result.revised_count == 1
         assert result.failed_count >= 1
-        # Profile updated, playbook untouched.
-        archived_profiles = storage.get_user_profile(
-            "u1", status_filter=[Status.ARCHIVED]
+        # Profile superseded (not archived), playbook untouched.
+        superseded_profiles = storage.get_user_profile(
+            "u1", status_filter=[Status.SUPERSEDED]
         )
-        assert len(archived_profiles) == 1
+        assert len(superseded_profiles) == 1
         archived_playbooks = storage.get_user_playbooks(
             user_id="u1", status_filter=[Status.ARCHIVED]
         )
@@ -548,15 +550,16 @@ class TestPerDecisionMalformed:
 
 
 class TestArchiveAfterInsertFailure:
-    """Post-insert archive failures must keep the new row and log at ERROR.
+    """Post-insert supersede failures must keep the new row and log at ERROR.
 
     The reflection service explicitly accepts a transient duplicate
     (cited row stays current, new row inserted) over silently dropping
-    user data when the archive step fails. These tests pin that
-    behavior down.
+    user data when the supersede step raises. When supersede_record
+    returns False (CAS race lost), the successor is deleted cleanly.
+    These tests pin that behavior down.
     """
 
-    def test_replace_profile_archive_raises_keeps_new_row(
+    def test_replace_profile_supersede_raises_keeps_new_row(
         self, request_context, service, llm_client, caplog
     ):
         _set_config(request_context)
@@ -588,11 +591,11 @@ class TestArchiveAfterInsertFailure:
         with (
             patch.object(
                 storage,
-                "archive_profile_by_id",
+                "supersede_record",
                 side_effect=RuntimeError("disk full"),
             ),
             caplog.at_level(
-                "ERROR", logger="reflexio.server.services.reflection.reflection_service"
+                "ERROR", logger="reflexio.server.services.reflection.service"
             ),
         ):
             result = service.run(ReflectionServiceRequest(user_id="u1"))
@@ -611,7 +614,7 @@ class TestArchiveAfterInsertFailure:
         assert "kind=profile" in caplog.text
         assert "cited_id=p1" in caplog.text
 
-    def test_replace_profile_archive_returns_false_logs_noop(
+    def test_replace_profile_supersede_returns_false_drops_successor_and_logs_noop(
         self, request_context, service, llm_client, caplog
     ):
         _set_config(request_context)
@@ -640,18 +643,22 @@ class TestArchiveAfterInsertFailure:
             ]
         )
 
-        # archive_profile_by_id returns False (e.g. row was already
-        # archived between resolve and apply by a concurrent writer).
+        # supersede_record returns False (CAS race lost — incumbent was no
+        # longer CURRENT between resolve and apply by a concurrent writer).
         with (
-            patch.object(storage, "archive_profile_by_id", return_value=False),
+            patch.object(storage, "supersede_record", return_value=False),
             caplog.at_level(
-                "ERROR", logger="reflexio.server.services.reflection.reflection_service"
+                "ERROR", logger="reflexio.server.services.reflection.service"
             ),
         ):
             result = service.run(ReflectionServiceRequest(user_id="u1"))
 
         assert result.revised_count == 1
         assert "reflection_archive_after_insert_noop" in caplog.text
+        # The successor was deleted (CAS lost → rollback); only p1 remains current.
+        current = storage.get_user_profile("u1", status_filter=[None])
+        assert len(current) == 1
+        assert current[0].profile_id == "p1"
 
     def test_replace_playbook_archive_raises_keeps_new_row(
         self, request_context, service, llm_client, caplog
@@ -686,11 +693,11 @@ class TestArchiveAfterInsertFailure:
         with (
             patch.object(
                 storage,
-                "archive_user_playbook_by_id",
+                "supersede_record",
                 side_effect=RuntimeError("disk full"),
             ),
             caplog.at_level(
-                "ERROR", logger="reflexio.server.services.reflection.reflection_service"
+                "ERROR", logger="reflexio.server.services.reflection.service"
             ),
         ):
             result = service.run(ReflectionServiceRequest(user_id="u1"))
@@ -698,7 +705,7 @@ class TestArchiveAfterInsertFailure:
         assert result.ran is True
         assert result.revised_count == 1
 
-        # Both rows still current — transient duplicate.
+        # Both rows still current — transient duplicate (supersede raised before cleanup).
         current = storage.get_user_playbooks(user_id="u1", status_filter=[None])
         assert len(current) == 2
         assert {p.content for p in current} == {"old rule", "new rule"}
@@ -762,14 +769,14 @@ class TestLLMReportedFlip:
         assert not hasattr(result, "flipped_count")
 
         current = storage.get_user_playbooks(user_id="u1", status_filter=[None])
-        archived = storage.get_user_playbooks(
-            user_id="u1", status_filter=[Status.ARCHIVED]
+        superseded = storage.get_user_playbooks(
+            user_id="u1", status_filter=[Status.SUPERSEDED]
         )
         assert len(current) == 1
-        assert len(archived) == 1
+        assert len(superseded) == 1
         assert current[0].content == "Avoid X when Y."
         assert current[0].rationale == "user pushed back when X was recommended"
-        assert archived[0].user_playbook_id == 1
+        assert superseded[0].user_playbook_id == 1
 
     def test_content_revision_without_rationale_counts_as_failed(
         self, request_context, service, llm_client
@@ -924,11 +931,11 @@ class TestPerPassCap:
         assert result.ran is True
         assert result.revised_count == 2
         assert result.capped_count == 1
-        # Exactly two archives happened.
-        archived = storage.get_user_playbooks(
-            user_id="u1", status_filter=[Status.ARCHIVED]
+        # Exactly two supersedes happened.
+        superseded = storage.get_user_playbooks(
+            user_id="u1", status_filter=[Status.SUPERSEDED]
         )
-        assert len(archived) == 2
+        assert len(superseded) == 2
 
     def test_no_change_decisions_do_not_count_against_cap(
         self, request_context, service, llm_client
@@ -1171,7 +1178,7 @@ class TestFieldDerivableCounters:
 
         with caplog.at_level(
             "INFO",
-            logger="reflexio.server.services.reflection.reflection_service",
+            logger="reflexio.server.services.reflection.service",
         ):
             result = service.run(ReflectionServiceRequest(user_id="u1"))
 

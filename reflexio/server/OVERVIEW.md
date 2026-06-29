@@ -23,7 +23,7 @@ Client (SDK/Web)
         -> GenerationService (server/services/)
           ├─> ProfileGenerationService -> ProfileExtractor(s) -> Storage
           ├─> PlaybookGenerationService -> PlaybookExtractor(s) -> Storage
-          └─> GroupEvaluationScheduler (deferred 10 min) -> Evaluator(s) -> Storage
+          └─> agent_success_evaluation/scheduler.py:GroupEvaluationScheduler (deferred 10 min) -> agent_success_evaluation/runner.py:run_group_evaluation -> agent_success_evaluation/service.py -> agent_success_evaluation/components/evaluator.py -> Storage
 ```
 
 ## Prerequisites
@@ -41,7 +41,7 @@ cp .env.example .env                         # Configure environment (set at lea
 uv sync                                      # Install Python dependencies (includes workspace packages)
 npm --prefix src/website install         # Install frontend dependencies
 npm --prefix src/public_docs install     # Install docs dependencies
-./run_services.sh                             # Starts API (8081), Website (8080), Docs (8082)
+./run_services.sh                             # Starts API (8061), Website (8080), Docs (8062)
 ./stop_services.sh                            # Stop all services
 ```
 
@@ -56,7 +56,7 @@ npm --prefix src/public_docs install     # Install docs dependencies
 **Testing:**
 ```python
 import reflexio
-client = reflexio.ReflexioClient(api_key="your-api-key", url_endpoint="http://127.0.0.1:8081/")
+client = reflexio.ReflexioClient(api_key="your-api-key", url_endpoint="http://127.0.0.1:8061/")
 ```
 See `notebooks/reflexio_cookbook.ipynb` and `src/tests/readme.md`
 

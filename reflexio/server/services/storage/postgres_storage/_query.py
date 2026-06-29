@@ -136,6 +136,10 @@ class PostgresQuery:
         self._filters.append((column, "IN", list(values)))
         return self
 
+    def contains(self, column: str, value: Any) -> PostgresQuery:
+        self._filters.append((column, "@>", value))
+        return self
+
     def is_(self, column: str, value: str) -> PostgresQuery:
         if value != "null":
             raise ValueError(f"Unsupported is_ value: {value}")
@@ -321,6 +325,9 @@ class PostgresQuery:
             elif op == "IN":
                 clauses.append(sql.SQL("{} = ANY(%s)").format(ident))
                 params.append(value)
+            elif op == "@>":
+                clauses.append(sql.SQL("{} @> %s::jsonb").format(ident))
+                params.append(Json(value))
             else:
                 clauses.append(sql.SQL("{} {} %s").format(ident, sql.SQL(op)))
                 params.append(self._filter_value(column, op, value))

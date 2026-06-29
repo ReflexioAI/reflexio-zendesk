@@ -8,16 +8,18 @@ prompt caching. All LiteLLM SDK calls are mocked -- no real API requests are mad
 import base64
 import json
 import logging
+import multiprocessing
 import struct
 import tempfile
 import time
 import zlib
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, Literal, cast
 from unittest.mock import MagicMock, patch
 
 import litellm
 import pytest
+from litellm.exceptions import APIConnectionError
 from pydantic import BaseModel, Field
 
 from reflexio.models.config_schema import (
@@ -37,14 +39,17 @@ from reflexio.models.config_schema import (
 from reflexio.models.config_schema import (
     OpenAIConfig as CommonsOpenAIConfig,
 )
+from reflexio.models.structured_output import find_schema_keyword
 from reflexio.server.llm.litellm_client import (
     LiteLLMClient,
     LiteLLMClientError,
     LiteLLMConfig,
     LLMHardTimeoutError,
     StructuredOutputParseError,
+    _CompletionErrorSnapshot,
     _get_embedding_encoding,
     _get_embedding_limit,
+    _litellm_completion_worker,
     _truncate_for_embedding,
     create_litellm_client,
 )
@@ -1026,6 +1031,33 @@ class TestMaybeParseStructuredOutput:
             )
 
 
+# Schema-keyword presence is checked via the shared structure-aware
+# ``find_schema_keyword`` (reflexio.models.structured_output) — single source of
+# truth for the name-map special-casing.
+
+
+# A minimal discriminated-union output schema, the shape behind PYTHON-FASTAPI-9J.
+# Pydantic emits `oneOf` + `discriminator` at properties.decisions.items, which
+# strict structured-output endpoints reject.
+class _UnifyDecision(BaseModel):
+    kind: Literal["unify"] = "unify"
+    new_id: str
+
+
+class _RejectDecision(BaseModel):
+    kind: Literal["reject"] = "reject"
+    existing_id: int
+
+
+_ConsolidationDecision = Annotated[
+    _UnifyDecision | _RejectDecision, Field(discriminator="kind")
+]
+
+
+class _DiscriminatedOutput(BaseModel):
+    decisions: list[_ConsolidationDecision] = Field(default_factory=list)
+
+
 class TestStrictStructuredOutputRequest:
     """Provider-facing structured output request format."""
 
@@ -1084,7 +1116,10 @@ class TestStrictStructuredOutputRequest:
         assert parse_structured is True
 
     def test_unsupported_model_keeps_pydantic_response_format(self):
-        client = _build_client(LiteLLMConfig(model="minimax/MiniMax-M2.7"))
+        # A provider that is neither natively response-schema-capable nor on the
+        # OpenAI-compatible allowlist keeps the raw Pydantic model so LiteLLM can
+        # apply its own provider-specific handling (e.g. tool-calling).
+        client = _build_client(LiteLLMConfig(model="ollama/llama3"))
 
         with patch.object(
             LiteLLMClient,
@@ -1098,6 +1133,106 @@ class TestStrictStructuredOutputRequest:
 
         assert params["response_format"] is SampleResponse
         assert parser_schema is SampleResponse
+
+    def test_openai_compatible_underreported_provider_uses_strict_schema(self):
+        # Regression for Sentry PYTHON-FASTAPI-9J: minimax reports
+        # supports_response_schema=False, but it is an OpenAI-compatible endpoint
+        # LiteLLM would still hand a self-built json_schema. We must send our own
+        # normalized strict schema instead of the raw Pydantic model.
+        client = _build_client(LiteLLMConfig(model="minimax/MiniMax-M3"))
+
+        with patch.object(
+            LiteLLMClient,
+            "_supports_response_schema",
+            return_value=False,
+        ):
+            params, parser_schema, parse_structured, _, _ = (
+                client._build_completion_params(
+                    [{"role": "user", "content": "test"}],
+                    response_format=SampleResponse,
+                )
+            )
+
+        provider_format = params["response_format"]
+        assert provider_format["type"] == "json_schema"
+        assert provider_format["json_schema"]["strict"] is True
+        assert parser_schema is SampleResponse
+        assert parse_structured is True
+
+    def test_discriminated_union_strips_oneof_for_underreported_provider(self):
+        # The exact shape behind PYTHON-FASTAPI-9J: a discriminated-union output
+        # whose Pydantic schema carries `oneOf`/`discriminator` at
+        # properties.<field>.items. On an under-reported OpenAI-compatible
+        # provider (minimax), the schema actually sent must contain neither
+        # (strict structured-output endpoints reject `oneOf`).
+
+        # Sanity: the raw Pydantic schema really does emit the rejected keyword.
+        raw_items = _DiscriminatedOutput.model_json_schema()["properties"]["decisions"][
+            "items"
+        ]
+        assert "oneOf" in raw_items
+
+        client = _build_client(LiteLLMConfig(model="minimax/MiniMax-M3"))
+        # ``_DiscriminatedOutput`` is intentionally a non-base double (emits oneOf)
+        # to exercise make_strict's prod backstop. The by-construction boundary
+        # guard would (correctly) raise on it under pytest, so patch it to a no-op
+        # here — this test asserts the make_strict fallback, not the guard.
+        with (
+            patch.object(
+                LiteLLMClient, "_supports_response_schema", return_value=False
+            ),
+            patch("reflexio.server.llm.litellm_client.assert_provider_safe_schema"),
+        ):
+            params, _, _, _, _ = client._build_completion_params(
+                [{"role": "user", "content": "test"}],
+                response_format=_DiscriminatedOutput,
+            )
+
+        provider_format = params["response_format"]
+        assert provider_format["type"] == "json_schema"
+        sent_schema = provider_format["json_schema"]["schema"]
+        assert not find_schema_keyword(sent_schema, "oneOf")
+        assert not find_schema_keyword(sent_schema, "discriminator")
+        # The variants are preserved as `anyOf` so generation stays constrained.
+        assert "anyOf" in sent_schema["properties"]["decisions"]["items"]
+
+    def test_real_minimax_gate_normalizes_without_mocking_predicate(self):
+        # The bug slipped because every strict-schema test PATCHED
+        # _supports_response_schema. This one does NOT — it exercises the real
+        # litellm capability lookup + allowlist for the actual default prod model
+        # (minimax). With the discriminated-union output, the response_format
+        # actually built must be a normalized dict with no oneOf/discriminator.
+        client = _build_client(LiteLLMConfig(model="minimax/MiniMax-M3"))
+        # Non-base double exercises the make_strict backstop; patch the
+        # by-construction guard (it would raise under pytest) — see the sibling
+        # test above for why.
+        with patch("reflexio.server.llm.litellm_client.assert_provider_safe_schema"):
+            params, _, _, _, _ = client._build_completion_params(
+                [{"role": "user", "content": "test"}],
+                response_format=_DiscriminatedOutput,
+            )
+        provider_format = params["response_format"]
+        assert isinstance(provider_format, dict), (
+            "minimax must receive a normalized strict schema, not the raw Pydantic "
+            "model (Sentry PYTHON-FASTAPI-9J)"
+        )
+        schema = provider_format["json_schema"]["schema"]
+        assert not find_schema_keyword(schema, "oneOf")
+        assert not find_schema_keyword(schema, "discriminator")
+
+    def test_finder_ignores_property_named_like_a_keyword(self):
+        # A field literally named `oneOf`/`discriminator` is a property NAME, not a
+        # schema keyword, and must not trip the strict-schema guard (the finder is
+        # context-aware — CodeRabbit false-positive fix).
+        class _TrickyNames(BaseModel):
+            oneOf: str = ""  # noqa: N815  (deliberately a keyword-like field name)
+            discriminator: int = 0
+
+        schema = make_strict_json_schema(_TrickyNames.model_json_schema())
+        assert "oneOf" in schema["properties"]
+        assert "discriminator" in schema["properties"]
+        assert not find_schema_keyword(schema, "oneOf")
+        assert not find_schema_keyword(schema, "discriminator")
 
     def test_strict_response_format_can_be_disabled_per_call(self):
         client = _build_client(LiteLLMConfig(model="gpt-4o-mini"))
@@ -1288,7 +1423,7 @@ class TestExtractJsonFromString:
         assert result == '{"answer": 42, "why": "{kept}"}'
 
     def test_json_array_ignores_stray_brackets_in_text(self, client):
-        content = "Candidates [not json] then [{\"answer\": 42}] trailing [x]"
+        content = 'Candidates [not json] then [{"answer": 42}] trailing [x]'
         result = client._extract_json_from_string(content)
         assert result == '[{"answer": 42}]'
 
@@ -1550,14 +1685,16 @@ class TestBuildCompletionParams:
         assert "top_p" not in call_kwargs
 
     @patch("reflexio.server.llm.litellm_client.litellm.completion")
-    def test_model_timeout_floor_raises_default(self, mock_completion):
-        """MiniMax-M3 has a 240s floor; the default 120s config is raised to it."""
+    def test_minimax_m3_floor_is_120(self, mock_completion):
+        """MiniMax-M3's floor was lowered from 240s to the 120s default
+        (Sentry PYTHON-FASTAPI-62) so a hung primary is abandoned sooner and the
+        fallback is reached faster."""
         mock_completion.return_value = _make_completion_response("ok")
         client = LiteLLMClient(LiteLLMConfig(model="minimax/MiniMax-M3"))
 
         client.generate_response("hi")
 
-        assert mock_completion.call_args.kwargs["timeout"] == 240
+        assert mock_completion.call_args.kwargs["timeout"] == 120
 
     @patch("reflexio.server.llm.litellm_client.litellm.completion")
     def test_model_timeout_floor_does_not_lower_higher_config(self, mock_completion):
@@ -1926,32 +2063,30 @@ class TestCreateLiteLLMClient:
 class TestMaxRetriesClamping:
     """max_retries clamping in _build_completion_params.
 
-    Retry orchestration itself is delegated to litellm; we only sanity-check
-    that the value forwarded into ``num_retries`` is at least 1 even when the
-    config holds a degenerate value.
+    The completion path now forces ``num_retries=0`` on litellm (the fallback
+    list, not same-model retry, is the resilience mechanism — see
+    PYTHON-FASTAPI-62), so the clamped value is no longer forwarded. We assert
+    the clamp on the value ``_build_completion_params`` returns, which the
+    per-call ``max_retries`` override API still validates.
     """
 
-    @patch("reflexio.server.llm.litellm_client.litellm.completion")
-    def test_max_retries_zero_treated_as_one(self, mock_completion):
-        """max_retries=0 should be clamped to at least 1."""
-        mock_completion.return_value = _make_completion_response("ok")
-        config = LiteLLMConfig(model="gpt-4o", max_retries=0)
-        client = LiteLLMClient(config)
+    def test_max_retries_zero_treated_as_one(self):
+        """max_retries=0 should be clamped to at least 1 in the returned value."""
+        client = LiteLLMClient(LiteLLMConfig(model="gpt-4o", max_retries=0))
 
-        result = client._make_request([{"role": "user", "content": "hi"}])
-        assert result == "ok"
-        assert mock_completion.call_args.kwargs["num_retries"] == 1
+        _, _, _, max_retries, _ = client._build_completion_params(
+            [{"role": "user", "content": "hi"}]
+        )
+        assert max_retries == 1
 
-    @patch("reflexio.server.llm.litellm_client.litellm.completion")
-    def test_negative_max_retries_treated_as_one(self, mock_completion):
+    def test_negative_max_retries_treated_as_one(self):
         """Negative max_retries should be clamped to at least 1."""
-        mock_completion.return_value = _make_completion_response("ok")
-        config = LiteLLMConfig(model="gpt-4o", max_retries=-1)
-        client = LiteLLMClient(config)
+        client = LiteLLMClient(LiteLLMConfig(model="gpt-4o", max_retries=-1))
 
-        result = client._make_request([{"role": "user", "content": "hi"}])
-        assert result == "ok"
-        assert mock_completion.call_args.kwargs["num_retries"] == 1
+        _, _, _, max_retries, _ = client._build_completion_params(
+            [{"role": "user", "content": "hi"}]
+        )
+        assert max_retries == 1
 
 
 class TestTokenUsageLoggingEdgeCases:
@@ -2134,7 +2269,11 @@ class TestLitellmIntegration:
     def _messages() -> list[dict[str, Any]]:
         return [{"role": "user", "content": "hi"}]
 
-    def test_passes_num_retries_from_config(self, monkeypatch):
+    def test_completion_forces_num_retries_zero(self, monkeypatch):
+        """The completion path disables litellm same-model retries regardless of
+        config: retrying a *hung* primary num_retries+1 times is what made the
+        fallback unreachable and produced the 490s in PYTHON-FASTAPI-62. The
+        fallback list is the resilience mechanism instead."""
         client = LiteLLMClient(LiteLLMConfig(model="x", max_retries=3))
         captured: dict[str, Any] = {}
 
@@ -2144,7 +2283,7 @@ class TestLitellmIntegration:
 
         monkeypatch.setattr("litellm.completion", _fake)
         client.generate_chat_response(self._messages())
-        assert captured.get("num_retries") == 3
+        assert captured.get("num_retries") == 0
 
     def test_passes_fallbacks_from_config(self, monkeypatch):
         # Config-explicit fallback (opt-in at construction)
@@ -2203,7 +2342,9 @@ class TestLitellmIntegration:
         client.generate_chat_response(
             self._messages(), max_retries=7, fallback_models=["gpt-5.4-mini"]
         )
-        assert captured.get("num_retries") == 7
+        # The per-call fallback override wins; num_retries is forced to 0 on the
+        # completion path regardless of the max_retries override.
+        assert captured.get("num_retries") == 0
         assert captured.get("fallbacks") == ["gpt-5.4-mini"]
 
     def test_fallback_self_reference_deduped(self, monkeypatch):
@@ -2250,36 +2391,47 @@ class TestLitellmIntegration:
         start = time.perf_counter()
         with pytest.raises(LiteLLMClientError, match="hard timeout"):
             client.generate_chat_response(self._messages())
-        # Two subprocess spawn/kill cycles (initial attempt + one hard-timeout
-        # retry) — still far below the 1s the blocked call would take.
+        # A single subprocess spawn/kill cycle (the blind same-model hard-timeout
+        # retry was removed) — still far below the 1s the blocked call would take.
         assert time.perf_counter() - start < 1.0
 
-    def test_hard_timeout_retried_once_then_succeeds(self, monkeypatch):
-        """A transient hard timeout is retried exactly once at the client level
-        (litellm's num_retries dies with the killed subprocess, so it can never
-        cover this case)."""
+    def test_worker_snapshots_litellm_api_connection_error(self, monkeypatch):
+        """LiteLLM exceptions can dump but fail to load across process queues."""
+
+        def _raise_connection_error(**_params):
+            raise APIConnectionError(
+                "connection failed",
+                llm_provider="openai",
+                model="gpt-5-mini",
+            )
+
+        monkeypatch.setattr("litellm.completion", _raise_connection_error)
+        process_context = multiprocessing.get_context()
+        result_queue = process_context.Queue(maxsize=1)
+
+        try:
+            _litellm_completion_worker({"model": "gpt-5-mini"}, result_queue)
+            status, payload = result_queue.get(timeout=1.0)
+        finally:
+            result_queue.close()
+            result_queue.join_thread()
+
+        assert status == "error"
+        assert isinstance(payload, _CompletionErrorSnapshot)
+        assert payload.type_name == "APIConnectionError"
+        assert "connection failed" in payload.message
+        assert payload.model == "gpt-5-mini"
+        assert payload.llm_provider == "openai"
+
+    def test_hard_timeout_not_retried_at_client_level(self, monkeypatch):
+        """A hard timeout is NOT retried at the client level. Same-model retry of
+        a hang is exactly what produced the 490s in PYTHON-FASTAPI-62; the
+        fallback ladder inside the litellm call is the resilience path instead.
+        The timeout surfaces as LiteLLMClientError after a single attempt."""
         client = LiteLLMClient(LiteLLMConfig(model="x"))
         attempts: list[int] = []
 
-        def _flaky(params):
-            attempts.append(1)
-            if len(attempts) == 1:
-                raise LLMHardTimeoutError("LLM request exceeded hard timeout")
-            return _make_completion_response("recovered")
-
-        monkeypatch.setattr(client, "_completion_with_hard_timeout", _flaky)
-
-        result = client.generate_chat_response(self._messages())
-
-        assert result == "recovered"
-        assert len(attempts) == 2
-
-    def test_hard_timeout_not_retried_more_than_once(self, monkeypatch):
-        """A second consecutive hard timeout propagates as LiteLLMClientError."""
-        client = LiteLLMClient(LiteLLMConfig(model="x"))
-        attempts: list[int] = []
-
-        def _always_timeout(params):
+        def _always_timeout(params, hard_timeout):
             attempts.append(1)
             raise LLMHardTimeoutError("LLM request exceeded hard timeout")
 
@@ -2287,7 +2439,90 @@ class TestLitellmIntegration:
 
         with pytest.raises(LiteLLMClientError, match="hard timeout"):
             client.generate_chat_response(self._messages())
-        assert len(attempts) == 2
+        assert len(attempts) == 1
+
+    def test_hard_timeout_sized_to_full_ladder(self, monkeypatch):
+        """The fix: the hard timeout passed to the subprocess covers the WHOLE
+        ladder (one slice per model), num_retries is 0, and the fallback list is
+        forwarded — together these make the fallback reachable on a hung primary.
+        """
+        monkeypatch.setenv("REFLEXIO_LLM_HARD_TIMEOUT_GRACE_SECONDS", "5")
+        client = LiteLLMClient(
+            LiteLLMConfig(model="minimax/MiniMax-M3", fallback_models=["gpt-5-mini"])
+        )
+        captured: dict[str, Any] = {}
+
+        def _capture(params, hard_timeout):
+            captured["hard_timeout"] = hard_timeout
+            captured["timeout"] = params.get("timeout")
+            captured["num_retries"] = params.get("num_retries")
+            captured["fallbacks"] = params.get("fallbacks")
+            return _make_completion_response("ok")
+
+        monkeypatch.setattr(client, "_completion_with_hard_timeout", _capture)
+        client.generate_chat_response(self._messages())
+
+        # MiniMax-M3 floor is 120s; litellm copies that timeout to each rung, so
+        # two rungs (primary + one fallback) → 2 * 120 + 5 grace.
+        assert captured["timeout"] == 120
+        assert captured["num_retries"] == 0
+        assert captured["fallbacks"] == ["gpt-5-mini"]
+        assert captured["hard_timeout"] == pytest.approx(2 * 120 + 5)
+
+    @pytest.mark.parametrize(
+        "fallback_models, expected_rungs",
+        [([], 1), (["a"], 2), (["a", "b"], 3)],
+    )
+    def test_hard_timeout_scales_with_rung_count(
+        self, monkeypatch, fallback_models, expected_rungs
+    ):
+        """hard_timeout == (1 + len(fallbacks)) * per_attempt + ONE grace.
+
+        Pinning n=0/1/2 catches the ``1 + len(...)`` off-by-one and that grace is
+        added once (not per rung) — at n=1 alone, several wrong formulas collapse
+        to the same number, so a single case proves nothing.
+        """
+        monkeypatch.setenv("REFLEXIO_LLM_HARD_TIMEOUT_GRACE_SECONDS", "5")
+        client = LiteLLMClient(
+            LiteLLMConfig(model="x", timeout=30, fallback_models=fallback_models)
+        )
+        captured: dict[str, Any] = {}
+
+        def _capture(params, hard_timeout):
+            captured["hard_timeout"] = hard_timeout
+            return _make_completion_response("ok")
+
+        monkeypatch.setattr(client, "_completion_with_hard_timeout", _capture)
+        client.generate_chat_response(self._messages())
+
+        assert captured["hard_timeout"] == pytest.approx(expected_rungs * 30 + 5)
+
+    def test_fallback_response_returned_when_primary_fails(self, monkeypatch):
+        """End-to-end: when the primary fails and a fallback is configured, the
+        fallback's response is what _make_request returns.
+
+        The fake stands in for litellm's native fallback dispatch (which our code
+        ENABLES by forwarding ``fallbacks`` and ``num_retries=0``): it serves the
+        fallback whenever the primary is invoked with a non-empty ``fallbacks``
+        list, and otherwise fails. If a regression dropped the ``fallbacks``
+        kwarg, the fake would raise instead and this test would fail — so it
+        guards the headline "fallback is reachable" behavior, not just plumbing
+        values.
+        """
+        client = LiteLLMClient(
+            LiteLLMConfig(model="minimax/MiniMax-M3", fallback_models=["gpt-5-mini"])
+        )
+
+        def _fake(**params):
+            if params["model"] == "minimax/MiniMax-M3" and params.get("fallbacks"):
+                return _make_completion_response("from-fallback")
+            raise APIConnectionError(
+                "primary down", llm_provider="minimax", model=params["model"]
+            )
+
+        monkeypatch.setattr("litellm.completion", _fake)
+        result = client.generate_chat_response(self._messages())
+        assert result == "from-fallback"
 
     def test_invalid_hard_timeout_grace_env_falls_back(self, monkeypatch, caplog):
         monkeypatch.setenv("REFLEXIO_LLM_HARD_TIMEOUT_GRACE_SECONDS", "not-a-float")

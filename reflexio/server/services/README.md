@@ -5,6 +5,19 @@ Description: Core business-logic layer — LLM orchestration, extraction, evalua
 
 **Service Boundary**: services own the LLM/extraction/evaluation/storage logic; API endpoints only authenticate, build `RequestContext`, and delegate into `Reflexio` or a focused service helper.
 
+## LLM Pipeline Module Contract
+
+LLM/pipeline modules use a shared vocabulary across OSS and enterprise:
+`service.py` for request-path entry points, `runner.py` for manual/background
+workflow entry points, `scheduler.py` for periodic/deferred execution,
+`config.py` for module-owned config, `models.py` for module-local data shapes,
+and `components/` for internal extractors, judges, proposers, aggregators,
+evaluators, gates, and resolvers.
+
+Files are optional. Do not create empty files only to satisfy the vocabulary.
+Complete cutover migrations update consumers, tests, docs, and monkeypatch
+strings before deleting old import paths in the same PR.
+
 ## Orchestration & Base Infrastructure
 
 | File | Purpose |
@@ -13,32 +26,34 @@ Description: Core business-logic layer — LLM orchestration, extraction, evalua
 | `base_generation_service.py` | `BaseGenerationService` — abstract base; the **Service Pattern** (load configs → create actors → run in parallel → save results). Per-extractor timeout `EXTRACTOR_TIMEOUT_SECONDS = 300`. |
 | `operation_state_utils.py` | `OperationStateManager` — all `_operation_state` access (progress, concurrency locks, extractor/aggregator bookmarks, cluster fingerprints, cancellation). |
 | `extractor_config_utils.py`, `extractor_interaction_utils.py` | Filter extractors by source / `allow_manual_trigger` / names; per-extractor stride + window + bookmark handling. |
-| `deduplication_utils.py`, `service_utils.py`, `embedding_text.py` | LLM dedup helpers (used by `ProfileDeduplicator` + `PlaybookConsolidator`), message construction / JSON extraction / response logging, embedding text builders. |
+| `deduplication_utils.py`, `service_utils.py`, `embedding_text.py` | LLM dedup helpers (used by `ProfileConsolidator` + `PlaybookConsolidator`), message construction / JSON extraction / response logging, embedding text builders. |
 
 ## Generation Services
 
 | Directory | Entry class | Key files |
 |-----------|-------------|-----------|
-| `profile/` | `ProfileGenerationService` | `profile_extractor.py`, `profile_deduplicator.py`, `profile_updater.py` |
-| `playbook/` | `PlaybookGenerationService` | `playbook_extractor.py`, `playbook_consolidator.py`, `playbook_aggregator.py` (cluster-fingerprint change detection) — has its own [README](playbook/README.md) |
-| `agent_success_evaluation/` | `AgentSuccessEvaluationService` | `agent_success_evaluator.py` (session-level), `delayed_group_evaluator.py` (`GroupEvaluationScheduler`, 10-min defer), `group_evaluation_runner.py`, `regen_jobs.py` |
-| `reflection/` | `ReflectionService` | `reflection_extractor.py` — post-horizon reflection; runs **before** extraction so extractors read post-reflection state |
+| `profile/` | `ProfileGenerationService` | `service.py`, `components/extractor.py`, `components/consolidator.py` |
+| `playbook/` | `PlaybookGenerationService` | `components/extractor.py`, `components/consolidator.py`, `components/aggregator.py` (cluster-fingerprint change detection) — has its own [README](playbook/README.md) |
+| `agent_success_evaluation/` | `AgentSuccessEvaluationService` | `service.py` (session-level service), `runner.py` (`run_group_evaluation`), `scheduler.py` (`GroupEvaluationScheduler`, 10-min defer), `regen_jobs.py`, `components/evaluator.py` |
+| `reflection/` | `ReflectionService` | `service.py`, `components/extractor.py` — post-horizon reflection; runs **before** extraction so extractors read post-reflection state |
 
 ## Async Extraction
 
 | Directory | Purpose |
 |-----------|---------|
-| `extraction/` | Resumable extraction agent: `resumable_agent.py`, `resume_scheduler.py`, `resume_worker.py`, `pending_tool_call_dispatch.py` (`ask_human`), `tools.py`, `plan.py`, `agent_run_records.py`, `invariants.py`. Long-horizon / tool-mediated extraction continues outside the request path. |
+| `extraction/` | Shared async extraction runtime: `resumable_agent.py`, `resume_scheduler.py`, `resume_worker.py`, `pending_tool_call_dispatch.py` (`ask_human`), `prior_answer_search.py`, `agent_run_records.py`, and `outcome.py`. Long-horizon / tool-mediated extraction continues outside the request path. See [README](extraction/README.md). |
 
 ## Evaluation, Search & Integrations
 
 | Path | Purpose |
 |------|---------|
-| `shadow_comparison/` | `ShadowComparisonJudge` — per-turn regular-vs-shadow verdicts written to a separate table (session-level shadow was retracted due to trajectory contamination). |
-| `evaluation_overview/` | Dashboard rollups: `service.py`, `hero_state.py`, `distribution.py`, `rule_attribution.py`, `shadow_aggregation.py`, `eval_sampler.py`. |
-| `playbook_optimizer/` | Scenario-based playbook optimization: `optimizer.py`, `scheduler.py`, `rollout.py`, `judge.py`, `scenario_resolver.py`, `gepa_adapter.py`, `assistant_webhook.py`. |
+| `shadow_comparison/` | `ShadowComparisonJudge` (`judge.py`) plus pure outcome helpers (`outcome.py`) - per-turn regular-vs-shadow verdicts written to a separate table. Compact by design; see [README](shadow_comparison/README.md). |
+| `evaluation_overview/` | Dashboard/read-side rollups: `service.py` entry point, `components/` aggregation helpers, and root `eval_sampler.py` shared with regenerate jobs. See [README](evaluation_overview/README.md). |
+| `playbook_optimizer/` | Scenario-based playbook optimization: mature flat package with `optimizer.py`, `scheduler.py`, `rollout.py`, `judge.py`, `models.py`, `scenario_resolver.py`, `gepa_adapter.py`, and `assistant_webhook.py`. See [README](playbook_optimizer/README.md). |
 | `braintrust/` | Braintrust export/sync: `service.py`, `client.py`, `_cron.py`, `_encryption.py`. |
-| `pre_retrieval/` | `QueryReformulator` (`_query_reformulator.py`) + `_document_expander.py` — query rewrite & doc expansion for recall. |
+| `lineage/` | Current-record resolution and tombstone GC: `resolve.py`, `gc_scheduler.py`. |
+| `pre_retrieval/` | `QueryReformulator` (`_query_reformulator.py`) + `DocumentExpander` (`_document_expander.py`) - query rewrite and doc expansion for recall. Compact by design; see [README](pre_retrieval/README.md). |
+| `tagging/` | `TaggingService` (`service.py`) + deferred `tagging_scheduler.py` - post-generation profile/playbook tagging. Compact by design; see [README](tagging/README.md). |
 | `unified_search_service.py` | `run_unified_search()` — two-phase parallel search across profiles / agent playbooks / user playbooks. |
 | `retrieval/` | `relevance_floor.py` — result relevance thresholding. |
 
@@ -46,7 +61,7 @@ Description: Core business-logic layer — LLM orchestration, extraction, evalua
 
 | Path | Purpose |
 |------|---------|
-| `storage/` | `storage_base/` (`BaseStorage` split by domain) + `sqlite_storage/` + `retention*.py`. Access via `request_context.storage` only. |
+| `storage/` | `storage_base/` (`BaseStorage` split by domain, including `_lineage.py`) + `sqlite_storage/` (including lineage/tombstones) + `retention*.py`. Access via `request_context.storage` only. |
 | `configurator/` | `DefaultConfigurator` — loads YAML config and creates the storage backend. |
 
 ## Key Rules

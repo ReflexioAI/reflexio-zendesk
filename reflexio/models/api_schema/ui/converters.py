@@ -78,6 +78,8 @@ def to_profile_view(profile: UserProfile) -> ProfileView:
         status=profile.status,
         extractor_names=profile.extractor_names,
         source_span=profile.source_span,
+        source_interaction_ids=profile.source_interaction_ids,
+        tags=profile.tags or [],
     )
 
 
@@ -104,6 +106,7 @@ def to_user_playbook_view(rf: UserPlaybook) -> UserPlaybookView:
         source=rf.source,
         source_interaction_ids=rf.source_interaction_ids,
         source_span=rf.source_span,
+        tags=rf.tags or [],
     )
 
 
@@ -127,6 +130,7 @@ def to_agent_playbook_view(fb: AgentPlaybook) -> AgentPlaybookView:
         playbook_status=fb.playbook_status,
         playbook_metadata=fb.playbook_metadata,
         status=fb.status,
+        tags=fb.tags or [],
     )
 
 
@@ -143,6 +147,7 @@ def to_evaluation_result_view(
     """
     return EvaluationResultView(
         result_id=result.result_id,
+        user_id=result.user_id,
         agent_version=result.agent_version,
         session_id=result.session_id,
         is_success=result.is_success,
@@ -173,5 +178,4 @@ def to_profile_change_log_view(log: ProfileChangeLog) -> ProfileChangeLogView:
         created_at=log.created_at,
         added_profiles=[to_profile_view(p) for p in log.added_profiles],
         removed_profiles=[to_profile_view(p) for p in log.removed_profiles],
-        mentioned_profiles=[to_profile_view(p) for p in log.mentioned_profiles],
     )

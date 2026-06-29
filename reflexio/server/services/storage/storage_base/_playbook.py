@@ -1,4 +1,6 @@
+import logging
 from abc import abstractmethod
+from collections.abc import Sequence
 
 from reflexio.models.api_schema.common import BlockingIssue
 from reflexio.models.api_schema.domain import (
@@ -13,11 +15,22 @@ from reflexio.models.api_schema.domain import (
     Status,
     UserPlaybook,
 )
+from reflexio.models.api_schema.domain.entities import LineageEvent
 from reflexio.models.api_schema.retriever_schema import (
     SearchAgentPlaybookRequest,
     SearchUserPlaybookRequest,
 )
 from reflexio.models.config_schema import SearchOptions
+from reflexio.server.tracing import capture_anomaly
+
+logger = logging.getLogger(__name__)
+
+_AGGREGATE_EVENT_EMIT_ATTEMPTS = 3
+
+# Shared prefix for aggregate lineage event reasons.
+# Consumers: storage_base (here), sqlite_storage/_playbook.py, and lib/_agent_playbook.py
+# (which imports this constant to keep the parser and producers in sync).
+AGGREGATE_REASON_PREFIX = "aggregate:"
 
 
 class PlaybookMixin:
@@ -42,6 +55,8 @@ class PlaybookMixin:
         start_time: int | None = None,
         end_time: int | None = None,
         include_embedding: bool = False,
+        tags: list[str] | None = None,
+        offset: int = 0,
     ) -> list[UserPlaybook]:
         """Get user playbooks from storage.
 
@@ -56,6 +71,8 @@ class PlaybookMixin:
             start_time (int, optional): Unix timestamp. Only return playbooks created at or after this time.
             end_time (int, optional): Unix timestamp. Only return playbooks created at or before this time.
             include_embedding (bool): If True, fetch and parse embedding vectors. Defaults to False.
+            tags (list[str], optional): Match playbooks having any of these tags.
+            offset (int): Number of matching rows to skip. Defaults to 0.
 
         Returns:
             list[UserPlaybook]: List of user playbook objects
@@ -166,11 +183,17 @@ class PlaybookMixin:
         raise NotImplementedError
 
     @abstractmethod
-    def delete_user_playbooks_by_ids(self, user_playbook_ids: list[int]) -> int:
+    def delete_user_playbooks_by_ids(
+        self, user_playbook_ids: list[int], *, emit_hard_delete: bool = True
+    ) -> int:
         """Delete user playbooks by their IDs.
 
         Args:
             user_playbook_ids: List of user_playbook_id values to delete
+            emit_hard_delete: When True (default), append a ``hard_delete``
+                lineage event per id (genuine erasure). Set False for rollback
+                cleanup of a never-live row (e.g. a lost supersede CAS), so no
+                spurious audit event is recorded.
 
         Returns:
             int: Number of user playbooks deleted
@@ -206,8 +229,19 @@ class PlaybookMixin:
         raise NotImplementedError
 
     @abstractmethod
-    def get_user_playbook_by_id(self, user_playbook_id: int) -> UserPlaybook | None:
-        """Fetch one user playbook by id, regardless of owner."""
+    def get_user_playbook_by_id(
+        self, user_playbook_id: int, *, include_tombstones: bool = False
+    ) -> UserPlaybook | None:
+        """Fetch one user playbook by primary key.
+
+        Args:
+            user_playbook_id: The user_playbook_id to look up.
+            include_tombstones: When False (default), MERGED/SUPERSEDED rows
+                return None. Set to True for lineage resolution (resolve_current).
+
+        Returns:
+            The UserPlaybook if found and not filtered, otherwise None.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -274,6 +308,77 @@ class PlaybookMixin:
         """
         raise NotImplementedError
 
+    def save_agent_playbook_with_aggregate_event(
+        self,
+        agent_playbook: AgentPlaybook,
+        *,
+        source_ids: list[str],
+        request_id: str,
+        run_mode: str,
+    ) -> AgentPlaybook:
+        """Persist an agent playbook AND its ``op=aggregate`` lineage event.
+
+        Backends SHOULD override this so the row insert and the event commit in ONE
+        transaction (the event is the sole record of the run->playbook membership for
+        reconstruction). This base default is a non-atomic save-then-emit fallback
+        with bounded retry + loud (level=error) on final failure.
+
+        Args:
+            agent_playbook (AgentPlaybook): The playbook to persist.
+            source_ids (list[str]): IDs of the source entities that produced this playbook.
+            request_id (str): The aggregation run ID (used as the lineage event request_id).
+            run_mode (str): The aggregation run mode (e.g. ``full_archive`` or ``incremental``).
+
+        Returns:
+            AgentPlaybook: The saved playbook with ``agent_playbook_id`` populated.
+
+        Raises:
+            ValueError: If ``request_id`` is empty (would produce an unreconstructable event).
+        """
+        if not request_id or not request_id.strip():
+            raise ValueError(
+                "save_agent_playbook_with_aggregate_event requires a non-empty request_id"
+            )
+        saved = self.save_agent_playbooks([agent_playbook])[0]
+        event = LineageEvent(
+            org_id=self.org_id,  # type: ignore[attr-defined]
+            entity_type="agent_playbook",
+            entity_id=str(saved.agent_playbook_id),
+            op="aggregate",
+            prov_relation="wasDerivedFrom",
+            source_ids=source_ids,
+            actor="aggregator",
+            request_id=request_id,
+            reason=f"{AGGREGATE_REASON_PREFIX}{run_mode}",
+        )
+        # The row is already committed; this default is non-atomic (SQLite overrides it to
+        # make the INSERT + event one transaction). The event is the sole reconstruction signal
+        # for the run, so make the emit durable: bounded retry (idempotent on retrying the
+        # same row's emit — entity_id is a fresh autoincrement per run, so this is NOT
+        # cross-run idempotency), and on final failure fail LOUD at level=error so the gap
+        # is paged + backfillable rather than silently lost. Never raise — the playbook
+        # itself is saved and must not be lost.
+        for attempt in range(_AGGREGATE_EVENT_EMIT_ATTEMPTS):
+            try:
+                self.append_lineage_event(event)  # type: ignore[attr-defined]
+                return saved
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "aggregate lineage event append failed (attempt %d/%d) for agent_playbook %s",
+                    attempt + 1,
+                    _AGGREGATE_EVENT_EMIT_ATTEMPTS,
+                    saved.agent_playbook_id,
+                    exc_info=True,
+                )
+        capture_anomaly(
+            "lineage.aggregate.append_failed",
+            level="error",
+            entity_id=str(saved.agent_playbook_id),
+            org_id=self.org_id,  # type: ignore[attr-defined]
+            request_id=request_id,
+        )
+        return saved
+
     @abstractmethod
     def get_agent_playbooks(
         self,
@@ -282,6 +387,7 @@ class PlaybookMixin:
         agent_version: str | None = None,
         status_filter: list[Status | None] | None = None,
         playbook_status_filter: list[PlaybookStatus] | None = None,
+        tags: list[str] | None = None,
     ) -> list[AgentPlaybook]:
         """Get agent playbooks from storage.
 
@@ -292,6 +398,7 @@ class PlaybookMixin:
             status_filter (list[Optional[Status]], optional): List of Status values to filter by. None in the list means CURRENT status.
             playbook_status_filter (Optional[list[PlaybookStatus]]): List of PlaybookStatus values to filter by.
                 If None, returns all playbook statuses.
+            tags (list[str], optional): Match playbooks having any of these tags.
 
         Returns:
             list[AgentPlaybook]: List of agent playbook objects
@@ -299,8 +406,19 @@ class PlaybookMixin:
         raise NotImplementedError
 
     @abstractmethod
-    def get_agent_playbook_by_id(self, agent_playbook_id: int) -> AgentPlaybook | None:
-        """Fetch one agent playbook by id."""
+    def get_agent_playbook_by_id(
+        self, agent_playbook_id: int, *, include_tombstones: bool = False
+    ) -> AgentPlaybook | None:
+        """Fetch one agent playbook by primary key.
+
+        Args:
+            agent_playbook_id: The agent_playbook_id to look up.
+            include_tombstones: When False (default), MERGED/SUPERSEDED rows
+                return None. Set to True for lineage resolution (resolve_current).
+
+        Returns:
+            The AgentPlaybook if found and not filtered, otherwise None.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -354,6 +472,7 @@ class PlaybookMixin:
         rationale: str | None = None,
         blocking_issue: BlockingIssue | None = None,
         playbook_status: PlaybookStatus | None = None,
+        tags: list[str] | None = None,
     ) -> None:
         """Update editable fields of an agent playbook. Only non-None fields are updated.
 
@@ -365,6 +484,7 @@ class PlaybookMixin:
             rationale (str, optional): New rationale text
             blocking_issue (BlockingIssue, optional): New blocking issue
             playbook_status (PlaybookStatus, optional): New playbook status
+            tags (list[str], optional): Replacement tags
 
         Raises:
             ValueError: If agent playbook with the given ID is not found
@@ -380,6 +500,7 @@ class PlaybookMixin:
         trigger: str | None = None,
         rationale: str | None = None,
         blocking_issue: BlockingIssue | None = None,
+        tags: list[str] | None = None,
     ) -> None:
         """Update editable fields of a user playbook. Only non-None fields are updated.
 
@@ -390,9 +511,31 @@ class PlaybookMixin:
             trigger (str, optional): New trigger text
             rationale (str, optional): New rationale text
             blocking_issue (BlockingIssue, optional): New blocking issue
+            tags (list[str], optional): Replacement tags
 
         Raises:
             ValueError: If user playbook with the given ID is not found
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def supersede_user_playbooks_by_ids(
+        self, user_playbook_ids: list[int], request_id: str
+    ) -> int:
+        """Soft-delete user playbooks by setting status to SUPERSEDED.
+
+        Eligible rows (CURRENT, PENDING, or ARCHIVED; not already MERGED /
+        SUPERSEDED) are transitioned to SUPERSEDED and emit one status_change
+        lineage event under the shared request id. This is the user-playbook
+        analogue of the existing agent/profile soft-supersede helpers and
+        preserves dead-source content for point-in-time attribution reads.
+
+        Args:
+            user_playbook_ids (list[int]): User playbook ids to supersede.
+            request_id (str): Shared request id for all emitted lineage events.
+
+        Returns:
+            int: Number of user playbooks actually updated.
         """
         raise NotImplementedError
 
@@ -416,6 +559,47 @@ class PlaybookMixin:
 
         Args:
             agent_playbook_ids (list[int]): List of agent playbook IDs to archive
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def supersede_agent_playbooks_by_ids(
+        self, agent_playbook_ids: list[int], request_id: str
+    ) -> int:
+        """Soft-delete agent playbooks by setting status to SUPERSEDED, emitting set-based lineage.
+
+        For each eligible id (not APPROVED, not already tombstoned), updates status to
+        SUPERSEDED and emits one status_change event under the shared request_id.
+        Atomic: mutation and event in one commit, guarded on rowcount.
+        FTS/vec rows are NOT removed.
+
+        Args:
+            agent_playbook_ids (list[int]): Agent playbook ids to supersede.
+            request_id (str): Shared request id for all emitted lineage events.
+
+        Returns:
+            int: Number of agent playbooks actually updated.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def supersede_agent_playbooks_by_playbook_name(
+        self, playbook_name: str, agent_version: str | None, request_id: str
+    ) -> int:
+        """Soft-delete archived agent playbooks by name/version via SUPERSEDED status.
+
+        Selects rows with playbook_name matching and status='archived', then
+        soft-supersedes each one with a status_change lineage event under request_id.
+        Atomic: one commit at the end.
+        FTS/vec rows are NOT removed.
+
+        Args:
+            playbook_name (str): Playbook name to supersede.
+            agent_version (str | None): Agent version filter. None matches all versions.
+            request_id (str): Shared request id for all emitted lineage events.
+
+        Returns:
+            int: Number of agent playbooks actually updated.
         """
         raise NotImplementedError
 
@@ -459,6 +643,13 @@ class PlaybookMixin:
         self, agent_playbook_id: int
     ) -> list[int]:
         """Return source user playbook ids for an agent playbook."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_source_user_playbook_ids_for_agent_playbooks(
+        self, agent_playbook_ids: Sequence[int]
+    ) -> dict[int, list[int]]:
+        """Return source user playbook ids keyed by agent playbook id."""
         raise NotImplementedError
 
     @abstractmethod
@@ -557,12 +748,18 @@ class PlaybookMixin:
         raise NotImplementedError
 
     @abstractmethod
-    def delete_agent_playbooks_by_ids(self, agent_playbook_ids: list[int]) -> None:
+    def delete_agent_playbooks_by_ids(
+        self, agent_playbook_ids: list[int], *, emit_hard_delete: bool = True
+    ) -> None:
         """Permanently delete agent playbooks by their IDs.
         No-op if agent_playbook_ids is empty.
 
         Args:
             agent_playbook_ids (list[int]): List of agent playbook IDs to delete
+            emit_hard_delete: When True (default), append a ``hard_delete``
+                lineage event per id (genuine erasure). Set False for rollback
+                cleanup of a never-live row (e.g. a lost supersede CAS), so no
+                spurious audit event is recorded.
         """
         raise NotImplementedError
 
@@ -634,6 +831,45 @@ class PlaybookMixin:
         """
         raise NotImplementedError
 
+    def get_agent_success_evaluation_results_in_window(
+        self,
+        from_ts: int,
+        to_ts: int,
+        agent_version: str | None = None,
+        limit: int | None = None,
+    ) -> list[AgentSuccessEvaluationResult]:
+        """Return eval results in ``[from_ts, to_ts]``.
+
+        Default implementation filters the existing latest-results method.
+        SQL backends should override so callers do not depend on an arbitrary
+        latest-row cap.
+        """
+        rows = self.get_agent_success_evaluation_results(
+            limit=limit or 10_000,
+            agent_version=agent_version,
+        )
+        return [r for r in rows if from_ts <= r.created_at <= to_ts]
+
+    def get_agent_success_evaluation_result_ids(
+        self,
+        user_id: str,
+        session_id: str,
+        evaluation_name: str,
+        agent_version: str,
+    ) -> list[int]:
+        """Return result ids for one eval identity tuple."""
+        rows = self.get_agent_success_evaluation_results(
+            limit=10_000,
+            agent_version=agent_version,
+        )
+        return [
+            r.result_id
+            for r in rows
+            if r.user_id == user_id
+            and r.session_id == session_id
+            and r.evaluation_name == evaluation_name
+        ]
+
     @abstractmethod
     def delete_all_agent_success_evaluation_results(self) -> None:
         """Delete all agent success evaluation results from storage."""
@@ -642,13 +878,15 @@ class PlaybookMixin:
     @abstractmethod
     def delete_agent_success_evaluation_results_for_session(
         self,
+        user_id: str,
         session_id: str,
         evaluation_name: str,
         agent_version: str,
     ) -> int:
-        """Delete stored results for (session_id, evaluation_name, agent_version).
+        """Delete stored results for (user_id, session_id, evaluation_name, agent_version).
 
         Args:
+            user_id (str): User whose session results to clear.
             session_id (str): Session whose results to clear.
             evaluation_name (str): Which evaluator's results to clear.
             agent_version (str): Agent version scope.

@@ -73,12 +73,12 @@ def _rows(response: Any) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], response.data)
 
 
-_PROFILE_COLUMNS = "profile_id, user_id, content, last_modified_timestamp, generated_from_request_id, profile_time_to_live, expiration_timestamp, custom_features, created_at, source, status, extractor_names, source_span, notes, reader_angle"
+_PROFILE_COLUMNS = "profile_id, user_id, content, last_modified_timestamp, generated_from_request_id, profile_time_to_live, expiration_timestamp, custom_features, created_at, source, status, extractor_names, expanded_terms, tags, source_interaction_ids, source_span, notes, reader_angle, merged_into, superseded_by"
 _INTERACTION_COLUMNS = "interaction_id, user_id, content, request_id, created_at, role, user_action, user_action_description, interacted_image_url, shadow_content, expert_content, tools_used, citations"
 _REQUEST_COLUMNS = "request_id, user_id, created_at, source, agent_version, session_id"
-_USER_PLAYBOOK_COLUMNS = 'user_playbook_id, user_id, playbook_name, created_at, request_id, agent_version, content, "trigger", rationale, blocking_issue, status, source, source_interaction_ids, source_span, notes, reader_angle'
+_USER_PLAYBOOK_COLUMNS = 'user_playbook_id, user_id, playbook_name, created_at, request_id, agent_version, content, "trigger", rationale, blocking_issue, status, source, source_interaction_ids, expanded_terms, tags, source_span, notes, reader_angle, merged_into, superseded_by'
 _USER_PLAYBOOK_COLUMNS_WITH_EMBEDDING = _USER_PLAYBOOK_COLUMNS + ", embedding"
-_AGENT_PLAYBOOK_COLUMNS = 'agent_playbook_id, playbook_name, created_at, agent_version, content, "trigger", rationale, blocking_issue, playbook_status, playbook_metadata, status'
+_AGENT_PLAYBOOK_COLUMNS = 'agent_playbook_id, playbook_name, created_at, agent_version, content, "trigger", rationale, blocking_issue, playbook_status, playbook_metadata, expanded_terms, tags, status, merged_into, superseded_by'
 _EVAL_RESULT_COLUMNS = "result_id, session_id, agent_version, evaluation_name, is_success, failure_type, failure_reason, created_at, regular_vs_shadow, number_of_correction_per_session, user_turns_to_resolution, is_escalated"
 _OPERATION_STATE_COLUMNS = "service_name, operation_state, updated_at"
 

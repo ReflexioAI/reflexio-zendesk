@@ -45,9 +45,13 @@ def response_to_user_profile(item: Mapping[str, Any]) -> UserProfile:
         status=Status(item["status"]) if item.get("status") else None,
         extractor_names=item.get("extractor_names"),
         expanded_terms=item.get("expanded_terms"),
+        tags=item.get("tags"),
+        source_interaction_ids=item.get("source_interaction_ids") or [],
         source_span=item.get("source_span"),
         notes=item.get("notes"),
         reader_angle=item.get("reader_angle"),
+        merged_into=item.get("merged_into"),
+        superseded_by=item.get("superseded_by"),
     )
 
 
@@ -75,9 +79,13 @@ def user_profile_to_data(profile: UserProfile) -> dict[str, Any]:
         "status": profile.status.value if profile.status else None,
         "extractor_names": profile.extractor_names,
         "expanded_terms": profile.expanded_terms,
+        "tags": profile.tags,
+        "source_interaction_ids": profile.source_interaction_ids,
         "source_span": profile.source_span,
         "notes": profile.notes,
         "reader_angle": profile.reader_angle,
+        "merged_into": profile.merged_into,
+        "superseded_by": profile.superseded_by,
     }
 
 
@@ -202,9 +210,6 @@ def response_to_profile_change_log(item: Mapping[str, Any]) -> ProfileChangeLog:
         removed_profiles=[
             UserProfile(**profile) for profile in item["removed_profiles"]
         ],
-        mentioned_profiles=[
-            UserProfile(**profile) for profile in item["mentioned_profiles"]
-        ],
     )
 
 
@@ -228,9 +233,6 @@ def profile_change_log_to_data(profile_change_log: ProfileChangeLog) -> dict[str
         ],
         "removed_profiles": [
             profile.model_dump() for profile in profile_change_log.removed_profiles
-        ],
-        "mentioned_profiles": [
-            profile.model_dump() for profile in profile_change_log.mentioned_profiles
         ],
     }
 

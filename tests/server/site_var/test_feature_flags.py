@@ -5,6 +5,7 @@ from reflexio.server.site_var.feature_flags import (
     get_all_feature_flags,
     is_deduplicator_enabled,
     is_feature_enabled,
+    is_lineage_dual_read_diff_enabled,
     is_resumable_extraction_agent_enabled,
 )
 
@@ -168,6 +169,129 @@ class TestFeatureFlags(unittest.TestCase):
     def test_is_resumable_extraction_agent_disabled_for_other_orgs(self, _mock):
         """resumable extraction agent defaults to classic extraction for other orgs."""
         self.assertFalse(is_resumable_extraction_agent_enabled("org-123"))
+
+
+class TestIsFeatureFlagsNullOrgIds(unittest.TestCase):
+    """Null-safety tests for is_feature_enabled with null enabled_org_ids."""
+
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value={
+            "some_feature": {"enabled": False, "enabled_org_ids": None},
+        },
+    )
+    def test_explicit_null_enabled_org_ids_returns_false(self, _mock):
+        """Explicit null enabled_org_ids must not raise TypeError in is_feature_enabled.
+
+        When ``enabled_org_ids`` is explicitly null (None) in config, the
+        membership check must treat it as an empty list and return False,
+        not raise TypeError.
+        """
+        self.assertFalse(is_feature_enabled("org-any", "some_feature"))
+
+
+class TestLineageDualReadDiffFlag(unittest.TestCase):
+    """Tests for is_lineage_dual_read_diff_enabled — a DEFAULT-CLOSED flag.
+
+    The key is absent from config → False (fail-CLOSED). The flag must never
+    activate on unconfigured deployments. Explicit enable via enabled=True or
+    per-org enabled_org_ids still works. Malformed config (non-dict) → False
+    with a warning (safe fallback). Strict-bool identity guards prevent truthy
+    strings and non-bool ints from enabling the flag.
+    """
+
+    # Default-closed: the critical case — key absent → OFF
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value={},
+    )
+    def test_absent_key_returns_false(self, _mock):
+        """DEFAULT-CLOSED: key absent from config → False (dual-read diff off by default)."""
+        self.assertFalse(is_lineage_dual_read_diff_enabled("org-any"))
+
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value=MOCK_CONFIG,  # MOCK_CONFIG has no lineage_dual_read_diff key
+    )
+    def test_key_missing_from_populated_config_returns_false(self, _mock):
+        """DEFAULT-CLOSED: key missing from a non-empty config still returns False."""
+        self.assertFalse(is_lineage_dual_read_diff_enabled("org-123"))
+
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value={
+            "lineage_dual_read_diff": {"enabled": True, "enabled_org_ids": []},
+        },
+    )
+    def test_globally_enabled_returns_true(self, _mock):
+        """Globally enabled (enabled=True) → True for any org."""
+        self.assertTrue(is_lineage_dual_read_diff_enabled("org-any"))
+
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value={
+            "lineage_dual_read_diff": {
+                "enabled": False,
+                "enabled_org_ids": ["org-pilot"],
+            },
+        },
+    )
+    def test_org_in_enabled_list_returns_true(self, _mock):
+        """Org in enabled_org_ids → True even when global enabled=False."""
+        self.assertTrue(is_lineage_dual_read_diff_enabled("org-pilot"))
+
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value={
+            "lineage_dual_read_diff": {
+                "enabled": False,
+                "enabled_org_ids": ["org-pilot"],
+            },
+        },
+    )
+    def test_org_not_in_enabled_list_returns_false(self, _mock):
+        """Org NOT in enabled_org_ids with global disabled → False."""
+        self.assertFalse(is_lineage_dual_read_diff_enabled("org-other"))
+
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value={"lineage_dual_read_diff": "yes"},
+    )
+    def test_malformed_scalar_value_returns_false(self, _mock):
+        """Non-dict config value (scalar) → False, no AttributeError."""
+        self.assertFalse(is_lineage_dual_read_diff_enabled("org-any"))
+
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value={
+            "lineage_dual_read_diff": {"enabled": "true", "enabled_org_ids": []}
+        },
+    )
+    def test_string_true_enabled_returns_false(self, _mock):
+        """enabled='true' (string) is not bool True — strict identity must reject it."""
+        self.assertFalse(is_lineage_dual_read_diff_enabled("org-any"))
+
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value={"lineage_dual_read_diff": {"enabled": 1, "enabled_org_ids": []}},
+    )
+    def test_int_one_enabled_returns_false(self, _mock):
+        """enabled=1 (int) is not bool True — strict identity must reject it."""
+        self.assertFalse(is_lineage_dual_read_diff_enabled("org-any"))
+
+    @patch(
+        "reflexio.server.site_var.feature_flags._get_feature_flags_config",
+        return_value={
+            "lineage_dual_read_diff": {
+                "enabled": False,
+                "enabled_org_ids": "org-pilot",
+            }
+        },
+    )
+    def test_string_org_ids_returns_false(self, _mock):
+        """enabled_org_ids='org-pilot' (string) must not match via substring in (#195)."""
+        self.assertFalse(is_lineage_dual_read_diff_enabled("org-pilot"))
+        self.assertFalse(is_lineage_dual_read_diff_enabled("pilot"))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel
@@ -14,6 +16,7 @@ from reflexio.models.api_schema.domain import (
     PlaybookStatus,
     UserPlaybook,
 )
+from reflexio.models.api_schema.domain.entities import LineageContext
 from reflexio.models.config_schema import PlaybookOptimizerConfig
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient
@@ -27,6 +30,22 @@ from .rollout import MultiTurnRollout
 from .scenario_resolver import ScenarioResolver
 
 logger = logging.getLogger(__name__)
+
+# Prefix used when constructing the run-scoped lineage request_id from a job id.
+# Shared with tests so the format is defined in one place.
+_OPTIMIZER_RUN_ID_PREFIX = "optjob_"
+
+
+def optimizer_run_request_id(job_id: int) -> str:
+    """Return the lineage request_id for a playbook optimizer run.
+
+    Args:
+        job_id (int): The ``PlaybookOptimizationJob.job_id`` for this run.
+
+    Returns:
+        str: A non-empty, job-scoped request id of the form ``optjob_<job_id>``.
+    """
+    return f"{_OPTIMIZER_RUN_ID_PREFIX}{job_id}"
 
 
 class PlaybookOptimizationTarget(BaseModel):
@@ -126,6 +145,7 @@ class PlaybookOptimizer:
                 metadata_json=json.dumps(split_metadata, ensure_ascii=False),
             )
         )
+        run_request_id = optimizer_run_request_id(job.job_id)
         logger.info(
             "event=playbook_optimization_start job_id=%d candidate_id=none "
             "target_kind=%s target_id=%d "
@@ -248,7 +268,9 @@ class PlaybookOptimizer:
             )
             return "completed"
 
-        successor_id = self._commit_if_allowed(target, incumbent, best_content, config)
+        successor_id = self._commit_if_allowed(
+            target, incumbent, best_content, config, run_request_id
+        )
         logger.info(
             "event=playbook_optimization_committed job_id=%d candidate_id=%d "
             "successor_target_id=%s best_score=%.3f",
@@ -331,6 +353,13 @@ class PlaybookOptimizer:
                 backoff_base_s=config.webhook_backoff_base_seconds,
             )
         if config.assistant_script_path:
+            if not _is_executable_file(config.assistant_script_path):
+                logger.warning(
+                    "Skipping playbook optimization: assistant_script_path is not "
+                    "an executable file path=%s",
+                    config.assistant_script_path,
+                )
+                return None
             return LocalScriptAssistant(
                 script_path=config.assistant_script_path,
                 script_args=config.assistant_script_args,
@@ -415,6 +444,7 @@ class PlaybookOptimizer:
         incumbent: AgentPlaybook,
         best_content: str,
         config: PlaybookOptimizerConfig,
+        run_request_id: str,
     ) -> int | None:
         # The optimize() entrypoint already gates on _can_adopt_winner before
         # creating the job, but check again so this stays correct if called
@@ -432,49 +462,39 @@ class PlaybookOptimizer:
                 or current.playbook_status != PlaybookStatus.PENDING
             ):
                 return None
-            self.storage.archive_agent_playbooks_by_ids([target.target_id])
-            successor = incumbent.model_copy(
-                update={
-                    "agent_playbook_id": 0,
-                    "content": best_content,
-                    "status": None,
-                    "playbook_status": PlaybookStatus.PENDING,
-                    "playbook_metadata": _append_optimizer_metadata(
-                        incumbent.playbook_metadata, target.target_id
-                    ),
-                }
+            metadata = _append_optimizer_metadata(
+                incumbent.playbook_metadata, target.target_id
             )
-            saved = self.storage.save_agent_playbooks([successor])
-            if saved and saved[0].agent_playbook_id:
+            successor_id = _supersede_agent_playbook(
+                self.storage,
+                incumbent,
+                best_content,
+                "playbook_optimizer",
+                playbook_metadata=metadata,
+                request_id=run_request_id,
+            )
+            if successor_id is not None:
                 self.storage.set_source_windows_for_agent_playbook(
-                    saved[0].agent_playbook_id, source_windows
+                    successor_id, source_windows
                 )
-                return saved[0].agent_playbook_id
-            return None
+            return successor_id
         current_user = self.storage.get_user_playbook_by_id(target.target_id)
         if current_user is None or current_user.status is not None:
             return None
         if current_user.user_id is None:
-            return None
-        archived = self.storage.archive_user_playbook_by_id(
-            current_user.user_id, current_user.user_playbook_id
-        )
-        if not archived:
             return None
         # The optimizer can legitimately flip framing (positive guidance ->
         # negative anti-pattern or vice versa). Orientation lives entirely in
         # the rule wording, so writing ``best_content`` is sufficient — there
         # is no derived polarity label or separate polarity field to keep in
         # sync.
-        successor_user = current_user.model_copy(
-            update={
-                "user_playbook_id": 0,
-                "content": best_content,
-                "status": None,
-            }
+        return _supersede_user_playbook(
+            self.storage,
+            current_user,
+            best_content,
+            "playbook_optimizer",
+            request_id=run_request_id,
         )
-        self.storage.save_user_playbooks([successor_user])
-        return successor_user.user_playbook_id or None
 
 
 def _agent_like_playbook(playbook: UserPlaybook) -> AgentPlaybook:
@@ -504,6 +524,129 @@ def _append_optimizer_metadata(existing: str, predecessor_id: int) -> str:
     if not existing:
         return suffix
     return f"{existing}; {suffix}"
+
+
+def _supersede_user_playbook(
+    storage: Any,
+    incumbent: UserPlaybook,
+    best_content: str,
+    source: str,
+    *,
+    request_id: str,
+) -> int | None:
+    """Insert a user-playbook successor then atomically supersede the incumbent.
+
+    Returns the new ``user_playbook_id`` on success, or ``None`` when the
+    incumbent is no longer CURRENT (lost race / already superseded).
+
+    Args:
+        storage: A storage instance implementing ``save_user_playbooks``,
+            ``supersede_record``, and ``delete_user_playbooks_by_ids``.
+        incumbent: The current user playbook to replace.
+        best_content: Content for the successor playbook.
+        source: Provenance label written to the lineage event actor field.
+        request_id: Run-scoped correlation id for the lineage event. Must be
+            non-empty; use the job-derived id from the calling optimizer run.
+
+    Returns:
+        int | None: ``user_playbook_id`` of the successor, or ``None`` if the
+            incumbent was not CURRENT.
+
+    Raises:
+        ValueError: If ``request_id`` is empty or None.
+    """
+    if not request_id:
+        raise ValueError(
+            "_supersede_user_playbook: request_id must be non-empty (run-correlation id)"
+        )
+    successor = incumbent.model_copy(
+        update={"user_playbook_id": 0, "content": best_content, "status": None}
+    )
+    storage.save_user_playbooks([successor])
+    ctx = LineageContext(
+        op_kind="revise",
+        actor=source,
+        request_id=request_id,
+    )
+    ok = storage.supersede_record(
+        entity_type="user_playbook",
+        incumbent_id=str(incumbent.user_playbook_id),
+        successor_id=str(successor.user_playbook_id),
+        context=ctx,
+    )
+    if not ok:
+        # Lost CAS: remove the never-live successor without auditing it as erasure.
+        storage.delete_user_playbooks_by_ids(
+            [successor.user_playbook_id], emit_hard_delete=False
+        )
+        return None
+    return successor.user_playbook_id
+
+
+def _supersede_agent_playbook(
+    storage: Any,
+    incumbent: AgentPlaybook,
+    best_content: str,
+    source: str,
+    playbook_metadata: str = "",
+    *,
+    request_id: str,
+) -> int | None:
+    """Insert an agent-playbook successor then atomically supersede the incumbent.
+
+    Returns the new ``agent_playbook_id`` on success, or ``None`` when the
+    incumbent is no longer CURRENT.
+
+    Args:
+        storage: A storage instance implementing ``save_agent_playbooks``,
+            ``supersede_record``, and ``delete_agent_playbooks_by_ids``.
+        incumbent: The current agent playbook to replace.
+        best_content: Content for the successor playbook.
+        source: Provenance label written to the lineage event actor field.
+        playbook_metadata: Optional metadata string for the successor row.
+        request_id: Run-scoped correlation id for the lineage event. Must be
+            non-empty; use the job-derived id from the calling optimizer run.
+
+    Returns:
+        int | None: ``agent_playbook_id`` of the successor, or ``None`` if the
+            incumbent was not CURRENT.
+
+    Raises:
+        ValueError: If ``request_id`` is empty or None.
+    """
+    if not request_id:
+        raise ValueError(
+            "_supersede_agent_playbook: request_id must be non-empty (run-correlation id)"
+        )
+    successor = incumbent.model_copy(
+        update={
+            "agent_playbook_id": 0,
+            "content": best_content,
+            "status": None,
+            "playbook_status": PlaybookStatus.PENDING,
+            "playbook_metadata": playbook_metadata,
+        }
+    )
+    saved = storage.save_agent_playbooks([successor])
+    if not saved or not saved[0].agent_playbook_id:
+        return None
+    successor_id = saved[0].agent_playbook_id
+    ctx = LineageContext(
+        op_kind="revise",
+        actor=source,
+        request_id=request_id,
+    )
+    ok = storage.supersede_record(
+        entity_type="agent_playbook",
+        incumbent_id=str(incumbent.agent_playbook_id),
+        successor_id=str(successor_id),
+        context=ctx,
+    )
+    if not ok:
+        # Lost CAS: remove the never-live successor without auditing it as erasure.
+        storage.delete_agent_playbooks_by_ids([successor_id], emit_hard_delete=False)
+        return None
+    return successor_id
 
 
 class _GEPAStorageCallback:
@@ -625,6 +768,11 @@ def _split_metadata(
             window.user_playbook_id for window in validation_windows
         ],
     }
+
+
+def _is_executable_file(path: str) -> bool:
+    candidate = Path(path)
+    return candidate.is_file() and os.access(candidate, os.X_OK)
 
 
 def _result_metadata(result: Any, split_metadata: dict[str, Any]) -> dict[str, Any]:

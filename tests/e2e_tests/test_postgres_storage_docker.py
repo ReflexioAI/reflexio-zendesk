@@ -19,8 +19,12 @@ from psycopg2 import sql
 
 from reflexio.models.api_schema.service_schemas import (
     NEVER_EXPIRES_TIMESTAMP,
+    LineageContext,
+    PlaybookRetrievalLog,
+    PlaybookRetrievalLogItem,
     ProfileTimeToLive,
     Request,
+    UserPlaybook,
     UserProfile,
 )
 from reflexio.models.config_schema import StorageConfigPostgres
@@ -221,3 +225,80 @@ def test_postgres_pending_tool_call_round_trip(
     assert claimed.id == run_id
     assert claimed.status == AgentRunStatus.RESUMING
     assert postgres_storage.consume_run_tool_dependencies(run_id) == 1
+
+
+@skip_in_precommit
+def test_postgres_lineage_and_retrieval_log_round_trip(
+    postgres_storage: PostgresStorage,
+) -> None:
+    run_id = uuid.uuid4().hex[:8]
+    request_id = f"pg-lineage-request-{run_id}"
+    user_id = f"pg-lineage-user-{run_id}"
+
+    first = UserPlaybook(
+        user_id=user_id,
+        request_id=request_id,
+        agent_version="codex",
+        playbook_name="postgres-lineage",
+        content="Old Postgres storage retrieval guidance.",
+    )
+    successor = UserPlaybook(
+        user_id=user_id,
+        request_id=request_id,
+        agent_version="codex",
+        playbook_name="postgres-lineage",
+        content="New Postgres storage retrieval guidance.",
+    )
+    postgres_storage.save_user_playbooks([first, successor])
+
+    assert first.user_playbook_id
+    assert successor.user_playbook_id
+    assert postgres_storage.supersede_record(
+        entity_type="user_playbook",
+        incumbent_id=str(first.user_playbook_id),
+        successor_id=str(successor.user_playbook_id),
+        context=LineageContext(
+            op_kind="revise",
+            actor="postgres-e2e",
+            request_id=request_id,
+            reason="verify postgres lineage",
+        ),
+    )
+
+    events = postgres_storage.get_lineage_events(
+        entity_type="user_playbook",
+        entity_id=str(successor.user_playbook_id),
+        request_id=request_id,
+    )
+    assert [(event.op, event.source_ids) for event in events] == [
+        ("revise", [str(first.user_playbook_id)])
+    ]
+
+    retrieval_id = postgres_storage.save_playbook_retrieval_log(
+        PlaybookRetrievalLog(
+            request_id=request_id,
+            session_id=f"session-{run_id}",
+            user_id=user_id,
+            query="Postgres storage guidance",
+            agent_version="codex",
+            shown_items=[
+                PlaybookRetrievalLogItem(
+                    ordinal=0,
+                    agent_playbook_id=17,
+                    source_user_playbook_ids=[successor.user_playbook_id],
+                    source_interaction_ids_by_user_playbook_id={
+                        str(successor.user_playbook_id): [101, 102]
+                    },
+                )
+            ],
+        )
+    )
+
+    logs = postgres_storage.get_playbook_retrieval_logs(request_id=request_id)
+    assert [log.retrieval_log_id for log in logs] == [retrieval_id]
+    assert logs[0].shown_items[0].source_user_playbook_ids == [
+        successor.user_playbook_id
+    ]
+    assert logs[0].shown_items[0].source_interaction_ids_by_user_playbook_id == {
+        str(successor.user_playbook_id): [101, 102]
+    }

@@ -1,8 +1,9 @@
-"""Tests for applied-learnings metering at search endpoints.
+"""Tests for search and applied-learnings metering at search endpoints.
 
 Verifies that ``_meter_applied_learnings`` emits exactly one ``learning_applied``
 usage event when a production-agent caller surfaces >= 1 result, and nothing for
-dashboard callers or empty result sets.
+dashboard callers or empty result sets. Verifies that production-agent calls to
+the core search endpoints also emit one ``search_request`` event per request.
 """
 
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ from reflexio.models.api_schema.ui.entities import (
     UserPlaybookView,
 )
 from reflexio.server.api import create_app
+from reflexio.server.tracing import configure_tracer
 from reflexio.server.usage_metrics import UsageEvent, configure_usage_event_recorder
 
 
@@ -86,6 +88,38 @@ def _capture() -> list[UsageEvent]:
     return events
 
 
+class _RecordingSpan:
+    def __init__(self, name: str, data: dict[str, object]) -> None:
+        self.name = name
+        self.data = data
+
+    def set_data(self, key: str, value: object) -> None:
+        self.data[key] = value
+
+
+class _SpanContext:
+    def __init__(
+        self, spans: list[_RecordingSpan], name: str, data: dict[str, object]
+    ) -> None:
+        self._spans = spans
+        self._span = _RecordingSpan(name, data)
+
+    def __enter__(self) -> _RecordingSpan:
+        self._spans.append(self._span)
+        return self._span
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class _RecordingTracer:
+    def __init__(self) -> None:
+        self.spans: list[_RecordingSpan] = []
+
+    def span(self, name: str, **data: object) -> _SpanContext:
+        return _SpanContext(self.spans, name, dict(data))
+
+
 def test_production_agent_search_meters_surfaced_count() -> None:
     """A production-agent call with results emits one learning_applied event."""
     events = _capture()
@@ -107,6 +141,10 @@ def test_production_agent_search_meters_surfaced_count() -> None:
         applied[0].count_value == 3
     )  # 2 profiles + 1 agent_playbook + 0 user_playbooks
     assert applied[0].caller_type == "production_agent"
+    searches = [e for e in events if e.event_name == "search_request"]
+    assert len(searches) == 1
+    assert searches[0].count_value == 1
+    assert searches[0].caller_type == "production_agent"
 
 
 def test_dashboard_search_meters_nothing() -> None:
@@ -121,6 +159,7 @@ def test_dashboard_search_meters_nothing() -> None:
         configure_usage_event_recorder(None)
 
     assert [e for e in events if e.event_name == "learning_applied"] == []
+    assert [e for e in events if e.event_name == "search_request"] == []
 
 
 def test_empty_result_meters_nothing() -> None:
@@ -135,6 +174,30 @@ def test_empty_result_meters_nothing() -> None:
         configure_usage_event_recorder(None)
 
     assert [e for e in events if e.event_name == "learning_applied"] == []
+    searches = [e for e in events if e.event_name == "search_request"]
+    assert len(searches) == 1
+    assert searches[0].count_value == 1
+
+
+def test_unified_search_records_threadpool_diagnostics_on_endpoint_span() -> None:
+    """The search span carries deps-to-body and threadpool snapshot diagnostics."""
+    tracer = _RecordingTracer()
+    configure_tracer(tracer)
+    try:
+        with _patch_unified_search([], [], []):
+            resp = _client("dashboard").post(
+                "/api/search", json={"query": "x", "user_id": "u1"}
+            )
+        assert resp.status_code == 200
+    finally:
+        configure_tracer(None)
+
+    search_spans = [span for span in tracer.spans if span.name == "search.endpoint"]
+    assert search_spans
+    data = search_spans[-1].data
+    assert "deps_to_body_ms" in data
+    assert isinstance(data["deps_to_body_ms"], int)
+    assert {"tp_borrowed", "tp_total", "tp_waiting"} <= data.keys()
 
 
 def test_get_billing_gate_override_seam() -> None:
@@ -278,6 +341,8 @@ _ENDPOINT_CASES = [
     ),
 ]
 
+_CORE_SEARCH_ENDPOINT_CASES = _ENDPOINT_CASES[:3]
+
 
 @pytest.mark.parametrize(
     ("path", "payload", "method_name", "response_attr", "make_item"),
@@ -327,6 +392,7 @@ def test_dashboard_per_endpoint_meters_nothing(
         configure_usage_event_recorder(None)
 
     assert [e for e in events if e.event_name == "learning_applied"] == []
+    assert [e for e in events if e.event_name == "search_request"] == []
 
 
 @pytest.mark.parametrize(
@@ -350,3 +416,59 @@ def test_empty_result_per_endpoint_meters_nothing(
         configure_usage_event_recorder(None)
 
     assert [e for e in events if e.event_name == "learning_applied"] == []
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "method_name", "response_attr", "make_item"),
+    _CORE_SEARCH_ENDPOINT_CASES,
+)
+def test_production_agent_core_search_endpoints_meter_search_request(
+    path: str,
+    payload: dict,
+    method_name: str,
+    response_attr: str,
+    make_item,
+) -> None:
+    """The three core per-resource search routes emit one search_request."""
+    events = _capture()
+    try:
+        with _patch_service_method(method_name, response_attr, [make_item()]):
+            resp = _client("production_agent").post(path, json=payload)
+        assert resp.status_code == 200
+    finally:
+        configure_usage_event_recorder(None)
+
+    searches = [e for e in events if e.event_name == "search_request"]
+    assert len(searches) == 1
+    assert searches[0].count_value == 1
+    assert searches[0].caller_type == "production_agent"
+
+
+def test_get_agent_playbooks_does_not_meter_search_request() -> None:
+    """The get-style playbook route remains excluded from search_request counts."""
+    events = _capture()
+    try:
+        with _patch_service_method(
+            "get_agent_playbooks", "agent_playbooks", [_make_agent_playbook_view()]
+        ):
+            resp = _client("production_agent").post("/api/get_agent_playbooks", json={})
+        assert resp.status_code == 200
+    finally:
+        configure_usage_event_recorder(None)
+
+    assert [e for e in events if e.event_name == "search_request"] == []
+
+
+def test_search_interactions_does_not_meter_search_request() -> None:
+    """The interaction search route remains excluded from search_request counts."""
+    events = _capture()
+    try:
+        with _patch_service_method("search_interactions", "interactions", []):
+            resp = _client("production_agent").post(
+                "/api/search_interactions", json={"user_id": "u1"}
+            )
+        assert resp.status_code == 200
+    finally:
+        configure_usage_event_recorder(None)
+
+    assert [e for e in events if e.event_name == "search_request"] == []

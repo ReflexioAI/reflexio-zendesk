@@ -36,15 +36,6 @@ RETENTION_TARGETS: tuple[RetentionTarget, ...] = (
         "created_at",
         ("result_id",),
     ),
-    RetentionTarget(
-        "profile_change_logs", "profile_change_logs", "created_at", ("id",)
-    ),
-    RetentionTarget(
-        "playbook_aggregation_change_logs",
-        "playbook_aggregation_change_logs",
-        "created_at",
-        ("id",),
-    ),
     RetentionTarget("share_links", "share_links", "created_at", ("id",)),
     RetentionTarget(
         "agent_playbook_source_user_playbooks",
@@ -75,6 +66,12 @@ RETENTION_TARGETS: tuple[RetentionTarget, ...] = (
         "playbook_optimization_events",
         "created_at",
         ("event_id",),
+    ),
+    RetentionTarget(
+        "playbook_retrieval_logs",
+        "playbook_retrieval_logs",
+        "created_at",
+        ("retrieval_log_id",),
     ),
     RetentionTarget("skills", "skills", "created_at", ("skill_id",)),
 )
@@ -116,6 +113,9 @@ RETENTION_CASCADES: dict[str, tuple[CascadeRef, ...]] = {
     ),
     "playbook_optimization_candidates": (
         CascadeRef("playbook_optimization_evaluations", "candidate_id"),
+    ),
+    "playbook_retrieval_logs": (
+        CascadeRef("playbook_retrieval_log_items", "retrieval_log_id"),
     ),
 }
 
