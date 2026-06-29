@@ -17,7 +17,7 @@ from reflexio.models.api_schema.service_schemas import (
     Interaction,
     Request,
 )
-from reflexio.server.services.agent_success_evaluation.group_evaluation_runner import (
+from reflexio.server.services.agent_success_evaluation.runner import (
     run_group_evaluation,
 )
 
@@ -68,6 +68,7 @@ def _make_prior_result(
     session_id: str,
     evaluation_name: str,
     agent_version: str = "1.0.0",
+    user_id: str = "user_a",
 ) -> AgentSuccessEvaluationResult:
     """Construct an AgentSuccessEvaluationResult representing a prior-run row.
 
@@ -82,6 +83,7 @@ def _make_prior_result(
     """
     return AgentSuccessEvaluationResult(
         result_id=result_id,
+        user_id=user_id,
         session_id=session_id,
         agent_version=agent_version,
         evaluation_name=evaluation_name,
@@ -129,6 +131,38 @@ def _make_storage(
         _make_interaction("req_1", "user_a")
     ]
     storage.get_agent_success_evaluation_results.return_value = prior_results or []
+
+    # The runner captures prior result ids via the targeted, indexed lookup
+    # get_agent_success_evaluation_result_ids (added in the evaluation-overview
+    # read optimization). Mirror the storage layer's own (user_id, session_id,
+    # evaluation_name, agent_version) filtering instead of a static return — so
+    # the test fails if the runner wires the WRONG identity tuple, not merely if
+    # it forgets to call the method.
+    def _result_ids_for(
+        user_id: str, session_id: str, evaluation_name: str, agent_version: str
+    ) -> list[int]:
+        """Return seeded result_ids matching one eval identity tuple (mirrors storage).
+
+        Args:
+            user_id (str): Owning user to match.
+            session_id (str): Owning session to match.
+            evaluation_name (str): Evaluator identifier to match.
+            agent_version (str): Agent version scope to match.
+
+        Returns:
+            list[int]: result_ids of the seeded prior rows whose full identity
+                tuple matches the arguments.
+        """
+        return [
+            r.result_id
+            for r in (prior_results or [])
+            if r.user_id == user_id
+            and r.session_id == session_id
+            and r.evaluation_name == evaluation_name
+            and r.agent_version == agent_version
+        ]
+
+    storage.get_agent_success_evaluation_result_ids.side_effect = _result_ids_for
     storage.delete_agent_success_evaluation_results_by_ids.return_value = len(
         prior_results or []
     )
@@ -144,7 +178,7 @@ def test_force_regenerate_bypasses_already_evaluated_short_circuit() -> None:
 
     with patch(
         "reflexio.server.services.agent_success_evaluation"
-        ".group_evaluation_runner.AgentSuccessEvaluationService"
+        ".runner.AgentSuccessEvaluationService"
     ) as service_cls:
         service = MagicMock()
         service.has_run_failures.return_value = False
@@ -175,7 +209,7 @@ def test_force_regenerate_builds_evaluation_request() -> None:
 
     with patch(
         "reflexio.server.services.agent_success_evaluation"
-        ".group_evaluation_runner.AgentSuccessEvaluationService"
+        ".runner.AgentSuccessEvaluationService"
     ) as service_cls:
         service = MagicMock()
         service.has_run_failures.return_value = False
@@ -218,10 +252,17 @@ def test_force_regenerate_deletes_prior_results() -> None:
     request_context.storage = storage
     llm_client = MagicMock()
 
-    with patch(
-        "reflexio.server.services.agent_success_evaluation"
-        ".group_evaluation_runner.AgentSuccessEvaluationService"
-    ) as service_cls:
+    with (
+        patch(
+            "reflexio.server.services.agent_success_evaluation"
+            ".runner.AgentSuccessEvaluationService"
+        ) as service_cls,
+        patch(
+            "reflexio.server.services.agent_success_evaluation"
+            ".runner.get_extractor_name",
+            return_value="overall_success",
+        ),
+    ):
         service = MagicMock()
         service.has_run_failures.return_value = False
         service.last_run_saved_result_count = 1
@@ -238,7 +279,9 @@ def test_force_regenerate_deletes_prior_results() -> None:
             force_regenerate=True,
         )
 
-    # By-id delete called once with the captured prior result_ids.
+    # By-id delete called once with the captured prior result_ids — proving the
+    # runner passed the matching (user_a, session_a, overall_success, 1.0.0) identity to
+    # get_agent_success_evaluation_result_ids (the mock now filters on it).
     storage.delete_agent_success_evaluation_results_by_ids.assert_called_once_with([42])
     # The old triple-scoped delete must NOT be called by the new flow.
     storage.delete_agent_success_evaluation_results_for_session.assert_not_called()
@@ -258,7 +301,7 @@ def test_force_regenerate_with_no_prior_rows_does_not_delete() -> None:
 
     with patch(
         "reflexio.server.services.agent_success_evaluation"
-        ".group_evaluation_runner.AgentSuccessEvaluationService"
+        ".runner.AgentSuccessEvaluationService"
     ) as service_cls:
         service = MagicMock()
         service.has_run_failures.return_value = False
@@ -303,7 +346,7 @@ def test_regenerate_preserves_old_rows_when_llm_run_fails() -> None:
 
     with patch(
         "reflexio.server.services.agent_success_evaluation"
-        ".group_evaluation_runner.AgentSuccessEvaluationService"
+        ".runner.AgentSuccessEvaluationService"
     ) as service_cls:
         service = MagicMock()
         # Simulate an LLM/save failure.
@@ -349,7 +392,7 @@ def test_regenerate_preserves_old_rows_when_zero_results_saved() -> None:
 
     with patch(
         "reflexio.server.services.agent_success_evaluation"
-        ".group_evaluation_runner.AgentSuccessEvaluationService"
+        ".runner.AgentSuccessEvaluationService"
     ) as service_cls:
         service = MagicMock()
         service.has_run_failures.return_value = False
@@ -387,6 +430,7 @@ def test_regenerate_happy_path_with_real_sqlite_storage(tmp_path) -> None:
         # failure_type="old_value" lets us distinguish it from the new row.
         old_row = AgentSuccessEvaluationResult(
             result_id=0,
+            user_id="user_a",
             session_id="session_a",
             agent_version="1.0.0",
             evaluation_name="overall_success",
@@ -452,10 +496,17 @@ def test_regenerate_happy_path_with_real_sqlite_storage(tmp_path) -> None:
                 ]
             )
 
-        with patch(
-            "reflexio.server.services.agent_success_evaluation"
-            ".group_evaluation_runner.AgentSuccessEvaluationService"
-        ) as service_cls:
+        with (
+            patch(
+                "reflexio.server.services.agent_success_evaluation"
+                ".runner.AgentSuccessEvaluationService"
+            ) as service_cls,
+            patch(
+                "reflexio.server.services.agent_success_evaluation"
+                ".runner.get_extractor_name",
+                return_value="overall_success",
+            ),
+        ):
             service = MagicMock()
             service.run.side_effect = fake_run
             service.has_run_failures.return_value = False
@@ -504,6 +555,7 @@ def test_regenerate_failure_preserves_old_rows_with_real_sqlite_storage(
 
         old_row = AgentSuccessEvaluationResult(
             result_id=0,
+            user_id="user_a",
             session_id="session_a",
             agent_version="1.0.0",
             evaluation_name="overall_success",
@@ -546,10 +598,17 @@ def test_regenerate_failure_preserves_old_rows_with_real_sqlite_storage(
         request_context.storage = storage
         llm_client = MagicMock()
 
-        with patch(
-            "reflexio.server.services.agent_success_evaluation"
-            ".group_evaluation_runner.AgentSuccessEvaluationService"
-        ) as service_cls:
+        with (
+            patch(
+                "reflexio.server.services.agent_success_evaluation"
+                ".runner.AgentSuccessEvaluationService"
+            ) as service_cls,
+            patch(
+                "reflexio.server.services.agent_success_evaluation"
+                ".runner.get_extractor_name",
+                return_value="overall_success",
+            ),
+        ):
             service = MagicMock()
             # Simulate the LLM failure path. Service .run() is a no-op (no save).
             service.has_run_failures.return_value = True
@@ -602,7 +661,7 @@ def test_force_regenerate_bypasses_completeness_delay_gate() -> None:
 
     with patch(
         "reflexio.server.services.agent_success_evaluation"
-        ".group_evaluation_runner.AgentSuccessEvaluationService"
+        ".runner.AgentSuccessEvaluationService"
     ) as service_cls:
         service = MagicMock()
         service.has_run_failures.return_value = False

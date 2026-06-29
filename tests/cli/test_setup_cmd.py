@@ -12,6 +12,7 @@ import typer
 from reflexio.cli.commands.setup_cmd import (
     _prompt_storage,
     _set_env_var,
+    _write_embedding_model_to_org_config,
 )
 from reflexio.models.api_schema.service_schemas import WhoamiResponse
 
@@ -127,7 +128,7 @@ class TestPromptStorage:
         with patch("typer.prompt", return_value=1):
             label = _prompt_storage(env)
         assert label == "SQLite (local)"
-        assert 'REFLEXIO_URL="http://localhost:8081"' in env.read_text()
+        assert 'REFLEXIO_URL="http://localhost:8061"' in env.read_text()
 
     def test_option_2_cloud_writes_reflexio_url_and_api_key(
         self, tmp_path: Path
@@ -578,6 +579,166 @@ class TestChooseEmbeddingProviderEdgeCases:
             openclaw(uninstall=False, embedding="opneai")
 
 
+class TestOpenclawSetup:
+    """Tests for the openclaw-smart install/uninstall/repair flows."""
+
+    def test_plugin_id_constant(self) -> None:
+        """The plugin id must match what openClaw and the TS shim register."""
+        from reflexio.cli.commands.setup_cmd import _OPENCLAW_PLUGIN_ID
+
+        assert _OPENCLAW_PLUGIN_ID == "reflexio-openclaw-smart"
+
+    def test_write_openclaw_env_persists_keys(self, tmp_path: Path) -> None:
+        """``_write_openclaw_env`` upserts OPENCLAW_BIN + USE_LOCAL_CLI=1."""
+        from reflexio.cli.commands.setup_cmd import _write_openclaw_env
+
+        env = tmp_path / ".env"
+        _write_openclaw_env(env, "/usr/local/bin/openclaw")
+        body = env.read_text()
+        assert 'OPENCLAW_BIN="/usr/local/bin/openclaw"' in body
+        assert 'OPENCLAW_SMART_USE_LOCAL_CLI="1"' in body
+
+    def test_remove_env_keys_strips_lines(self, tmp_path: Path) -> None:
+        """``_remove_env_keys`` drops the named keys, leaves others untouched."""
+        from reflexio.cli.commands.setup_cmd import _remove_env_keys
+
+        env = tmp_path / ".env"
+        env.write_text(
+            "OTHER=keep\n"
+            'OPENCLAW_BIN="/usr/local/bin/openclaw"\n'
+            'OPENCLAW_SMART_USE_LOCAL_CLI="1"\n'
+            "STILL=keep\n"
+        )
+        _remove_env_keys(env, ("OPENCLAW_BIN", "OPENCLAW_SMART_USE_LOCAL_CLI"))
+        remaining = env.read_text().splitlines()
+        assert remaining == ["OTHER=keep", "STILL=keep"]
+
+    def test_openclaw_rejects_conflicting_flags(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Repair, uninstall, and purge modes must be unambiguous."""
+        from reflexio.cli import env_loader
+        from reflexio.cli.commands.setup_cmd import openclaw
+
+        env = tmp_path / ".env"
+        env.write_text("")
+        monkeypatch.setattr(env_loader, "ensure_user_env_for_setup", lambda: env)
+
+        with pytest.raises(typer.Exit):
+            openclaw(repair=True, uninstall=True, purge=False)
+        with pytest.raises(typer.Exit):
+            openclaw(repair=False, uninstall=False, purge=True)
+
+    def test_install_openclaw_uses_new_plugin_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`_install_openclaw_integration` passes the new plugin id to subprocess."""
+        from reflexio.cli.commands import setup_cmd
+
+        env_path = tmp_path / ".env"
+        env_path.write_text("")
+
+        monkeypatch.setattr(setup_cmd.shutil, "which", lambda _: "/usr/bin/openclaw")
+        plugin_dir = tmp_path / "plugin"
+        plugin_dir.mkdir()
+        monkeypatch.setattr(setup_cmd, "_openclaw_plugin_dir", lambda: plugin_dir)
+        monkeypatch.setattr(setup_cmd, "_run_smart_install", lambda _p: None)
+
+        calls: list[list[str]] = []
+
+        class _Result:
+            def __init__(self, stdout: str = "Status: loaded\n") -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = 0
+
+        def fake_run(argv, **_kw):  # noqa: ANN001
+            calls.append(list(argv))
+            # CLI is invoked by absolute path (TOCTOU fix), so check the
+            # subcommand position rather than the executable string.
+            if argv[1:3] == ["plugins", "inspect"]:
+                return _Result("Status: loaded\n")
+            return _Result("")
+
+        monkeypatch.setattr(setup_cmd.subprocess, "run", fake_run)
+
+        ok = setup_cmd._install_openclaw_integration(env_path)
+
+        assert ok is True
+        flat_args = [arg for call in calls for arg in call]
+        assert "reflexio-openclaw-smart" in flat_args
+        assert "reflexio-federated" not in flat_args
+        # Every install-side call should target the absolute openclaw_bin
+        # path, not the bare "openclaw" string.
+        for call in calls:
+            assert call[0] == "/usr/bin/openclaw", (
+                f"expected absolute CLI path, got {call[0]!r}"
+            )
+        body = env_path.read_text()
+        assert 'OPENCLAW_BIN="/usr/bin/openclaw"' in body
+        assert 'OPENCLAW_SMART_USE_LOCAL_CLI="1"' in body
+
+    def test_install_openclaw_fails_if_conversation_access_not_persisted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Setup must not report success if typed-hook access cannot be saved."""
+        from reflexio.cli.commands import setup_cmd
+
+        env_path = tmp_path / ".env"
+        env_path.write_text("")
+        plugin_dir = tmp_path / "plugin"
+        plugin_dir.mkdir()
+
+        monkeypatch.setattr(setup_cmd.shutil, "which", lambda _: "/usr/bin/openclaw")
+        monkeypatch.setattr(setup_cmd, "_openclaw_plugin_dir", lambda: plugin_dir)
+
+        class _Result:
+            def __init__(self, returncode: int = 0) -> None:
+                self.stdout = ""
+                self.stderr = "denied"
+                self.returncode = returncode
+
+        def fake_run(argv, **_kw):  # noqa: ANN001
+            if argv[1:3] == ["config", "set"]:
+                return _Result(returncode=1)
+            return _Result()
+
+        monkeypatch.setattr(setup_cmd.subprocess, "run", fake_run)
+
+        with pytest.raises(typer.Exit):
+            setup_cmd._install_openclaw_integration(env_path)
+
+    def test_uninstall_openclaw_reuses_openclaw_bin_from_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Uninstall should remove the plugin even if PATH no longer has openclaw."""
+        from reflexio.cli.commands import setup_cmd
+
+        env_path = tmp_path / ".env"
+        env_path.write_text('OPENCLAW_BIN="/opt/openclaw/bin/openclaw"\n')
+        monkeypatch.setattr(setup_cmd.typer, "confirm", lambda *_a, **_kw: True)
+        monkeypatch.setattr(setup_cmd.shutil, "which", lambda _: None)
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **_kw):  # noqa: ANN001
+            calls.append(list(argv))
+
+            class _Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return _Result()
+
+        monkeypatch.setattr(setup_cmd.subprocess, "run", fake_run)
+
+        setup_cmd._uninstall_openclaw(env_path=env_path, purge=False)
+
+        assert calls
+        assert all(call[0] == "/opt/openclaw/bin/openclaw" for call in calls)
+
+
 class TestEnsureUserEnvForSetup:
     """Regression tests for the user-level .env target.
 
@@ -654,3 +815,30 @@ class TestEnsureUserEnvForSetup:
         assert resolved is not None and resolved.exists()
         # CWD .env was untouched.
         assert cwd_env.read_text() == "CWD_ONLY=ignored\n"
+
+
+class TestWriteEmbeddingModelToOrgConfig:
+    """The embedding-choice writer must target the same org the running no-auth
+    server resolves (``REFLEXIO_DEFAULT_ORG_ID``-aware), not a hardcoded
+    ``self-host-org`` — otherwise the storage backend and the embedding model
+    land in different ``config_<org>.json`` files."""
+
+    _STORAGE_PATCH = (
+        "reflexio.server.services.configurator."
+        "local_file_config_storage.LocalFileConfigStorage"
+    )
+
+    def test_writes_to_env_resolved_org(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("REFLEXIO_DEFAULT_ORG_ID", "claude-smart")
+        with patch(self._STORAGE_PATCH) as mock_storage:
+            _write_embedding_model_to_org_config("local/minilm-l6-v2")
+        mock_storage.assert_called_once_with("claude-smart")
+        mock_storage.return_value.save_config.assert_called_once()
+
+    def test_defaults_to_self_host_org_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("REFLEXIO_DEFAULT_ORG_ID", raising=False)
+        with patch(self._STORAGE_PATCH) as mock_storage:
+            _write_embedding_model_to_org_config("local/minilm-l6-v2")
+        mock_storage.assert_called_once_with("self-host-org")

@@ -4,6 +4,7 @@ from reflexio.models.api_schema.domain import Request
 from reflexio.models.api_schema.internal_schema import (
     RequestInteractionDataModel,
     SessionDescriptor,
+    SessionFirstRequest,
 )
 
 
@@ -152,3 +153,62 @@ class RequestMixin:
             list[SessionDescriptor]: Deduped descriptors ordered by session_id.
         """
         raise NotImplementedError
+
+    def get_first_requests_by_session_ids(
+        self, session_ids: list[str]
+    ) -> dict[str, SessionFirstRequest]:
+        """Return earliest-request metadata for each requested session.
+
+        Default implementation preserves the historical storage contract by
+        calling ``get_sessions`` per session. SQL backends should override with
+        a set-based query.
+        """
+        out: dict[str, SessionFirstRequest] = {}
+        for session_id in set(session_ids):
+            requests = []
+            page_size = 1000
+            offset = 0
+            while True:
+                grouped = self.get_sessions(
+                    session_id=session_id,
+                    top_k=page_size,
+                    offset=offset,
+                )
+                rows = grouped.get(session_id) or []
+                requests.extend(r.request for r in rows if r.request is not None)
+                if len(rows) < page_size:
+                    break
+                offset += page_size
+            if not requests:
+                continue
+            first = min(requests, key=lambda r: r.created_at)
+            out[session_id] = SessionFirstRequest(
+                session_id=session_id,
+                user_id=first.user_id,
+                source=first.source or "",
+                created_at=first.created_at,
+            )
+        return out
+
+    def get_first_requests_by_user_session_pairs(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], SessionFirstRequest]:
+        """Return earliest-request metadata for each requested (user_id, session_id).
+
+        Default implementation preserves backend compatibility by calling the
+        existing user-scoped request lookup per distinct pair. SQL backends
+        override with set-based queries.
+        """
+        out: dict[tuple[str, str], SessionFirstRequest] = {}
+        for user_id, session_id in set(pairs):
+            requests = self.get_requests_by_session(user_id, session_id)
+            if not requests:
+                continue
+            first = min(requests, key=lambda r: r.created_at)
+            out[(user_id, session_id)] = SessionFirstRequest(
+                session_id=session_id,
+                user_id=user_id,
+                source=first.source or "",
+                created_at=first.created_at,
+            )
+        return out

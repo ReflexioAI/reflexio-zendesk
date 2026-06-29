@@ -28,28 +28,28 @@ from reflexio.server.services.extraction.resumable_agent import (
     ResumableExtractionAgent,
     create_pending_info_tools_for_extractor_kind,
 )
-from reflexio.server.services.playbook.playbook_extractor import PlaybookExtractor
-from reflexio.server.services.playbook.playbook_generation_service import (
-    PlaybookGenerationService,
-    PlaybookGenerationServiceConfig,
-)
+from reflexio.server.services.playbook.components.extractor import PlaybookExtractor
 from reflexio.server.services.playbook.playbook_service_utils import (
     StructuredPlaybookList,
     construct_expert_playbook_extraction_messages,
     construct_playbook_extraction_messages_from_sessions,
     has_expert_content,
 )
-from reflexio.server.services.profile.profile_extractor import (
+from reflexio.server.services.playbook.service import (
+    PlaybookGenerationService,
+    PlaybookGenerationServiceConfig,
+)
+from reflexio.server.services.profile.components.extractor import (
     MAX_EXISTING_PROFILES_FOR_CONTEXT,
     ProfileExtractor,
-)
-from reflexio.server.services.profile.profile_generation_service import (
-    ProfileGenerationService,
-    ProfileGenerationServiceConfig,
 )
 from reflexio.server.services.profile.profile_generation_service_utils import (
     StructuredProfilesOutput,
     construct_profile_extraction_messages_from_sessions,
+)
+from reflexio.server.services.profile.service import (
+    ProfileGenerationService,
+    ProfileGenerationServiceConfig,
 )
 from reflexio.server.services.service_utils import (
     extract_interactions_from_request_interaction_data_models,
@@ -61,6 +61,7 @@ from reflexio.server.services.storage.storage_base import (
     PendingToolCallRecord,
     PendingToolCallStatus,
 )
+from reflexio.server.services.tagging.tagging_scheduler import schedule_tagging
 from reflexio.server.site_var.site_var_manager import SiteVarManager
 from reflexio.server.tracing import sentry_tags
 
@@ -272,6 +273,7 @@ class ExtractionResumeWorker:
         try:
             self.storage.update_agent_run_status(run.id, AgentRunStatus.FINALIZING)
             self._finalize_items(run, items)
+            self._schedule_finalized_tagging(run)
             self.storage.consume_run_tool_dependencies(run.id)
             finalized_status = (
                 AgentRunStatus.FINALIZED_PENDING_TOOL
@@ -315,6 +317,7 @@ class ExtractionResumeWorker:
         try:
             items, pending_tool_call_ids = self._items_from_committed_output(run)
             self._finalize_items(run, items)
+            self._schedule_finalized_tagging(run)
             self.storage.consume_run_tool_dependencies(run.id)
             finalized_status = (
                 AgentRunStatus.FINALIZED_PENDING_TOOL
@@ -460,11 +463,6 @@ class ExtractionResumeWorker:
                 else ""
             ),
             extraction_definition_prompt=extractor_config.extraction_definition_prompt.strip(),
-            metadata_definition_prompt=(
-                extractor_config.metadata_definition_prompt.strip()
-                if extractor_config.metadata_definition_prompt
-                else None
-            ),
             existing_profiles=context_profiles,
         )
         result = self._resume_agent(
@@ -486,11 +484,18 @@ class ExtractionResumeWorker:
         raw_profiles = [
             profile.model_dump() for profile in result.output.profiles or []
         ]
+        source_interaction_ids = [
+            interaction.interaction_id
+            for request_model in request_interaction_data_models
+            for interaction in request_model.interactions
+            if interaction.interaction_id
+        ]
         return (
             extractor._convert_raw_to_user_profiles(
                 raw_profiles=raw_profiles,
                 user_id=run.binding.user_id,
                 request_id=run.binding.request_id,
+                source_interaction_ids=source_interaction_ids,
             ),
             result.pending_tool_call_ids,
         )
@@ -700,6 +705,7 @@ class ExtractionResumeWorker:
                 raw_profiles=raw_profiles,
                 user_id=run.binding.user_id,
                 request_id=run.binding.request_id,
+                source_interaction_ids=list(run.binding.source_interaction_ids),
             ),
             run.pending_tool_call_ids,
         )
@@ -777,3 +783,28 @@ class ExtractionResumeWorker:
         raise ResumeWorkerError(
             f"Unsupported extractor kind {run.binding.extractor_kind!r}"
         )
+
+    def _schedule_finalized_tagging(self, run: AgentRunRecord) -> None:
+        user_id = run.binding.user_id
+        if not user_id:
+            return
+        if run.binding.extractor_kind not in ("profile", "playbook"):
+            return
+
+        # Defer tagging off this worker's drain loop. The pass is idempotent
+        # (skips already-tagged entities), so running both profile and playbook
+        # tagging is safe regardless of this run's extractor kind.
+        try:
+            schedule_tagging(
+                org_id=self.request_context.org_id,
+                user_id=user_id,
+                agent_version=run.binding.agent_version or "",
+                request_context=self.request_context,
+                llm_client=self.client,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to schedule tagging for finalized %s run %s",
+                run.binding.extractor_kind,
+                run.id,
+            )

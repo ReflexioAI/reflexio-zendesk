@@ -13,13 +13,6 @@ from reflexio.models.api_schema.eval_overview_schema import (
 
 from ._base import SQLiteStorageBase, _epoch_to_iso
 
-# Maximum epoch seconds that ``datetime.fromtimestamp`` can represent (year
-# 9999-12-31). Callers passing sentinel "open" upper bounds like
-# ``sys.maxsize`` or ``10**12`` would otherwise overflow ``_epoch_to_iso``;
-# clamping to this value yields the same query semantics (≥ everything) with
-# a valid ISO string.
-_MAX_SAFE_EPOCH_TS = 253_402_300_799  # 9999-12-31T23:59:59Z
-
 
 def _parse_dt(value: str) -> datetime:
     """
@@ -164,14 +157,35 @@ class ShadowVerdictsMixin:
             list[ShadowComparisonVerdict]: Verdicts in chronological order
                 (ascending ``created_at``).
         """
-        from_iso = _epoch_to_iso(max(0, min(from_ts, _MAX_SAFE_EPOCH_TS)))
-        to_iso = _epoch_to_iso(max(0, min(to_ts, _MAX_SAFE_EPOCH_TS)))
+        from_iso = _epoch_to_iso(from_ts)
+        to_iso = _epoch_to_iso(to_ts)
         rows = self._fetchall(
             """SELECT * FROM shadow_comparison_verdicts
                WHERE created_at >= ? AND created_at <= ?
                  AND judge_prompt_version = ?
                ORDER BY created_at ASC""",
             (from_iso, to_iso, judge_prompt_version),
+        )
+        return [_row_to_verdict(r) for r in rows]
+
+    @SQLiteStorageBase.handle_exceptions
+    def get_recent_shadow_comparison_verdicts(
+        self,
+        from_ts: int,
+        to_ts: int,
+        judge_prompt_version: str,
+        limit: int,
+    ) -> list[ShadowComparisonVerdict]:
+        from_iso = _epoch_to_iso(from_ts)
+        to_iso = _epoch_to_iso(to_ts)
+        safe_limit = max(0, limit)
+        rows = self._fetchall(
+            """SELECT * FROM shadow_comparison_verdicts
+               WHERE created_at >= ? AND created_at <= ?
+                 AND judge_prompt_version = ?
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (from_iso, to_iso, judge_prompt_version, safe_limit),
         )
         return [_row_to_verdict(r) for r in rows]
 

@@ -39,6 +39,7 @@ from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from reflexio.models.structured_output import find_schema_keyword as _find_schema_key
 from reflexio.test_support.llm_model_registry import get_model_registry
 
 
@@ -69,6 +70,8 @@ def _create_mock_completion(
         # intrinsic to the schema, not stylistic, so it survives prompt
         # rewrites better than matching on a tagline like "policy mining".
         content = json.dumps(registry["playbook_extraction"].minimal_valid)
+    elif '"tags"' in prompt_content:
+        content = json.dumps(registry["tagging"].minimal_valid)
     elif parse_structured_output:
         content = json.dumps(registry["profile_extraction"].minimal_valid)
     else:
@@ -78,47 +81,58 @@ def _create_mock_completion(
     mock_response = MagicMock()
     mock_response.choices = [MagicMock()]
     mock_response.choices[0].message.content = content
+    # Explicitly clear tool_calls: structured-output extraction now passes
+    # ``tools=`` (ask_human) alongside ``response_format``, so the client's
+    # tool-calling branch inspects ``message.tool_calls``. Without this, a bare
+    # MagicMock attribute would read as truthy and be misparsed as a tool call.
+    mock_response.choices[0].message.tool_calls = None
     mock_response.choices[0].finish_reason = "stop"
     return mock_response
 
 
-def _extraction_finish_args(prompt_content: str) -> dict[str, Any]:
-    """Pick the ``finish_extraction`` payload for an extraction tool-loop turn.
-
-    Profile and playbook extraction both run the always-on ``finish_extraction``
-    tool loop, so the mock must return the structured output as the *arguments*
-    of a ``finish_extraction`` tool call (not as message content). Routes on the
-    same schema marker the content-mode path uses.
+def _assert_response_format_strict_compatible(kwargs: dict[str, Any]) -> None:
+    """Guard every structured-output call: a ``json_schema`` response_format sent
+    to the provider must be OpenAI strict-mode compatible (no ``oneOf`` /
+    ``discriminator``). Pydantic discriminated unions emit ``oneOf``, which strict
+    structured-output endpoints reject with a 400 (Sentry PYTHON-FASTAPI-9J) — a
+    failure the canned mock would otherwise hide. Raw Pydantic-class
+    response_format (the unsupported-provider passthrough) is skipped: that path
+    is handled by LiteLLM/the provider, not by an explicit strict schema.
     """
-    registry = get_model_registry()
-    if '"playbooks"' in prompt_content:
-        return registry["playbook_extraction"].minimal_valid
-    return registry["profile_extraction"].minimal_valid
+    response_format = kwargs.get("response_format")
+    if not isinstance(response_format, dict):
+        return
+    if response_format.get("type") != "json_schema":
+        return
+    schema = response_format.get("json_schema", {}).get("schema")
+    if not isinstance(schema, dict):
+        return
+    for banned in ("oneOf", "discriminator"):
+        if _find_schema_key(schema, banned):
+            raise AssertionError(
+                f"response_format json_schema contains '{banned}' — OpenAI strict "
+                "structured outputs reject it. Normalize via make_strict_json_schema "
+                "before sending (Sentry PYTHON-FASTAPI-9J)."
+            )
 
 
 def _mock_completion(*args: Any, **kwargs: Any) -> MagicMock:
     """Mock implementation for litellm.completion."""
+    _assert_response_format_strict_compatible(kwargs)
     messages = kwargs.get("messages", args[0] if args else [])
     prompt_content = ""
     for message in messages:
         if isinstance(message, dict) and "content" in message:
             prompt_content += str(message["content"])
 
-    # Extraction now runs through the ``finish_extraction`` tool loop, which
-    # invokes ``litellm.completion`` with ``tools=``. In that mode the loop
-    # reads ``resp.tool_calls`` (not message content), so emit a single
-    # ``finish_extraction`` tool call carrying the structured output as args.
-    if kwargs.get("tools"):
-        # Imported lazily to avoid importing the extraction service stack at
-        # module load time (this module is imported by the root conftest).
-        from reflexio.server.services.extraction.resumable_agent import (
-            FINISH_EXTRACTION_TOOL_NAME,
-        )
-
-        return make_tool_call_response(
-            FINISH_EXTRACTION_TOOL_NAME, _extraction_finish_args(prompt_content)
-        )
-
+    # Extraction now delivers its result as a native structured response
+    # (response_format=output_schema): the tool loop reads the final answer from
+    # message CONTENT (parsed into the schema), with ask_human /
+    # attach_pending_info_request available only as optional intermediate tools.
+    # So whenever a response_format is requested, emit structured content with no
+    # tool call — the common "finish" path. Tests that exercise an intermediate
+    # tool call (ask_human) install explicit responses via ``side_effect`` using
+    # ``make_tool_call_response``; they don't rely on this default router.
     parse_structured = kwargs.get("response_format") is not None
     return _create_mock_completion(prompt_content, parse_structured)
 
@@ -219,6 +233,27 @@ def make_tool_call_response(tool_name: str, args: dict[str, Any]) -> MagicMock:
     tc.function.arguments = json.dumps(args)
     resp.choices[0].message.tool_calls = [tc]
     return resp
+
+
+def make_structured_finish(payload: dict[str, Any] | str) -> MagicMock:
+    """Build a structured-response finish for the extraction agent.
+
+    The resumable extraction agent now delivers its result as a native
+    structured response — the schema-conformant JSON arrives as the assistant
+    message content (no tool call), and the tool loop parses it into the output
+    schema. Use this in place of the old ``make_tool_call_response(
+    FINISH_EXTRACTION_TOOL_NAME, payload)`` pattern.
+
+    Args:
+        payload: The extraction result as a dict (serialized to JSON) or an
+            already-serialized JSON string (e.g. ``model.model_dump_json()``).
+
+    Returns:
+        MagicMock: A response object whose message content is the JSON payload
+            and whose ``tool_calls`` is None.
+    """
+    content = payload if isinstance(payload, str) else json.dumps(payload)
+    return make_finish_response(content)
 
 
 def make_finish_response(text: str = "done") -> MagicMock:

@@ -11,6 +11,7 @@ from reflexio.models.api_schema.service_schemas import (
     DeleteUserProfileRequest,
     Interaction,
     ProfileTimeToLive,
+    Request,
     UserActionType,
     UserProfile,
 )
@@ -29,6 +30,45 @@ def _make_profile(user_id: str, profile_id: str, content: str) -> UserProfile:
         profile_time_to_live=ProfileTimeToLive.INFINITY,
         source="test",
     )
+
+
+class TestGetAllGeneratedProfiles:
+    """Contract: get_all_generated_profiles returns every profile with a
+    non-empty generated_from_request_id (any status) — the bulk form of the
+    per-id read that reconstruct_profile_change_log uses for the "added" side.
+    """
+
+    def test_returns_gfr_bearing_profiles_and_matches_per_id_union(
+        self, storage: BaseStorage
+    ) -> None:
+        uid = "u-gen-all"
+        p1 = _make_profile(uid, "g-p1", "c1")  # gfr=req_g-p1
+        p2 = _make_profile(uid, "g-p2", "c2")  # gfr=req_g-p2
+        p_nogfr = UserProfile(
+            user_id=uid,
+            profile_id="g-p3",
+            content="c3",
+            last_modified_timestamp=int(datetime.now(UTC).timestamp()),
+            generated_from_request_id="",  # no run — must be excluded
+            profile_time_to_live=ProfileTimeToLive.INFINITY,
+            source="test",
+        )
+        storage.add_user_profile(uid, [p1, p2, p_nogfr])
+
+        got = {p.profile_id for p in storage.get_all_generated_profiles()}
+
+        # gfr-bearing profiles present; the empty-gfr one excluded.
+        assert {"g-p1", "g-p2"} <= got
+        assert "g-p3" not in got
+
+        # Equivalent to the union of the per-id reads it replaces (robust to any
+        # other profiles already in this storage).
+        union = {
+            p.profile_id
+            for r in storage.get_distinct_generated_from_request_ids()
+            for p in storage.get_profiles_by_generated_from_request_id(r)
+        }
+        assert got == union
 
 
 def _make_interaction(
@@ -58,6 +98,20 @@ class TestProfileCRUD:
         assert len(result) == 1
         assert result[0].content == "likes sushi"
         assert result[0].profile_id == "p1"
+
+    def test_update_user_profile_tags_round_trip(self, storage: BaseStorage) -> None:
+        storage.add_user_profile("u1", [_make_profile("u1", "p1", "likes sushi")])
+        assert storage.get_user_profile("u1")[0].tags is None  # untagged until tagged
+
+        storage.update_user_profile_tags("u1", "p1", ["food", "japanese"])
+
+        result = storage.get_user_profile("u1")
+        assert result[0].tags == ["food", "japanese"]
+        # Tags-only update must not disturb content.
+        assert result[0].content == "likes sushi"
+
+        storage.update_user_profile_tags("u1", "p1", [])
+        assert storage.get_user_profile("u1")[0].tags == []
 
     def test_get_nonexistent_user_returns_empty(self, storage: BaseStorage) -> None:
         assert storage.get_user_profile("nonexistent") == []
@@ -346,3 +400,52 @@ class TestInteractionCRUD:
         result = storage.get_user_interaction("u1")
         assert len(result) == 1
         assert result[0].citations == []
+
+    def test_interaction_image_encoding_round_trips_through_extraction_reads(
+        self, storage: BaseStorage
+    ) -> None:
+        timestamp = int(datetime.now(UTC).timestamp())
+        request = Request(
+            request_id="req-image",
+            user_id="u1",
+            created_at=timestamp,
+            source="api",
+            agent_version="v1",
+            session_id="session-image",
+        )
+        storage.add_request(request)
+        interaction = Interaction(
+            interaction_id=1,
+            user_id="u1",
+            request_id=request.request_id,
+            content="describe this",
+            created_at=timestamp,
+            user_action=UserActionType.NONE,
+            user_action_description="",
+            image_encoding="base64-image-data",
+        )
+        storage.add_user_interaction("u1", interaction)
+
+        direct_rows = storage.get_user_interaction("u1")
+        assert len(direct_rows) == 1
+        assert direct_rows[0].image_encoding == "base64-image-data"
+
+        grouped, flat = storage.get_last_k_interactions_grouped(
+            "u1", 10, sources=["api"]
+        )
+        assert flat[0].image_encoding == "base64-image-data"
+        assert grouped[0].interactions[0].image_encoding == "base64-image-data"
+
+        storage.upsert_operation_state(
+            "image-extraction-test",
+            {
+                "last_processed_timestamp": timestamp - 1,
+                "last_processed_interaction_ids": [],
+            },
+        )
+        _state, new_groups = storage.get_operation_state_with_new_request_interaction(
+            "image-extraction-test",
+            "u1",
+            sources=["api"],
+        )
+        assert new_groups[0].interactions[0].image_encoding == "base64-image-data"

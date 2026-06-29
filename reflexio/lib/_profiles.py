@@ -1,13 +1,20 @@
 import logging
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
 from datetime import UTC, datetime
+from typing import Protocol
 
 from reflexio.lib._base import (
     STORAGE_NOT_CONFIGURED_MSG,
     ReflexioBase,
     _require_storage,
+)
+from reflexio.models.api_schema.domain.entities import (
+    LineageEvent,
+    ProfileChangeLog,
+    UserProfile,
 )
 from reflexio.models.api_schema.retriever_schema import (
     GetProfileStatisticsResponse,
@@ -36,7 +43,7 @@ from reflexio.models.api_schema.service_schemas import (
     UpgradeProfilesRequest,
     UpgradeProfilesResponse,
 )
-from reflexio.server.services.profile.profile_generation_service import (
+from reflexio.server.services.profile.service import (
     ProfileGenerationService,
 )
 from reflexio.server.tracing import profile_step
@@ -199,15 +206,21 @@ class ProfilesMixin(ReflexioBase):
         )
 
     def get_profile_change_logs(self) -> ProfileChangeLogResponse:
-        """Get profile change logs.
+        """Get profile change logs, served from the lineage reconstruction.
+
+        The change-log view is rebuilt on demand from ``lineage_event`` linkage
+        joined to survivor/tombstone content via
+        :func:`reconstruct_profile_change_log`. The legacy ``profile_change_logs``
+        table is no longer written (B3 Task 6) or read (B3 Task 7); it is retained
+        frozen until its removal in Task 8.
 
         Returns:
-            ProfileChangeLogResponse: Response containing profile change logs
+            ProfileChangeLogResponse: Response containing the reconstructed
+                profile change logs.
         """
         if not self._is_storage_configured():
             return ProfileChangeLogResponse(success=True, profile_change_logs=[])
-        changelogs = self._get_storage().get_profile_change_logs()
-        return ProfileChangeLogResponse(success=True, profile_change_logs=changelogs)
+        return reconstruct_profile_change_log(self._get_storage())
 
     @_require_storage(DeleteUserProfileResponse)
     def delete_profile(
@@ -401,7 +414,7 @@ class ProfilesMixin(ReflexioBase):
                 status_filter = [None]  # Default to current profiles
 
         profiles = self._get_storage().get_user_profile(
-            request.user_id, status_filter=status_filter
+            request.user_id, status_filter=status_filter, tags=request.tags
         )
         profiles = sorted(
             profiles, key=lambda x: x.last_modified_timestamp, reverse=True
@@ -543,3 +556,182 @@ class ProfilesMixin(ReflexioBase):
             return GetProfileStatisticsResponse(
                 success=False, msg=f"Failed to get profile statistics: {str(e)}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Standalone read-side reconstruction (Phase B3 Task 2)
+# ---------------------------------------------------------------------------
+
+
+class ChangeLogReadStorage(Protocol):
+    """The storage read surface ``reconstruct_profile_change_log`` requires.
+
+    Both the real ``BaseStorage`` backends and the read-only
+    ``RestStorageReader`` satisfy this structurally — no inheritance required —
+    so reconstruction can run against either without an unsound ``cast`` to
+    ``BaseStorage``.
+    """
+
+    org_id: str
+
+    def get_lineage_events(
+        self,
+        *,
+        entity_type: str | None = ...,
+        entity_id: str | None = ...,
+        org_id: str | None = ...,
+        request_id: str | None = ...,
+    ) -> list[LineageEvent]: ...
+
+    def get_distinct_generated_from_request_ids(self) -> list[str]: ...
+
+    def get_profiles_by_generated_from_request_id(
+        self, request_id: str
+    ) -> list[UserProfile]: ...
+
+    def get_all_generated_profiles(self) -> list[UserProfile]: ...
+
+    def get_profile_by_id(
+        self, profile_id: str, *, include_tombstones: bool = ...
+    ) -> UserProfile | None: ...
+
+
+def reconstruct_profile_change_log(
+    storage: ChangeLogReadStorage,
+    *,
+    limit: int = 100,
+) -> ProfileChangeLogResponse:
+    """Rebuild the ProfileChangeLog view using time-travel-stable signals.
+
+    Uses two immutable / stable signals to classify every dedup run:
+
+    * **added(R)** — profiles whose ``generated_from_request_id == R``.  This
+      column is set at creation and never changes, so it correctly classifies
+      a profile as "added in run R" even if it is later tombstoned in run R2.
+      Tombstones are included so the content is available.
+
+    * **removed(R)** — entity_ids of ``status_change`` lineage events with
+      ``to_status == "superseded"`` and ``request_id == R``.  This is the
+      exact signature emitted by ``supersede_profiles_by_ids`` (the dedup
+      soft-delete path).  It is distinct from reflection which emits
+      ``op="revise"``, so reflection events are never mis-counted as removals.
+
+    Groups are formed over the union of request_ids from both signals.
+    Request_id ``""`` is skipped — it would merge unrelated runs.
+    A row is emitted only when ``added or removed`` is non-empty (matching
+    legacy semantics: the legacy table was written only when
+    ``all_new_profiles or superseded_profiles``).
+
+    When a removed profile's tombstone has been physically purged (GDPR GC),
+    it is silently omitted from ``removed_profiles`` rather than crashing.
+
+    Args:
+        storage (ChangeLogReadStorage): Storage read surface to query (any
+            BaseStorage backend or the read-only ``RestStorageReader``).
+        limit (int): Maximum number of reconstructed entries to return.
+            Defaults to 100.
+
+    Returns:
+        ProfileChangeLogResponse: ``success=True`` with reconstructed rows
+            ordered most-recent first (by max event ``created_at`` in each
+            request_id group), capped at ``limit``.
+    """
+    if limit <= 0:
+        return ProfileChangeLogResponse(success=True, profile_change_logs=[])
+
+    all_events = storage.get_lineage_events(
+        entity_type="profile", org_id=storage.org_id
+    )
+
+    # Dedup soft-delete signature: status_change to_status=="superseded".
+    # Each such event records one profile removed in the dedup run ``request_id``.
+    # Distinct from reflection which emits op="revise" — so revise events are
+    # never counted as removals here.
+    removal_by_req: dict[str, list[str]] = defaultdict(list)
+    sort_key: dict[str, tuple[int, int]] = {}  # request_id -> (created_at, event_id)
+    for evt in all_events:
+        key = evt.request_id
+        if not key:
+            continue  # skip empty-string request_ids — never merge unrelated runs
+        cur = sort_key.get(key, (0, 0))
+        if (evt.created_at, evt.event_id) > cur:
+            sort_key[key] = (evt.created_at, evt.event_id)
+        if evt.op == "status_change" and evt.to_status == "superseded":
+            removal_by_req[key].append(evt.entity_id)
+
+    # Resolve the "added" side for every run in ONE bulk read, grouped by each
+    # profile's immutable generated_from_request_id. This replaces a read per
+    # candidate request_id, which fanned out over the org's whole dedup history
+    # before the limit slice below — a hot-path N+1 on network-backed storage now
+    # that the live endpoint serves this reconstruction.
+    added_by_req: dict[str, list] = defaultdict(list)
+    for profile in storage.get_all_generated_profiles():
+        added_by_req[profile.generated_from_request_id].append(profile)
+
+    # Candidate request_ids are the UNION of:
+    #   (a) lineage EVENT request_ids — runs that produced a dedup removal
+    #       (status_change/superseded event); and
+    #   (b) request_ids stamped on profile rows (the keys of added_by_req) —
+    #       discovers ADD-ONLY dedup runs (new profiles, nothing superseded) that
+    #       emit no lineage event. ``get_all_generated_profiles`` already excludes
+    #       the empty-string sentinel, so unrelated runs are never merged.
+    #
+    # This closes the reconstruction-completeness gap for add-only runs: the
+    # legacy `add_profile_change_log` fired whenever `all_new_profiles or
+    # superseded_profiles` was non-empty, so a run with only adds was still
+    # recorded. The (b) path mirrors that.
+    #
+    # For add-only runs (in set (b) but not (a)), no event timestamp exists.
+    # We derive their sort key from the max `last_modified_timestamp` of the
+    # profiles in that group — set at creation, giving a sensible most-recent-first
+    # ordering relative to event-timestamped runs. The secondary key is 0.
+    candidate_req_ids: set[str] = set(sort_key.keys()) | set(added_by_req.keys())
+
+    def _effective_sort_key(req_id: str) -> tuple[int, int]:
+        """Return (timestamp, event_id) for sorting; for add-only runs fall back to
+        the max last_modified_timestamp of the profiles in that group."""
+        if req_id in sort_key:
+            return sort_key[req_id]
+        profiles = added_by_req.get(req_id, [])
+        max_ts = max((p.last_modified_timestamp for p in profiles), default=0)
+        return (max_ts, 0)
+
+    sorted_keys = sorted(
+        candidate_req_ids,
+        key=_effective_sort_key,
+        reverse=True,
+    )[:limit]
+
+    logs: list[ProfileChangeLog] = []
+    for req_id in sorted_keys:
+        # added: profiles whose generated_from_request_id == req_id (any status,
+        # include tombstones — a profile added in R1 and tombstoned in R2 is still
+        # "added in R1").
+        added = added_by_req[req_id]
+
+        # removed: dedup-superseded profiles from this run's lineage events.
+        removed: list = []
+        for entity_id in removal_by_req.get(req_id, []):
+            profile = storage.get_profile_by_id(entity_id, include_tombstones=True)
+            if profile is not None:
+                removed.append(profile)
+            # Tombstone physically purged (GDPR GC) → silently omit; no crash.
+
+        if not added and not removed:
+            # No dedup activity for this request_id — skip to match legacy semantics.
+            continue
+
+        ts, _ = _effective_sort_key(req_id)
+        user_id = added[0].user_id if added else removed[0].user_id
+        logs.append(
+            ProfileChangeLog(
+                id=0,
+                user_id=user_id,
+                request_id=req_id,
+                created_at=ts,
+                added_profiles=added,
+                removed_profiles=removed,
+            )
+        )
+
+    return ProfileChangeLogResponse(success=True, profile_change_logs=logs)

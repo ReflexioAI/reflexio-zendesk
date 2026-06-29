@@ -142,6 +142,9 @@ markers = [
     "e2e: Full workflow tests with real storage and services",
     "requires_credentials: Tests that need API keys (costs money)",
 ]
+filterwarnings = [
+    "ignore:This process \\(pid=.*\\) is multi-threaded, use of fork\\(\\) may lead to deadlocks in the child\\.:DeprecationWarning:multiprocessing\\.popen_fork",
+]
 
 [tool.coverage.run]
 # Measure branch coverage — ensures both if/else paths are tested, not just lines
@@ -220,6 +223,12 @@ ignore = [
 "reflexio/server/api.py" = ["B008", "ARG001", "ARG002"]
 "reflexio/server/api_endpoints/**" = ["B008", "ARG001", "ARG002"]
 "reflexio/integrations/**" = ["ARG002"]
+# The openclaw plugin is a nested package; its tests/scripts/cli are not reached
+# by the top-level "tests/**" / "reflexio/cli/**" globs above (those only match
+# at the tree root), so mirror the same standard test/cli ignores here.
+"reflexio/integrations/openclaw/plugin/tests/**" = ["S101", "ARG001", "ARG002", "ARG005", "PTH", "ANN", "S105", "S106", "S107", "S108", "S310", "N802", "N806"]
+"reflexio/integrations/openclaw/plugin/scripts/**" = ["S101", "G004", "ANN", "S603", "S607"]
+"reflexio/integrations/openclaw/plugin/src/openclaw_smart/cli.py" = ["S603", "S607"]
 "reflexio/server/services/configurator/test_config_storage.py" = ["S101", "ANN", "S108"]
 "demo/**" = ["S101", "PTH", "G004", "ANN"]
 "reflexio/server/services/storage/sqlite_storage/**" = ["S608"]
@@ -264,6 +273,9 @@ version_toml = ["pyproject.toml:project.version"]
 tag_format = "reflexio-v{version}"
 commit_message = "chore(release): reflexio v{version}"
 build_command = "pip install build && python -m build"
+# Pre-1.0 convention: a breaking change bumps the MINOR (0.x.y -> 0.(x+1).0),
+# not MAJOR. So the B3 Task 7 breaking removal releases as 0.3.0, not 1.0.0.
+major_on_zero = false
 
 [tool.semantic_release.branches.main]
 match = "^(main|master)$"

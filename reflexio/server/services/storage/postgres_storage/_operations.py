@@ -368,3 +368,27 @@ class OperationMixin(SchemaScopedClient):
         if response.data and isinstance(response.data, dict):
             return response.data
         return {"acquired": False, "state": {}}
+
+    @handle_exceptions
+    def clear_in_progress_lock_if_owner(
+        self,
+        state_key: str,
+        request_id: str,
+        cleared_state: dict,
+    ) -> bool:
+        response = (
+            self._table("_operation_state")
+            .select(_OPERATION_STATE_COLUMNS)
+            .eq("service_name", state_key)
+            .execute()
+        )
+        rows = _rows(response)
+        if not rows:
+            return False
+        state = rows[0].get("operation_state") or {}
+        if state.get("current_request_id") != request_id and state.get(
+            "request_id"
+        ) != request_id:
+            return False
+        self.upsert_operation_state(state_key, cleared_state)
+        return True

@@ -11,8 +11,8 @@ These tests focus on the handler contract:
   - Unknown session → returns ``skipped_reason`` instead of 5xx.
 
 The actual judge call inside ``run_group_evaluation`` is mocked at the
-runner boundary — the runner is exercised exhaustively in its own
-``test_group_evaluation_runner_*`` suite, and end-to-end LLM behaviour is
+runner boundary — the runner is exercised exhaustively in its focused
+agent-success evaluation runner test suites, and end-to-end LLM behaviour is
 covered by the e2e tier. Here we only verify the endpoint correctly
 wires storage → runner → cache → response.
 """
@@ -90,11 +90,12 @@ def _fake_runner_factory(storage, *, agent_version: str, evaluation_name: str):
     finds a fresh row to report as ``result_id``.
     """
 
-    def _fake(*, session_id: str, **_kwargs: object) -> None:
+    def _fake(*, user_id: str, session_id: str, **_kwargs: object) -> None:
         storage.save_agent_success_evaluation_results(
             [
                 AgentSuccessEvaluationResult(
                     result_id=0,
+                    user_id=user_id,
                     session_id=session_id,
                     agent_version=agent_version,
                     evaluation_name=evaluation_name,

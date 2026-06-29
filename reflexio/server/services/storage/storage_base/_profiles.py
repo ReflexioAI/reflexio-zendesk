@@ -34,6 +34,7 @@ class ProfileMixin:
         self,
         user_id: str,
         status_filter: list[Status | None] | None = None,
+        tags: list[str] | None = None,
     ) -> list[UserProfile]:
         raise NotImplementedError
 
@@ -76,6 +77,13 @@ class ProfileMixin:
     def update_user_profile_by_id(
         self, user_id: str, profile_id: str, new_profile: UserProfile
     ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_user_profile_tags(
+        self, user_id: str, profile_id: str, tags: list[str]
+    ) -> None:
+        """Replace only the tags of a profile, leaving content and embedding untouched."""
         raise NotImplementedError
 
     @abstractmethod
@@ -179,6 +187,22 @@ class ProfileMixin:
         raise NotImplementedError
 
     @abstractmethod
+    def get_profile_by_id(
+        self, profile_id: str, *, include_tombstones: bool = False
+    ) -> UserProfile | None:
+        """Fetch a single profile by primary key.
+
+        Args:
+            profile_id: The profile's primary key.
+            include_tombstones: When False (default), MERGED/SUPERSEDED profiles
+                return None. Set to True for lineage resolution (resolve_current).
+
+        Returns:
+            The UserProfile if found and not filtered, otherwise None.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def archive_profile_by_id(self, user_id: str, profile_id: str) -> bool:
         """Atomically archive a single profile by id, only if currently CURRENT.
 
@@ -220,14 +244,110 @@ class ProfileMixin:
         raise NotImplementedError
 
     @abstractmethod
-    def delete_profiles_by_ids(self, profile_ids: list[str]) -> int:
+    def delete_profiles_by_ids(
+        self, profile_ids: list[str], *, emit_hard_delete: bool = True
+    ) -> int:
         """Delete profiles by their IDs.
 
         Args:
             profile_ids (list[str]): List of profile IDs to delete
+            emit_hard_delete (bool): When True (default), emit a ``hard_delete``
+                lineage event for each id before removing the row.  Pass ``False``
+                from rollback callers that cleaned up a never-CURRENT successor to
+                avoid poisoning the audit log with phantom erasures.
 
         Returns:
             int: Number of profiles deleted
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_distinct_generated_from_request_ids(self) -> list[str]:
+        """Return the DISTINCT non-empty generated_from_request_id values present on profiles.
+
+        Scoped to the org. Includes profiles of any status (tombstones included) so
+        that an add-only run whose profiles were later tombstoned is still discoverable.
+        Empty-string values are excluded by the query (they must never form a group).
+
+        Used by ``reconstruct_profile_change_log`` to discover add-only dedup runs
+        (runs that added new profiles but superseded nothing, which emit no lineage
+        event and would otherwise be invisible).
+
+        Returns:
+            list[str]: Distinct non-empty ``generated_from_request_id`` values.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_profiles_by_generated_from_request_id(
+        self,
+        request_id: str,
+    ) -> list[UserProfile]:
+        """Return all profiles (any status, including tombstones) for a given generated_from_request_id.
+
+        Scoped to the org. Used by reconstruct_profile_change_log to find the
+        "added" side of a dedup run without depending on mutable status columns.
+        The column is set at profile creation and never changes — it is the
+        time-travel-stable signal for "added in run R".
+
+        Args:
+            request_id (str): The generated_from_request_id value to filter on.
+
+        Returns:
+            list[UserProfile]: All profiles (live or tombstone) whose
+                ``generated_from_request_id`` matches, scoped by org.
+        """
+        raise NotImplementedError
+
+    def get_all_generated_profiles(self) -> list[UserProfile]:
+        """Return every profile (any status, incl. tombstones) with a non-empty
+        ``generated_from_request_id``, scoped to the org.
+
+        Bulk equivalent of :meth:`get_profiles_by_generated_from_request_id` — it
+        lets ``reconstruct_profile_change_log`` resolve the "added" side of every
+        run in a single query instead of one read per candidate request_id (an
+        org-history-sized fan-out on network-backed storage).
+
+        The default implementation loops the per-id reads, so every backend is
+        correct without an override; backends SHOULD override it with a single
+        ``WHERE generated_from_request_id <> ''`` query for the performance win.
+
+        Returns:
+            list[UserProfile]: All profiles with a non-empty
+                ``generated_from_request_id``.
+        """
+        out: list[UserProfile] = []
+        for request_id in self.get_distinct_generated_from_request_ids():
+            out.extend(self.get_profiles_by_generated_from_request_id(request_id))
+        return out
+
+    @abstractmethod
+    def supersede_profiles_by_ids(
+        self,
+        user_id: str,
+        profile_ids: list[str],
+        request_id: str,
+    ) -> list[str]:
+        """Soft-delete profiles by setting status to SUPERSEDED, emitting set-based lineage.
+
+        For each profile id that matches (user_id, current status in {NULL/CURRENT,
+        PENDING}), updates status to SUPERSEDED and emits one ``status_change``
+        lineage event under the shared ``request_id``.  Rows are NOT physically
+        deleted — reads that exclude tombstones will simply filter them out by status.
+
+        Args:
+            user_id (str): Owning user id. Predicate scoped to this user.
+            profile_ids (list[str]): Profile ids to supersede. Already-superseded or
+                non-existent ids are silently skipped.
+            request_id (str): Shared request id to stamp on all emitted events so the
+                entire dedup run is reconstructible from a single id.
+
+        Returns:
+            list[str]: The profile ids that were actually superseded by this call, in
+                input order. Already-superseded or non-existent ids are omitted (so an
+                empty list means nothing committed). Callers needing a count use
+                ``len(...)``. This is the commit-accurate set used to build a
+                commit-atomic legacy change-log "removed" entry.
         """
         raise NotImplementedError
 

@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from psycopg2 import sql
+
 from reflexio.models.api_schema.retriever_schema import (
     SearchInteractionRequest,
     SearchUserProfileRequest,
@@ -52,6 +54,8 @@ class ProfileMixin(SchemaScopedClient):
     _get_embedding: Any
     _should_expand_documents: Any
     _expand_document: Any
+    _fetch_all: Any
+    _table_identifier: Any
     llm_client: Any
     embedding_model_name: str
     embedding_dimensions: int
@@ -122,6 +126,7 @@ class ProfileMixin(SchemaScopedClient):
         self,
         user_id: str,
         status_filter: list[Status | None] | None = None,
+        tags: list[str] | None = None,
     ) -> list[UserProfile]:
         if status_filter is None:
             status_filter = [None]  # Default to current profiles (status=None)
@@ -155,6 +160,8 @@ class ProfileMixin(SchemaScopedClient):
         else:
             # Only non-None statuses: status IN (...)
             query = query.in_("status", status_strings)
+        if tags:
+            query = query.contains("tags", tags)
 
         response = query.execute()
         return response_list_to_user_profiles(_rows(response))
@@ -226,6 +233,20 @@ class ProfileMixin(SchemaScopedClient):
         )
 
     @handle_exceptions
+    def update_user_profile_tags(
+        self, user_id: str, profile_id: str, tags: list[str]
+    ) -> None:
+        response = (
+            self._table("profiles")
+            .update({"tags": tags})
+            .eq("user_id", user_id)
+            .eq("profile_id", profile_id)
+            .execute()
+        )
+        if self._opensearch:
+            self._opensearch.index_rows("profiles", _rows(response))
+
+    @handle_exceptions
     def delete_user_profile(self, request: DeleteUserProfileRequest) -> None:
         response = (
             self._table("profiles")
@@ -263,8 +284,11 @@ class ProfileMixin(SchemaScopedClient):
             self._opensearch.delete_by_filter("profiles", [])
 
     @handle_exceptions
-    def delete_profiles_by_ids(self, profile_ids: list[str]) -> int:
+    def delete_profiles_by_ids(
+        self, profile_ids: list[str], *, emit_hard_delete: bool = True
+    ) -> int:
         """Delete profiles by their IDs."""
+        _ = emit_hard_delete
         if not profile_ids:
             return 0
         response = (
@@ -275,6 +299,22 @@ class ProfileMixin(SchemaScopedClient):
                 "profiles", [row.get("profile_id") for row in _rows(response)]
             )
         return len(_rows(response))
+
+    @handle_exceptions
+    def get_profile_by_id(
+        self, profile_id: str, *, include_tombstones: bool = False
+    ) -> UserProfile | None:
+        query = (
+            self._table("profiles")
+            .select(_PROFILE_COLUMNS)
+            .eq("profile_id", profile_id)
+            .limit(1)
+        )
+        if not include_tombstones:
+            query = _apply_status_filter_to_query(query, [None])
+        response = query.execute()
+        rows = _rows(response)
+        return response_list_to_user_profiles([rows[0]])[0] if rows else None
 
     @handle_exceptions
     def get_profiles_by_ids(
@@ -308,6 +348,87 @@ class ProfileMixin(SchemaScopedClient):
 
         response = query.execute()
         return response_list_to_user_profiles(_rows(response))
+
+    @handle_exceptions
+    def get_distinct_generated_from_request_ids(self) -> list[str]:
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT DISTINCT generated_from_request_id
+                FROM {}
+                WHERE generated_from_request_id IS NOT NULL
+                  AND generated_from_request_id <> ''
+                ORDER BY generated_from_request_id
+                """
+            ).format(self._table_identifier("profiles"))
+        )
+        return [str(row["generated_from_request_id"]) for row in rows]
+
+    @handle_exceptions
+    def get_profiles_by_generated_from_request_id(
+        self,
+        request_id: str,
+    ) -> list[UserProfile]:
+        response = (
+            self._table("profiles")
+            .select(_PROFILE_COLUMNS)
+            .eq("generated_from_request_id", request_id)
+            .execute()
+        )
+        return response_list_to_user_profiles(_rows(response))
+
+    @handle_exceptions
+    def supersede_profiles_by_ids(
+        self,
+        user_id: str,
+        profile_ids: list[str],
+        request_id: str,
+    ) -> list[str]:
+        if not profile_ids:
+            return []
+        now = int(datetime.now(UTC).timestamp())
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                UPDATE {} SET status = %s, retired_at = %s,
+                    last_modified_timestamp = %s
+                WHERE user_id = %s
+                  AND profile_id = ANY(%s)
+                  AND (status IS NULL OR status = %s)
+                RETURNING profile_id
+                """
+            ).format(self._table_identifier("profiles")),
+            [Status.SUPERSEDED.value, now, now, user_id, profile_ids, Status.PENDING.value],
+        )
+        changed = {str(row["profile_id"]) for row in rows}
+        for profile_id in changed:
+            self._fetch_all(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (
+                        org_id, entity_type, entity_id, op, prov_relation,
+                        source_ids, actor, request_id, reason, created_at,
+                        from_status, to_status, status_namespace
+                    )
+                    VALUES (%s, 'profile', %s, 'status_change',
+                            'wasInvalidatedBy', '[]'::jsonb, 'system', %s,
+                            'soft_supersede', %s, NULL, %s, 'lifecycle')
+                    ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
+                    DO NOTHING
+                    RETURNING 1
+                    """
+                ).format(self._table_identifier("lineage_event")),
+                [self.org_id, profile_id, request_id, now, Status.SUPERSEDED.value],
+            )
+        if changed and self._opensearch:
+            response = (
+                self._table("profiles")
+                .select("*")
+                .in_("profile_id", list(changed))
+                .execute()
+            )
+            self._opensearch.index_rows("profiles", _rows(response))
+        return [profile_id for profile_id in profile_ids if profile_id in changed]
 
     @handle_exceptions
     def archive_profile_by_id(self, user_id: str, profile_id: str) -> bool:
@@ -747,6 +868,8 @@ class ProfileMixin(SchemaScopedClient):
                         }
                     }
                 )
+            if search_user_profile_request.tags:
+                filters.append({"terms": {"tags": search_user_profile_request.tags}})
             ids = self._opensearch.search_ids(
                 entity="profiles",
                 query_text=query_text,

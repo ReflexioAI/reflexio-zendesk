@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from psycopg2 import sql
+
 from reflexio.models.api_schema.common import BlockingIssue
 from reflexio.models.api_schema.retriever_schema import (
     SearchAgentPlaybookRequest,
@@ -119,6 +121,8 @@ class PlaybookMixin(SchemaScopedClient):
     _should_expand_documents: Any
     _expand_document: Any
     _parse_datetime_to_timestamp: Any
+    _fetch_all: Any
+    _table_identifier: Any
     search_mode: Any
     vector_weight: float
     fts_weight: float
@@ -175,12 +179,16 @@ class PlaybookMixin(SchemaScopedClient):
             status=Status(item["status"]) if item.get("status") else None,
             source=item.get("source"),
             source_interaction_ids=item.get("source_interaction_ids") or [],
+            expanded_terms=item.get("expanded_terms"),
+            tags=item.get("tags"),
             embedding=_parse_user_playbook_embedding(item.get("embedding"))
             if include_embedding
             else [],
             source_span=item.get("source_span"),
             notes=item.get("notes"),
             reader_angle=item.get("reader_angle"),
+            merged_into=item.get("merged_into"),
+            superseded_by=item.get("superseded_by"),
         )
 
     def _row_to_agent_playbook(self, item: dict[str, Any]) -> AgentPlaybook:
@@ -197,8 +205,12 @@ class PlaybookMixin(SchemaScopedClient):
             else None,
             playbook_status=item["playbook_status"],
             playbook_metadata=item.get("playbook_metadata") or "",
+            expanded_terms=item.get("expanded_terms"),
+            tags=item.get("tags"),
             embedding=[],
             status=Status(item["status"]) if item.get("status") else None,
+            merged_into=item.get("merged_into"),
+            superseded_by=item.get("superseded_by"),
         )
 
     # ==============================
@@ -256,10 +268,12 @@ class PlaybookMixin(SchemaScopedClient):
         user_id: str | None = None,
         playbook_name: str | None = None,
         agent_version: str | None = None,
-        status_filter: Sequence[Status | None] | None = None,
+        status_filter: list[Status | None] | None = None,
         start_time: int | None = None,
         end_time: int | None = None,
         include_embedding: bool = False,
+        tags: list[str] | None = None,
+        offset: int = 0,
     ) -> list[UserPlaybook]:
         """
         Get user playbooks from storage.
@@ -289,6 +303,7 @@ class PlaybookMixin(SchemaScopedClient):
             .select(columns)
             .order("created_at", desc=True)
             .limit(limit)
+            .offset(offset)
         )
 
         # Add user_id filter if specified
@@ -314,6 +329,8 @@ class PlaybookMixin(SchemaScopedClient):
         # Add status filter if specified
         if status_filter is not None:
             query = _apply_status_filter_to_query(query, status_filter)
+        if tags:
+            query = query.contains("tags", tags)
 
         response = query.execute()
         return [
@@ -328,7 +345,7 @@ class PlaybookMixin(SchemaScopedClient):
         playbook_name: str | None = None,
         min_user_playbook_id: int | None = None,
         agent_version: str | None = None,
-        status_filter: Sequence[Status | None] | None = None,
+        status_filter: list[Status | None] | None = None,
     ) -> int:
         """
         Count user playbooks in storage efficiently using SQL COUNT.
@@ -460,7 +477,9 @@ class PlaybookMixin(SchemaScopedClient):
             )
 
     @handle_exceptions
-    def delete_user_playbooks_by_ids(self, user_playbook_ids: Sequence[int]) -> int:
+    def delete_user_playbooks_by_ids(
+        self, user_playbook_ids: list[int], *, emit_hard_delete: bool = True
+    ) -> int:
         """
         Delete user playbooks by their IDs.
 
@@ -470,6 +489,7 @@ class PlaybookMixin(SchemaScopedClient):
         Returns:
             int: Number of user playbooks deleted
         """
+        _ = emit_hard_delete
         if not user_playbook_ids:
             return 0
         response = (
@@ -524,15 +544,19 @@ class PlaybookMixin(SchemaScopedClient):
         return [self._row_to_user_playbook(item) for item in _rows(response)]
 
     @handle_exceptions
-    def get_user_playbook_by_id(self, user_playbook_id: int) -> UserPlaybook | None:
+    def get_user_playbook_by_id(
+        self, user_playbook_id: int, *, include_tombstones: bool = False
+    ) -> UserPlaybook | None:
         response = (
             self._table("user_playbooks")
             .select(_USER_PLAYBOOK_COLUMNS)
             .eq("user_playbook_id", user_playbook_id)
             .limit(1)
-            .execute()
         )
-        rows = _rows(response)
+        if not include_tombstones:
+            response = _apply_status_filter_to_query(response, [None])
+        result = response.execute()
+        rows = _rows(result)
         return self._row_to_user_playbook(rows[0]) if rows else None
 
     @handle_exceptions
@@ -751,6 +775,18 @@ class PlaybookMixin(SchemaScopedClient):
                 terms = status_filter_terms(status_filter)
                 if terms is not None:
                     filters.append({"terms": {"status": terms}})
+                else:
+                    filters.append(
+                        {
+                            "bool": {
+                                "must_not": [
+                                    {"terms": {"status": ["merged", "superseded"]}}
+                                ]
+                            }
+                        }
+                    )
+                if request.tags:
+                    filters.append({"terms": {"tags": request.tags}})
                 ids = self._opensearch.search_ids(
                     entity="user_playbooks",
                     query_text=query,
@@ -904,8 +940,9 @@ class PlaybookMixin(SchemaScopedClient):
         limit: int = 100,
         playbook_name: str | None = None,
         agent_version: str | None = None,
-        status_filter: Sequence[Status | None] | None = None,
+        status_filter: list[Status | None] | None = None,
         playbook_status_filter: list[PlaybookStatus] | None = None,
+        tags: list[str] | None = None,
     ) -> list[AgentPlaybook]:
         """
         Get agent playbooks from storage.
@@ -966,19 +1003,25 @@ class PlaybookMixin(SchemaScopedClient):
                 for s in playbook_status_filter
             ]
             query = query.in_("playbook_status", status_values)
+        if tags:
+            query = query.contains("tags", tags)
 
         response = query.execute()
         return [self._row_to_agent_playbook(item) for item in _rows(response)]
 
     @handle_exceptions
-    def get_agent_playbook_by_id(self, agent_playbook_id: int) -> AgentPlaybook | None:
-        response = (
+    def get_agent_playbook_by_id(
+        self, agent_playbook_id: int, *, include_tombstones: bool = False
+    ) -> AgentPlaybook | None:
+        query = (
             self._table("agent_playbooks")
             .select(_AGENT_PLAYBOOK_COLUMNS)
             .eq("agent_playbook_id", agent_playbook_id)
             .limit(1)
-            .execute()
         )
+        if not include_tombstones:
+            query = _apply_status_filter_to_query(query, [None])
+        response = query.execute()
         rows = _rows(response)
         return self._row_to_agent_playbook(rows[0]) if rows else None
 
@@ -1034,7 +1077,9 @@ class PlaybookMixin(SchemaScopedClient):
             )
 
     @handle_exceptions
-    def delete_agent_playbooks_by_ids(self, agent_playbook_ids: Sequence[int]) -> None:
+    def delete_agent_playbooks_by_ids(
+        self, agent_playbook_ids: list[int], *, emit_hard_delete: bool = True
+    ) -> None:
         """
         Permanently delete agent playbooks by their IDs.
         No-op if agent_playbook_ids is empty.
@@ -1042,6 +1087,7 @@ class PlaybookMixin(SchemaScopedClient):
         Args:
             agent_playbook_ids (list[int]): List of agent playbook IDs to delete
         """
+        _ = emit_hard_delete
         if not agent_playbook_ids:
             return
         response = (
@@ -1326,6 +1372,119 @@ class PlaybookMixin(SchemaScopedClient):
         if self._opensearch:
             self._opensearch.index_rows("agent_playbooks", _rows(response))
 
+    def _supersede_rows_by_ids(
+        self,
+        *,
+        table: str,
+        pk: str,
+        entity_type: str,
+        ids: list[int],
+        request_id: str,
+        exclude_approved: bool = False,
+    ) -> int:
+        if not ids:
+            return 0
+        now = int(datetime.now(UTC).timestamp())
+        approved_guard = (
+            sql.SQL(" AND playbook_status <> %s") if exclude_approved else sql.SQL("")
+        )
+        params: list[Any] = [
+            Status.SUPERSEDED.value,
+            now,
+            ids,
+            Status.MERGED.value,
+            Status.SUPERSEDED.value,
+        ]
+        if exclude_approved:
+            params.append(PlaybookStatus.APPROVED.value)
+        rows = self._fetch_all(
+            sql.SQL(
+                "UPDATE {} SET status = %s, retired_at = %s "
+                "WHERE {} = ANY(%s) "
+                "AND (status IS NULL OR status NOT IN (%s, %s))"
+            )
+            .format(self._table_identifier(table), sql.Identifier(pk))
+            + approved_guard
+            + sql.SQL(" RETURNING {}").format(sql.Identifier(pk)),
+            params,
+        )
+        changed_ids = [int(row[pk]) for row in rows]
+        for changed_id in changed_ids:
+            self._fetch_all(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (
+                        org_id, entity_type, entity_id, op, prov_relation,
+                        source_ids, actor, request_id, reason, created_at,
+                        from_status, to_status, status_namespace
+                    )
+                    VALUES (%s, %s, %s, 'status_change', 'wasInvalidatedBy',
+                            '[]'::jsonb, 'system', %s, 'soft_supersede',
+                            %s, NULL, %s, 'lifecycle')
+                    ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
+                    DO NOTHING
+                    RETURNING 1
+                    """
+                ).format(self._table_identifier("lineage_event")),
+                [
+                    self.org_id,
+                    entity_type,
+                    str(changed_id),
+                    request_id,
+                    now,
+                    Status.SUPERSEDED.value,
+                ],
+            )
+        if changed_ids and self._opensearch:
+            response = (
+                self._table(table)
+                .select("*")
+                .in_(pk, changed_ids)
+                .execute()
+            )
+            self._opensearch.index_rows(table, _rows(response))
+        return len(changed_ids)
+
+    @handle_exceptions
+    def supersede_user_playbooks_by_ids(
+        self, user_playbook_ids: list[int], request_id: str
+    ) -> int:
+        return self._supersede_rows_by_ids(
+            table="user_playbooks",
+            pk="user_playbook_id",
+            entity_type="user_playbook",
+            ids=user_playbook_ids,
+            request_id=request_id,
+        )
+
+    @handle_exceptions
+    def supersede_agent_playbooks_by_ids(
+        self, agent_playbook_ids: list[int], request_id: str
+    ) -> int:
+        return self._supersede_rows_by_ids(
+            table="agent_playbooks",
+            pk="agent_playbook_id",
+            entity_type="agent_playbook",
+            ids=agent_playbook_ids,
+            request_id=request_id,
+            exclude_approved=True,
+        )
+
+    @handle_exceptions
+    def supersede_agent_playbooks_by_playbook_name(
+        self, playbook_name: str, agent_version: str | None, request_id: str
+    ) -> int:
+        query = (
+            self._table("agent_playbooks")
+            .select("agent_playbook_id")
+            .eq("playbook_name", playbook_name)
+            .eq("status", Status.ARCHIVED.value)
+        )
+        if agent_version is not None:
+            query = query.eq("agent_version", agent_version)
+        ids = [int(row["agent_playbook_id"]) for row in _rows(query.execute())]
+        return self.supersede_agent_playbooks_by_ids(ids, request_id)
+
     @handle_exceptions
     def delete_archived_agent_playbooks_by_playbook_name(
         self, playbook_name: str, agent_version: str | None = None
@@ -1398,6 +1557,16 @@ class PlaybookMixin(SchemaScopedClient):
                 terms = status_filter_terms(status_filter)
                 if terms is not None:
                     filters.append({"terms": {"status": terms}})
+                else:
+                    filters.append(
+                        {
+                            "bool": {
+                                "must_not": [
+                                    {"terms": {"status": ["merged", "superseded"]}}
+                                ]
+                            }
+                        }
+                    )
                 if playbook_status_filter is not None:
                     if isinstance(playbook_status_filter, list):
                         playbook_status_terms = [
@@ -1408,6 +1577,8 @@ class PlaybookMixin(SchemaScopedClient):
                     filters.append(
                         {"terms": {"playbook_status": playbook_status_terms}}
                     )
+                if request.tags:
+                    filters.append({"terms": {"tags": request.tags}})
                 ids = self._opensearch.search_ids(
                     entity="agent_playbooks",
                     query_text=query,
@@ -1539,6 +1710,33 @@ class PlaybookMixin(SchemaScopedClient):
             window.user_playbook_id
             for window in self.get_source_windows_for_agent_playbook(agent_playbook_id)
         ]
+
+    @handle_exceptions
+    def get_source_user_playbook_ids_for_agent_playbooks(
+        self, agent_playbook_ids: Sequence[int]
+    ) -> dict[int, list[int]]:
+        if not agent_playbook_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(int(agent_id) for agent_id in agent_playbook_ids))
+        response = (
+            self._table("agent_playbook_source_user_playbooks")
+            .select("agent_playbook_id, user_playbook_id")
+            .in_("agent_playbook_id", unique_ids)
+            .order("agent_playbook_id", desc=False)
+            .execute()
+        )
+        by_agent_id: dict[int, list[int]] = {agent_id: [] for agent_id in unique_ids}
+        seen_by_agent_id: dict[int, set[int]] = {
+            agent_id: set() for agent_id in unique_ids
+        }
+        for row in _rows(response):
+            agent_playbook_id = int(row["agent_playbook_id"])
+            user_playbook_id = int(row["user_playbook_id"])
+            seen = seen_by_agent_id.setdefault(agent_playbook_id, set())
+            if user_playbook_id not in seen:
+                by_agent_id.setdefault(agent_playbook_id, []).append(user_playbook_id)
+                seen.add(user_playbook_id)
+        return by_agent_id
 
     @handle_exceptions
     def set_source_windows_for_agent_playbook(

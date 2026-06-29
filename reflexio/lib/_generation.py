@@ -38,17 +38,28 @@ class GenerationMixin(ReflexioBase):
         """
         if not self._is_storage_configured():
             raise ValueError(STORAGE_NOT_CONFIGURED_MSG)
-        from reflexio.server.services.playbook.playbook_aggregator import (
+        from reflexio.server.services.playbook.components.aggregator import (
             PlaybookAggregator,
         )
         from reflexio.server.services.playbook.playbook_service_utils import (
             PlaybookAggregatorRequest,
         )
+        from reflexio.server.services.playbook.user_detail_stripping import (
+            create_aggregation_user_detail_stripper,
+        )
+
+        user_detail_stripper = create_aggregation_user_detail_stripper(
+            self.request_context.configurator
+        )
+        aggregator_kwargs = {}
+        if user_detail_stripper is not None:
+            aggregator_kwargs["user_detail_stripper"] = user_detail_stripper
 
         playbook_aggregator = PlaybookAggregator(
             llm_client=self.llm_client,
             request_context=self.request_context,
             agent_version=agent_version,
+            **aggregator_kwargs,
         )
         aggregator_request = PlaybookAggregatorRequest(
             agent_version=agent_version,
@@ -88,7 +99,7 @@ class GenerationMixin(ReflexioBase):
         Returns:
             RerunProfileGenerationResponse: Response containing success status, message, and count of profiles generated
         """
-        from reflexio.server.services.profile.profile_generation_service import (
+        from reflexio.server.services.profile.service import (
             ProfileGenerationService,
         )
 
@@ -113,7 +124,7 @@ class GenerationMixin(ReflexioBase):
         Returns:
             ManualProfileGenerationResponse: Response containing success status, message, and count of profiles generated
         """
-        from reflexio.server.services.profile.profile_generation_service import (
+        from reflexio.server.services.profile.service import (
             ProfileGenerationService,
         )
 
@@ -138,7 +149,7 @@ class GenerationMixin(ReflexioBase):
         Returns:
             RerunPlaybookGenerationResponse: Response containing success status, message, and count of playbooks generated
         """
-        from reflexio.server.services.playbook.playbook_generation_service import (
+        from reflexio.server.services.playbook.service import (
             PlaybookGenerationService,
         )
 
@@ -163,7 +174,7 @@ class GenerationMixin(ReflexioBase):
         Returns:
             ManualPlaybookGenerationResponse: Response containing success status, message, and count of playbooks generated
         """
-        from reflexio.server.services.playbook.playbook_generation_service import (
+        from reflexio.server.services.playbook.service import (
             PlaybookGenerationService,
         )
 

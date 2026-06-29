@@ -65,6 +65,8 @@ class ProfileView(BaseModel):
     status: Status | None = None
     extractor_names: list[str] | None = None
     source_span: str | None = None
+    source_interaction_ids: list[int] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
 
 
 class UserPlaybookView(BaseModel):
@@ -83,6 +85,7 @@ class UserPlaybookView(BaseModel):
     source: str | None = None
     source_interaction_ids: list[int] = Field(default_factory=list)
     source_span: str | None = None
+    tags: list[str] = Field(default_factory=list)
 
 
 class AgentPlaybookView(BaseModel):
@@ -98,12 +101,14 @@ class AgentPlaybookView(BaseModel):
     playbook_status: PlaybookStatus = PlaybookStatus.PENDING
     playbook_metadata: str = ""
     status: Status | None = None
+    tags: list[str] = Field(default_factory=list)
 
 
 class EvaluationResultView(BaseModel):
     """User-facing AgentSuccessEvaluationResult — excludes embedding."""
 
     result_id: int = 0
+    user_id: str = ""
     agent_version: str
     session_id: str
     is_success: bool
@@ -126,4 +131,3 @@ class ProfileChangeLogView(BaseModel):
     created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
     added_profiles: list[ProfileView]
     removed_profiles: list[ProfileView]
-    mentioned_profiles: list[ProfileView]

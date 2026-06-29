@@ -4,16 +4,17 @@ Unit tests for PlaybookAggregator private helpers and run() orchestration.
 Targets coverage gaps in:
 - _should_run_aggregation (reaggregation_trigger_count defaults, threshold logic)
 - _determine_cluster_changes (no previous clusters, fingerprint match/mismatch)
-- _build_change_log (empty changes, full archive, incremental with updates/removals)
 - _update_operation_state (empty list, normal update)
 - _get_playbook_aggregator_config (match, no match, no configs)
 - _compute_cluster_fingerprint (deterministic, order-independent)
 - run() (rerun mode, no user playbooks, incremental no changes, save exception,
-         change log exception, full archive delete path, incremental archive delete)
+         full archive delete path, incremental archive delete)
 """
 
+import logging
+import re
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -27,9 +28,11 @@ from reflexio.models.config_schema import (
     PlaybookAggregatorConfig,
     PlaybookConfig,
 )
-from reflexio.server.services.playbook.playbook_aggregator import PlaybookAggregator
+from reflexio.server.services.playbook.components.aggregator import PlaybookAggregator
 from reflexio.server.services.playbook.playbook_service_utils import (
+    PlaybookAggregationOutput,
     PlaybookAggregatorRequest,
+    StructuredPlaybookContent,
 )
 
 # ---------------------------------------------------------------------------
@@ -40,6 +43,7 @@ from reflexio.server.services.playbook.playbook_service_utils import (
 def _make_aggregator(
     storage: MagicMock | None = None,
     configurator: MagicMock | None = None,
+    user_detail_stripper: Any | None = None,
 ) -> Any:
     """Build an aggregator with fully mocked dependencies."""
     llm = MagicMock()
@@ -51,6 +55,7 @@ def _make_aggregator(
         llm_client=llm,
         request_context=ctx,
         agent_version="v1",
+        user_detail_stripper=user_detail_stripper,
     )
 
 
@@ -81,6 +86,380 @@ def _agent_playbook(
         content=content,
         playbook_status=PlaybookStatus.PENDING,
     )
+
+
+# ---------------------------------------------------------------------------
+# User detail stripping seam
+# ---------------------------------------------------------------------------
+
+
+class _MappingAwareStripper:
+    prompt_extra_instructions: str | None = None
+    _OUTPUT_MARKER_RE = re.compile(r"<<DETAIL_\d+>>")
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def strip_user_details(
+        self, text: str, shared_mapping: dict[str, int] | None = None
+    ) -> Any:
+        from reflexio.server.services.playbook.user_detail_stripping import (
+            StrippingResult,
+        )
+
+        assert shared_mapping is not None
+        if "Sarah" in text:
+            shared_mapping.setdefault("sarah", len(shared_mapping) + 1)
+            text = text.replace("Sarah", f"<<DETAIL_{shared_mapping['sarah']}>>")
+        if "Mike" in text:
+            shared_mapping.setdefault("mike", len(shared_mapping) + 1)
+            text = text.replace("Mike", f"<<DETAIL_{shared_mapping['mike']}>>")
+        if "sarah@acme.com" in text:
+            shared_mapping.setdefault("email", len(shared_mapping) + 1)
+            text = text.replace(
+                "sarah@acme.com", f"<<DETAIL_{shared_mapping['email']}>>"
+            )
+        if "555-1234" in text:
+            shared_mapping.setdefault("phone", len(shared_mapping) + 1)
+            text = text.replace("555-1234", f"<<DETAIL_{shared_mapping['phone']}>>")
+        self.calls.append((text, id(shared_mapping)))
+        return StrippingResult(text=text, detections=[])
+
+    def sanitize_aggregation_output_text(
+        self,
+        text: str | None,
+    ) -> tuple[str | None, int]:
+        if text is None:
+            return None, 0
+        marker_count = len(self._OUTPUT_MARKER_RE.findall(text))
+        return self._OUTPUT_MARKER_RE.sub("a user detail", text), marker_count
+
+
+def test_user_detail_stripping_protocol_types_importable():
+    from reflexio.server.services.playbook.user_detail_stripping import (
+        DetectedEntity,
+        PassthroughStripper,
+        StrippingResult,
+        create_aggregation_user_detail_stripper,
+        set_user_detail_stripper_factory,
+    )
+
+    result = PassthroughStripper().strip_user_details("keep this")
+    sanitized, sanitized_count = PassthroughStripper().sanitize_aggregation_output_text(
+        "keep this"
+    )
+    entity = DetectedEntity(
+        start=0,
+        end=4,
+        entity_type="USER_DETAIL",
+        replacement="<<DETAIL_1>>",
+        confidence=1.0,
+        source="test",
+    )
+
+    assert result == StrippingResult(text="keep this", detections=[])
+    assert sanitized == "keep this"
+    assert sanitized_count == 0
+    assert entity.start == 0
+    assert entity.end == 4
+    assert entity.replacement == "<<DETAIL_1>>"
+    assert create_aggregation_user_detail_stripper(object()) is None
+
+    set_user_detail_stripper_factory(lambda _configurator: PassthroughStripper())
+    try:
+        assert isinstance(
+            create_aggregation_user_detail_stripper(object()), PassthroughStripper
+        )
+    finally:
+        set_user_detail_stripper_factory(lambda _configurator: None)
+
+
+def test_user_detail_stripper_sanitizes_cluster_playbooks_but_not_existing_agent_playbooks():
+    stripper = _MappingAwareStripper()
+    agg = _make_aggregator(user_detail_stripper=stripper)
+    captured_messages: list[dict[str, str]] = []
+    captured_variables: dict[str, str] = {}
+
+    def render_prompt(_prompt_id: str, variables: dict[str, str]) -> str:
+        captured_variables.update(variables)
+        return (
+            f"{variables['user_playbooks']}\n\nEXISTING:\n"
+            f"{variables['existing_approved_playbooks']}"
+        )
+
+    agg.request_context.prompt_manager.render_prompt.side_effect = render_prompt
+    agg.client.generate_chat_response.side_effect = lambda messages, **_kwargs: (
+        captured_messages.extend(messages)
+        or PlaybookAggregationOutput(
+            playbook=StructuredPlaybookContent(
+                content="Keep the shared operational rule.",
+                trigger="When the shared workflow appears.",
+                rationale="The rule is common across users.",
+            )
+        )
+    )
+    clusters = {
+        0: [
+            UserPlaybook(
+                user_playbook_id=1,
+                agent_version="v1",
+                request_id="req-1",
+                playbook_name="test_fb",
+                content="Sarah prefers the safety checklist.",
+                trigger="When Sarah opens a ticket.",
+                rationale="Sarah missed one step.",
+            ),
+            UserPlaybook(
+                user_playbook_id=2,
+                agent_version="v1",
+                request_id="req-2",
+                playbook_name="test_fb",
+                content="Mike asks for the same checklist.",
+                trigger="When Mike opens a ticket.",
+                rationale="Mike missed the same step.",
+            ),
+        ]
+    }
+    existing = [
+        AgentPlaybook(
+            agent_playbook_id=7,
+            playbook_name="test_fb",
+            agent_version="v1",
+            content="Sarah already has a checklist playbook.",
+            playbook_status=PlaybookStatus.PENDING,
+        )
+    ]
+
+    with patch.dict("os.environ", {"MOCK_LLM_RESPONSE": ""}):
+        result = agg._generate_playbooks_with_source_clusters(clusters, existing)
+
+    assert len(result) == 1
+    rendered_prompt = captured_messages[0]["content"]
+    user_prompt = captured_variables["user_playbooks"]
+    existing_prompt = captured_variables["existing_approved_playbooks"]
+    assert "Sarah" not in user_prompt
+    assert "Mike" not in user_prompt
+    assert "<<DETAIL_1>>" in rendered_prompt
+    assert "<<DETAIL_2>>" in rendered_prompt
+    assert "Sarah already has a checklist playbook." in existing_prompt
+    assert len({mapping_id for _text, mapping_id in stripper.calls}) == 1
+    assert clusters[0][0].content == "Sarah prefers the safety checklist."
+    assert existing[0].content == "Sarah already has a checklist playbook."
+
+
+def test_user_detail_stripper_sanitizes_grouped_prompt_input():
+    stripper = _MappingAwareStripper()
+    agg = _make_aggregator(user_detail_stripper=stripper)
+    captured_prompts: list[str] = []
+
+    agg.request_context.prompt_manager.render_prompt.side_effect = (
+        lambda _prompt_id, variables: (
+            captured_prompts.append(variables["user_playbooks"])
+            or variables["user_playbooks"]
+        )
+    )
+    agg.client.generate_chat_response.return_value = PlaybookAggregationOutput(
+        playbook=StructuredPlaybookContent(
+            content="- Keep both unrelated operational rules.",
+            trigger="When either operational condition applies.",
+            rationale="The grouped prompt preserves both source groups.",
+        )
+    )
+    clusters = {
+        0: [
+            UserPlaybook(
+                user_playbook_id=1,
+                agent_version="v1",
+                request_id="req-1",
+                playbook_name="test_fb",
+                content="Sarah checks deployment readiness.",
+                trigger="When Sarah reviews deployment readiness.",
+                rationale="Sarah owns the deployment checklist.",
+            ),
+            UserPlaybook(
+                user_playbook_id=2,
+                agent_version="v1",
+                request_id="req-2",
+                playbook_name="test_fb",
+                content="Mike audits billing anomalies.",
+                trigger="When Mike reviews billing anomalies.",
+                rationale="Mike owns the billing review.",
+            ),
+        ]
+    }
+
+    with patch.dict("os.environ", {"MOCK_LLM_RESPONSE": ""}):
+        result = agg._generate_playbooks_with_source_clusters(clusters, [])
+
+    assert len(result) == 1
+    rendered_prompt = captured_prompts[0]
+    assert "Group 1" in rendered_prompt
+    assert "Sarah" not in rendered_prompt
+    assert "Mike" not in rendered_prompt
+    assert "<<DETAIL_1>>" in rendered_prompt
+    assert "<<DETAIL_2>>" in rendered_prompt
+
+
+def test_mock_llm_response_sanitizes_stripping_placeholders_before_storage():
+    stripper = _MappingAwareStripper()
+    agg = _make_aggregator(user_detail_stripper=stripper)
+    clusters = {
+        0: [
+            UserPlaybook(
+                user_playbook_id=1,
+                agent_version="v1",
+                request_id="req-1",
+                playbook_name="test_fb",
+                content="Sarah prefers the safety checklist for sarah@acme.com and 555-1234.",
+                trigger="When Sarah opens a ticket with 555-1234.",
+                rationale="Sarah missed one step for sarah@acme.com.",
+            )
+        ]
+    }
+
+    with patch.dict("os.environ", {"MOCK_LLM_RESPONSE": "true"}):
+        result = agg._generate_playbooks_with_source_clusters(clusters, [])
+
+    assert len(result) == 1
+    playbook, _sources = result[0]
+    assert "<<DETAIL_" not in playbook.content
+    assert "<<DETAIL_" not in (playbook.trigger or "")
+    assert "a user detail" in playbook.content
+
+
+def test_placeholder_leakage_is_replaced_before_response_logging_and_storage():
+    agg = _make_aggregator(user_detail_stripper=_MappingAwareStripper())
+    agg.request_context.prompt_manager.render_prompt.return_value = "prompt"
+    raw_response = PlaybookAggregationOutput(
+        playbook=StructuredPlaybookContent(
+            content="- Ask <<DETAIL_1>> to confirm via <<DETAIL_2>>.",
+            trigger="When <<DETAIL_3>> requests access.",
+            rationale="<<DETAIL_1>>, <<DETAIL_2>>, and <<DETAIL_3>> all hit this case.",
+        )
+    )
+    agg.client.generate_chat_response.return_value = raw_response
+    cluster = [_raw(rid=1)]
+
+    with (
+        patch(
+            "reflexio.server.services.playbook.components.aggregator.log_model_response"
+        ) as mock_log_model_response,
+        patch.dict("os.environ", {"MOCK_LLM_RESPONSE": ""}),
+    ):
+        result = agg._generate_playbook_from_cluster(cluster, "None")
+
+    assert result is not None
+    assert "<<DETAIL_" not in result.content
+    assert "<<DETAIL_" not in (result.trigger or "")
+    assert "<<DETAIL_" not in (result.rationale or "")
+    assert "a user detail" in result.content
+    assert "a user detail" in (result.trigger or "")
+    logged_response = mock_log_model_response.call_args.args[2]
+    assert isinstance(logged_response, PlaybookAggregationOutput)
+    assert logged_response.playbook is not None
+    assert "<<DETAIL_" not in (logged_response.playbook.content or "")
+    assert "<<DETAIL_" not in (logged_response.playbook.trigger or "")
+    assert "<<DETAIL_" not in (logged_response.playbook.rationale or "")
+
+
+def test_placeholder_leakage_is_replaced_before_string_fallback_logging():
+    agg = _make_aggregator(user_detail_stripper=_MappingAwareStripper())
+    agg.request_context.prompt_manager.render_prompt.return_value = "prompt"
+    agg.client.generate_chat_response.return_value = "invalid <<DETAIL_7>> response"
+    cluster = [_raw(rid=1)]
+
+    with (
+        patch(
+            "reflexio.server.services.playbook.components.aggregator.log_model_response"
+        ) as mock_log_model_response,
+        patch.dict("os.environ", {"MOCK_LLM_RESPONSE": ""}),
+    ):
+        result = agg._generate_playbook_from_cluster(cluster, "None")
+
+    assert result is None
+    logged_response = mock_log_model_response.call_args.args[2]
+    assert logged_response == "invalid a user detail response"
+
+
+def test_placeholder_leakage_is_replaced_before_dict_fallback_logging():
+    agg = _make_aggregator(user_detail_stripper=_MappingAwareStripper())
+    agg.request_context.prompt_manager.render_prompt.return_value = "prompt"
+    agg.client.generate_chat_response.return_value = {
+        "playbook": {
+            "content": "Ask <<DETAIL_1>> to confirm.",
+            "rationale": ["<<DETAIL_2>> saw this before."],
+        },
+        "<<DETAIL_3>>": "key should not leak either",
+    }
+    cluster = [_raw(rid=1)]
+
+    with (
+        patch(
+            "reflexio.server.services.playbook.components.aggregator.log_model_response"
+        ) as mock_log_model_response,
+        patch.dict("os.environ", {"MOCK_LLM_RESPONSE": ""}),
+    ):
+        result = agg._generate_playbook_from_cluster(cluster, "None")
+
+    assert result is None
+    logged_response = mock_log_model_response.call_args.args[2]
+    assert "<<DETAIL_" not in repr(logged_response)
+    assert "a user detail" in repr(logged_response)
+
+
+def test_placeholder_leakage_is_replaced_before_nested_sequence_logging():
+    agg = _make_aggregator(user_detail_stripper=_MappingAwareStripper())
+
+    sanitized, placeholder_count = agg._sanitize_aggregation_log_value(
+        (
+            "Ask <<DETAIL_1>> to confirm.",
+            ["Notify <<DETAIL_2>>.", {"owner": "<<DETAIL_3>>"}],
+        )
+    )
+
+    assert placeholder_count == 3
+    assert "<<DETAIL_" not in repr(sanitized)
+    assert "a user detail" in repr(sanitized)
+
+
+def test_placeholder_leakage_warning_does_not_write_usage_event(caplog):
+    agg = _make_aggregator()
+
+    with (
+        caplog.at_level(
+            logging.WARNING,
+            logger="reflexio.server.services.playbook.components.aggregator",
+        ),
+        patch(
+            "reflexio.server.services.playbook.components.aggregator.record_usage_event"
+        ) as mock_record_usage_event,
+    ):
+        agg._record_placeholder_leakage(3)
+
+    assert "Replaced 3 residual user-detail placeholders" in caplog.text
+    mock_record_usage_event.assert_not_called()
+
+
+def test_placeholder_leakage_is_replaced_before_exception_logging(caplog):
+    agg = _make_aggregator(user_detail_stripper=_MappingAwareStripper())
+    agg.request_context.prompt_manager.render_prompt.return_value = "prompt"
+    agg.client.generate_chat_response.side_effect = RuntimeError(
+        "failed after <<DETAIL_9>> appeared in parse error"
+    )
+    cluster = [_raw(rid=1)]
+
+    with (
+        caplog.at_level(
+            logging.ERROR,
+            logger="reflexio.server.services.playbook.components.aggregator",
+        ),
+        patch.dict("os.environ", {"MOCK_LLM_RESPONSE": ""}),
+    ):
+        result = agg._generate_playbook_from_cluster(cluster, "None")
+
+    assert result is None
+    assert "<<DETAIL_" not in caplog.text
+    assert "a user detail" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -335,204 +714,6 @@ class TestDetermineClusterChanges:
 
 
 # ---------------------------------------------------------------------------
-# _build_change_log
-# ---------------------------------------------------------------------------
-
-
-class TestBuildChangeLog:
-    def test_full_archive_empty_before_and_saved(self):
-        """Full archive with no previous or new playbooks."""
-        agg = _make_aggregator()
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=True,
-            before_playbooks_by_id={},
-            saved_playbooks=[],
-            archived_playbook_ids=[],
-            prev_fingerprints={},
-        )
-        assert log.run_mode == "full_archive"
-        assert log.added_agent_playbooks == []
-        assert log.removed_agent_playbooks == []
-        assert log.updated_agent_playbooks == []
-
-    def test_full_archive_all_new_clusters(self):
-        """Full archive: old playbooks are removed, new ones added."""
-        agg = _make_aggregator()
-        old_fb = _agent_playbook(fid=1, content="old")
-        new_fb = _agent_playbook(fid=2, content="new")
-
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=True,
-            before_playbooks_by_id={1: old_fb},
-            saved_playbooks=[new_fb],
-            archived_playbook_ids=[],
-            prev_fingerprints={},
-        )
-
-        assert len(log.removed_agent_playbooks) == 1
-        assert log.removed_agent_playbooks[0].agent_playbook_id == 1
-        assert len(log.added_agent_playbooks) == 1
-        assert log.added_agent_playbooks[0].agent_playbook_id == 2
-
-    def test_full_archive_filters_none_saved(self):
-        """None entries in saved_playbooks should be filtered out."""
-        agg = _make_aggregator()
-        fb = _agent_playbook(fid=3)
-
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=True,
-            before_playbooks_by_id={},
-            saved_playbooks=[None, fb, None],  # type: ignore[list-item]
-            archived_playbook_ids=[],
-            prev_fingerprints={},
-        )
-
-        assert len(log.added_agent_playbooks) == 1
-
-    def test_incremental_update_pairs_old_and_new(self):
-        """Incremental mode pairs archived old playbooks with saved new ones."""
-        agg = _make_aggregator()
-        old_fb = _agent_playbook(fid=10, content="old")
-        new_fb = _agent_playbook(fid=20, content="new")
-
-        prev_fps = {"fp1": {"agent_playbook_id": 10, "user_playbook_ids": [1]}}
-
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=False,
-            before_playbooks_by_id={10: old_fb},
-            saved_playbooks=[new_fb],
-            archived_playbook_ids=[10],
-            prev_fingerprints=prev_fps,
-        )
-
-        assert len(log.updated_agent_playbooks) == 1
-        assert log.updated_agent_playbooks[0].before.agent_playbook_id == 10
-        assert log.updated_agent_playbooks[0].after.agent_playbook_id == 20
-        assert log.added_agent_playbooks == []
-        assert log.removed_agent_playbooks == []
-
-    def test_incremental_unmatched_archived_becomes_removed(self):
-        """Archived playbook not paired with a new one should be a removal."""
-        agg = _make_aggregator()
-        old_fb = _agent_playbook(fid=10, content="old")
-
-        prev_fps = {"fp1": {"agent_playbook_id": 10, "user_playbook_ids": [1]}}
-
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=False,
-            before_playbooks_by_id={10: old_fb},
-            saved_playbooks=[],
-            archived_playbook_ids=[10],
-            prev_fingerprints=prev_fps,
-        )
-
-        assert len(log.removed_agent_playbooks) == 1
-        assert log.removed_agent_playbooks[0].agent_playbook_id == 10
-        assert log.updated_agent_playbooks == []
-        assert log.added_agent_playbooks == []
-
-    def test_incremental_saved_with_no_archived_becomes_added(self):
-        """Saved playbook with nothing archived -> addition."""
-        agg = _make_aggregator()
-        new_fb = _agent_playbook(fid=20, content="new")
-
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=False,
-            before_playbooks_by_id={},
-            saved_playbooks=[new_fb],
-            archived_playbook_ids=[],
-            prev_fingerprints={},
-        )
-
-        assert len(log.added_agent_playbooks) == 1
-        assert log.added_agent_playbooks[0].agent_playbook_id == 20
-
-    def test_incremental_filters_none_saved_playbooks(self):
-        """None entries in saved_playbooks should be skipped in incremental mode."""
-        agg = _make_aggregator()
-        new_fb = _agent_playbook(fid=20, content="new")
-
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=False,
-            before_playbooks_by_id={},
-            saved_playbooks=[None, new_fb],  # type: ignore[list-item]
-            archived_playbook_ids=[],
-            prev_fingerprints={},
-        )
-
-        assert len(log.added_agent_playbooks) == 1
-
-    def test_incremental_paired_old_id_not_in_before_becomes_added(self):
-        """If paired old_id exists but not in before_playbooks_by_id, treat as added."""
-        agg = _make_aggregator()
-        new_fb = _agent_playbook(fid=20, content="new")
-
-        prev_fps = {"fp1": {"agent_playbook_id": 10, "user_playbook_ids": [1]}}
-
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=False,
-            before_playbooks_by_id={},  # 10 not present
-            saved_playbooks=[new_fb],
-            archived_playbook_ids=[10],
-            prev_fingerprints=prev_fps,
-        )
-
-        assert len(log.added_agent_playbooks) == 1
-        assert log.added_agent_playbooks[0].agent_playbook_id == 20
-
-    def test_incremental_multiple_saved_skip_already_matched(self):
-        """Branch 349->348: second saved_fb skips already-matched old_id."""
-        agg = _make_aggregator()
-        old_fb1 = _agent_playbook(fid=10, content="old1")
-        old_fb2 = _agent_playbook(fid=11, content="old2")
-        new_fb1 = _agent_playbook(fid=20, content="new1")
-        new_fb2 = _agent_playbook(fid=21, content="new2")
-
-        prev_fps = {
-            "fp1": {"agent_playbook_id": 10, "user_playbook_ids": [1]},
-            "fp2": {"agent_playbook_id": 11, "user_playbook_ids": [2]},
-        }
-
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=False,
-            before_playbooks_by_id={10: old_fb1, 11: old_fb2},
-            saved_playbooks=[new_fb1, new_fb2],
-            archived_playbook_ids=[10, 11],
-            prev_fingerprints=prev_fps,
-        )
-
-        assert len(log.updated_agent_playbooks) == 2
-        assert log.added_agent_playbooks == []
-        assert log.removed_agent_playbooks == []
-
-    def test_incremental_archived_not_in_before_ignored(self):
-        """Archived id not present in before_playbooks_by_id should be ignored for removals."""
-        agg = _make_aggregator()
-
-        log = agg._build_change_log(
-            playbook_name="fb",
-            full_archive=False,
-            before_playbooks_by_id={},
-            saved_playbooks=[],
-            archived_playbook_ids=[999],
-            prev_fingerprints={
-                "fp1": {"agent_playbook_id": 999, "user_playbook_ids": [1]}
-            },
-        )
-
-        assert log.removed_agent_playbooks == []
-
-
-# ---------------------------------------------------------------------------
 # _get_playbook_aggregator_config
 # ---------------------------------------------------------------------------
 
@@ -600,7 +781,9 @@ class TestRun:
         agg.storage.count_user_playbooks.return_value = 5
         agg.storage.get_agent_playbooks.return_value = []
         agg.storage.get_user_playbooks.return_value = [_raw(rid=1), _raw(rid=2)]
-        agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=100)]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = (
+            _agent_playbook(fid=100)
+        )
         return agg
 
     def test_no_config_returns_early(self):
@@ -655,7 +838,9 @@ class TestRun:
         raws = [_raw(rid=1)]
         mock_clust.return_value = {0: raws}
         mock_gen.return_value = [(_agent_playbook(fid=100), raws)]
-        agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=100)]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = (
+            _agent_playbook(fid=100)
+        )
 
         req = PlaybookAggregatorRequest(agent_version="v1", rerun=True)
         agg.run(req)
@@ -670,24 +855,29 @@ class TestRun:
 
     @patch.object(PlaybookAggregator, "get_clusters")
     @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
-    def test_rerun_deletes_archived_playbooks_after_success(self, mock_gen, mock_clust):
-        """After successful rerun, delete_archived_agent_playbooks_by_playbook_name is called."""
+    def test_rerun_supersedes_archived_playbooks_after_success(
+        self, mock_gen, mock_clust
+    ):
+        """After successful rerun, supersede_agent_playbooks_by_playbook_name is called (always soft)."""
         agg = self._make_runnable_aggregator()
         raws = [_raw(rid=1)]
         mock_clust.return_value = {0: raws}
         mock_gen.return_value = [(_agent_playbook(fid=100), raws)]
-        agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=100)]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = (
+            _agent_playbook(fid=100)
+        )
 
         req = PlaybookAggregatorRequest(agent_version="v1", rerun=True)
         agg.run(req)
 
-        agg.storage.delete_archived_agent_playbooks_by_playbook_name.assert_has_calls(
+        agg.storage.supersede_agent_playbooks_by_playbook_name.assert_has_calls(
             [
-                call(SINGLETON_USER_PLAYBOOK_NAME, agent_version="v1"),
-                call("test_fb", agent_version="v1"),
+                call(SINGLETON_USER_PLAYBOOK_NAME, agent_version="v1", request_id=ANY),
+                call("test_fb", agent_version="v1", request_id=ANY),
             ],
             any_order=True,
         )
+        agg.storage.delete_archived_agent_playbooks_by_playbook_name.assert_not_called()
 
     @patch.object(PlaybookAggregator, "get_clusters")
     @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
@@ -697,7 +887,9 @@ class TestRun:
         raws = [_raw(rid=1), _raw(rid=2)]
         mock_clust.return_value = {0: raws}
         mock_gen.return_value = [(_agent_playbook(fid=100), raws)]
-        agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=100)]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = (
+            _agent_playbook(fid=100)
+        )
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
@@ -728,19 +920,51 @@ class TestRun:
             req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
-        # Should NOT call _generate_playbooks_from_clusters
-        agg.storage.save_agent_playbooks.assert_not_called()
+        # Should NOT call save_agent_playbook_with_aggregate_event
+        agg.storage.save_agent_playbook_with_aggregate_event.assert_not_called()
 
     @patch.object(PlaybookAggregator, "get_clusters")
     @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
-    def test_incremental_with_changes_archives_selectively(self, mock_gen, mock_clust):
-        """Incremental mode with changed clusters archives only affected playbook_ids."""
+    def test_incremental_with_changes_supersedes_selectively(
+        self, mock_gen, mock_clust
+    ):
+        """Incremental mode with changed clusters soft-supersedes affected playbook_ids (always soft)."""
         agg = self._make_runnable_aggregator()
         raws_new = [_raw(rid=5), _raw(rid=6)]
         agg.storage.get_user_playbooks.return_value = raws_new
         mock_clust.return_value = {0: raws_new}
         mock_gen.return_value = [(_agent_playbook(fid=200), raws_new)]
-        agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=200)]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = (
+            _agent_playbook(fid=200)
+        )
+
+        with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
+            mgr = MagicMock()
+            mgr.get_cluster_fingerprints.return_value = {
+                "old_fp": {"agent_playbook_id": 50, "user_playbook_ids": [5]}
+            }
+            mock_csm.return_value = mgr
+
+            req = PlaybookAggregatorRequest(agent_version="v1")
+            agg.run(req)
+
+        agg.storage.archive_agent_playbooks_by_ids.assert_not_called()
+        agg.storage.supersede_agent_playbooks_by_ids.assert_called_once_with(
+            [50], request_id=ANY
+        )
+        agg.storage.delete_agent_playbooks_by_ids.assert_not_called()
+
+    @patch.object(PlaybookAggregator, "get_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
+    def test_incremental_null_generation_preserves_existing_playbooks(
+        self, mock_gen, mock_clust
+    ):
+        """Incremental mode preserves existing playbooks when LLM produces no replacement."""
+        agg = self._make_runnable_aggregator()
+        raws_new = [_raw(rid=5), _raw(rid=6)]
+        agg.storage.get_user_playbooks.return_value = raws_new
+        mock_clust.return_value = {0: raws_new}
+        mock_gen.return_value = []
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
@@ -752,8 +976,102 @@ class TestRun:
             req = PlaybookAggregatorRequest(agent_version="v1")
             agg.run(req)
 
-        agg.storage.archive_agent_playbooks_by_ids.assert_called_once_with([50])
-        agg.storage.delete_agent_playbooks_by_ids.assert_called_once_with([50])
+        agg.storage.archive_agent_playbooks_by_ids.assert_not_called()
+        agg.storage.supersede_agent_playbooks_by_ids.assert_not_called()
+        agg.storage.delete_agent_playbooks_by_ids.assert_not_called()
+
+    @patch.object(PlaybookAggregator, "get_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
+    def test_incremental_mixed_generation_supersedes_only_replaced_cluster(
+        self, mock_gen, mock_clust
+    ):
+        """A null changed cluster keeps its old playbook when a sibling generates."""
+        agg = self._make_runnable_aggregator()
+        null_cluster = [_raw(rid=1), _raw(rid=2), _raw(rid=5)]
+        generated_cluster = [_raw(rid=3), _raw(rid=4), _raw(rid=6)]
+        agg.storage.get_user_playbooks.return_value = null_cluster + generated_cluster
+        mock_clust.return_value = {0: null_cluster, 1: generated_cluster}
+        generated = _agent_playbook(fid=200)
+        generated.agent_playbook_id = 200
+        mock_gen.return_value = [(generated, generated_cluster)]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = generated
+        fp_null_old = PlaybookAggregator._compute_cluster_fingerprint(
+            [_raw(rid=1), _raw(rid=2)]
+        )
+        fp_generated_old = PlaybookAggregator._compute_cluster_fingerprint(
+            [_raw(rid=3), _raw(rid=4)]
+        )
+        fp_generated_new = PlaybookAggregator._compute_cluster_fingerprint(
+            generated_cluster
+        )
+
+        with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
+            mgr = MagicMock()
+            mgr.get_cluster_fingerprints.return_value = {
+                fp_null_old: {"agent_playbook_id": 50, "user_playbook_ids": [1, 2]},
+                fp_generated_old: {
+                    "agent_playbook_id": 60,
+                    "user_playbook_ids": [3, 4],
+                },
+            }
+            mock_csm.return_value = mgr
+
+            req = PlaybookAggregatorRequest(agent_version="v1")
+            agg.run(req)
+
+        agg.storage.supersede_agent_playbooks_by_ids.assert_called_once_with(
+            [60], request_id=ANY
+        )
+        call_kwargs = mgr.update_cluster_fingerprints.call_args
+        new_fps = call_kwargs.kwargs.get("fingerprints") or call_kwargs[1].get(
+            "fingerprints"
+        )
+        assert new_fps[fp_null_old]["agent_playbook_id"] == 50
+        assert new_fps[fp_generated_new]["agent_playbook_id"] == 200
+        assert fp_generated_old not in new_fps
+
+    @patch.object(PlaybookAggregator, "get_clusters")
+    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
+    def test_incremental_split_cluster_preserves_shared_prior_until_all_replaced(
+        self, mock_gen, mock_clust
+    ):
+        """A split cluster keeps the old playbook while any split branch is null."""
+        agg = self._make_runnable_aggregator()
+        null_cluster = [_raw(rid=1), _raw(rid=2), _raw(rid=5)]
+        generated_cluster = [_raw(rid=3), _raw(rid=4), _raw(rid=6)]
+        agg.storage.get_user_playbooks.return_value = null_cluster + generated_cluster
+        mock_clust.return_value = {0: null_cluster, 1: generated_cluster}
+        generated = _agent_playbook(fid=200)
+        generated.agent_playbook_id = 200
+        mock_gen.return_value = [(generated, generated_cluster)]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = generated
+        fp_old = PlaybookAggregator._compute_cluster_fingerprint(
+            [_raw(rid=1), _raw(rid=2), _raw(rid=3), _raw(rid=4)]
+        )
+        fp_generated_new = PlaybookAggregator._compute_cluster_fingerprint(
+            generated_cluster
+        )
+
+        with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
+            mgr = MagicMock()
+            mgr.get_cluster_fingerprints.return_value = {
+                fp_old: {
+                    "agent_playbook_id": 50,
+                    "user_playbook_ids": [1, 2, 3, 4],
+                },
+            }
+            mock_csm.return_value = mgr
+
+            req = PlaybookAggregatorRequest(agent_version="v1")
+            agg.run(req)
+
+        agg.storage.supersede_agent_playbooks_by_ids.assert_not_called()
+        call_kwargs = mgr.update_cluster_fingerprints.call_args
+        new_fps = call_kwargs.kwargs.get("fingerprints") or call_kwargs[1].get(
+            "fingerprints"
+        )
+        assert new_fps[fp_old]["agent_playbook_id"] == 50
+        assert new_fps[fp_generated_new]["agent_playbook_id"] == 200
 
     @patch.object(PlaybookAggregator, "get_clusters")
     @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
@@ -798,27 +1116,6 @@ class TestRun:
 
     @patch.object(PlaybookAggregator, "get_clusters")
     @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
-    def test_change_log_exception_is_caught(self, mock_gen, mock_clust):
-        """Exception in add_playbook_aggregation_change_log should be caught, not raised."""
-        agg = self._make_runnable_aggregator()
-        raws = [_raw(rid=1)]
-        mock_clust.return_value = {0: raws}
-        mock_gen.return_value = [(_agent_playbook(fid=100), raws)]
-        agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=100)]
-        agg.storage.add_playbook_aggregation_change_log.side_effect = RuntimeError(
-            "DB down"
-        )
-
-        req = PlaybookAggregatorRequest(agent_version="v1", rerun=True)
-
-        # Should NOT raise
-        agg.run(req)
-
-        # Despite the exception, delete should still proceed
-        agg.storage.delete_archived_agent_playbooks_by_playbook_name.assert_called()
-
-    @patch.object(PlaybookAggregator, "get_clusters")
-    @patch.object(PlaybookAggregator, "_generate_playbooks_with_source_clusters")
     def test_run_fingerprint_state_updated(self, mock_gen, mock_clust):
         """Fingerprint state should be updated after a successful run."""
         agg = self._make_runnable_aggregator()
@@ -827,7 +1124,7 @@ class TestRun:
         saved = _agent_playbook(fid=100)
         saved.agent_playbook_id = 100
         mock_gen.return_value = [(saved, raws)]
-        agg.storage.save_agent_playbooks.return_value = [saved]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = saved
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
@@ -859,7 +1156,9 @@ class TestRun:
         agg.storage.get_user_playbooks.return_value = raws_new
         mock_clust.return_value = {0: raws_new}
         mock_gen.return_value = [(_agent_playbook(fid=200), raws_new)]
-        agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=200)]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = (
+            _agent_playbook(fid=200)
+        )
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
@@ -891,7 +1190,7 @@ class TestRun:
         fb_no_id = _agent_playbook(fid=0, content="no id")
         fb_no_id.agent_playbook_id = 0
         mock_gen.return_value = [(fb_no_id, raws)]
-        agg.storage.save_agent_playbooks.return_value = [fb_no_id]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = fb_no_id
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
@@ -948,7 +1247,6 @@ class TestRun:
         raws = [_raw(rid=1)]
         mock_clust.return_value = {0: raws}
         mock_gen.return_value = []
-        agg.storage.save_agent_playbooks.return_value = [None]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
@@ -974,7 +1272,7 @@ class TestRun:
         fb2 = _agent_playbook(fid=200, content="b")
         fb2.agent_playbook_id = 200
         mock_gen.return_value = [(fb1, raws_a), (fb2, raws_b)]
-        agg.storage.save_agent_playbooks.return_value = [fb1, fb2]
+        agg.storage.save_agent_playbook_with_aggregate_event.side_effect = [fb1, fb2]
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
@@ -1011,7 +1309,7 @@ class TestRun:
         saved = _agent_playbook(fid=200, content="b")
         saved.agent_playbook_id = 200
         mock_gen.return_value = [(saved, generated_cluster)]
-        agg.storage.save_agent_playbooks.return_value = [saved]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = saved
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
@@ -1051,7 +1349,9 @@ class TestRun:
         agg.storage.get_user_playbooks.return_value = all_raws
         mock_clust.return_value = {0: raws_unchanged, 1: raws_new}
         mock_gen.return_value = [(_agent_playbook(fid=200), raws_new)]
-        agg.storage.save_agent_playbooks.return_value = [_agent_playbook(fid=200)]
+        agg.storage.save_agent_playbook_with_aggregate_event.return_value = (
+            _agent_playbook(fid=200)
+        )
 
         with patch.object(PlaybookAggregator, "_create_state_manager") as mock_csm:
             mgr = MagicMock()
@@ -1377,6 +1677,7 @@ def test_playbook_aggregation_prompt_specifies_structured_format():
         variables={
             "user_playbooks": '[1]\nContent: "x"\nTrigger: "y"',
             "existing_approved_playbooks": "(none)",
+            "aggregation_prompt_extra_instructions": "",
         },
     )
     # The Playbook format section must be present.
@@ -1389,6 +1690,131 @@ def test_playbook_aggregation_prompt_specifies_structured_format():
     assert "- Ask for CLI preference" in out
     # Rationale guidance — one sentence WHY.
     assert "one sentence" in out.lower()
+
+
+def test_playbook_aggregation_prompt_generalizes_direct_identifiers():
+    """Aggregation prompt should generalize direct identifiers for shared playbooks."""
+    from reflexio.server.prompt.prompt_manager import PromptManager
+
+    out = PromptManager().render_prompt(
+        "playbook_aggregation",
+        {
+            "existing_approved_playbooks": "[]",
+            "user_playbooks": "TRIGGER conditions (to be consolidated):\n- when approving a deployment\nRATIONALE summaries:\n- direct approval details appeared in the source",
+            "aggregation_prompt_extra_instructions": "",
+        },
+    )
+
+    assert "Privacy and Identifier Generalization" in out
+    assert "shared organization-wide rules" in out
+    assert "all source fields shown to you" in out
+    assert "triggers, rationales, and any freeform content" in out
+    assert "Never carry user-specific or source-specific direct identifiers" in out
+    assert "Secrets and credentials must not be copied" in out
+    assert 'Return {"playbook": null}' in out
+
+
+def test_playbook_aggregation_prompt_does_not_add_stripping_guidance_by_default():
+    """Default OSS prompt should stay generic because OSS does not create markers."""
+    from reflexio.server.prompt.prompt_manager import PromptManager
+
+    out = PromptManager().render_prompt(
+        "playbook_aggregation",
+        {
+            "existing_approved_playbooks": "[]",
+            "user_playbooks": "TRIGGER conditions:\n- When direct identifiers appear in source notes",
+            "aggregation_prompt_extra_instructions": "",
+        },
+    )
+
+    assert "behavior.\n\n- Preserve the reusable procedure" in out
+
+
+def test_aggregation_prompt_extra_instructions_render_before_next_bullet():
+    from reflexio.server.prompt.prompt_manager import PromptManager
+
+    out = PromptManager().render_prompt(
+        "playbook_aggregation",
+        {
+            "existing_approved_playbooks": "[]",
+            "user_playbooks": "sample",
+            "aggregation_prompt_extra_instructions": (
+                "Extra guidance without trailing newline"
+            ),
+        },
+    )
+
+    assert (
+        "Extra guidance without trailing newline\n- Preserve the reusable procedure"
+        in out
+    )
+    assert "newline- Preserve the reusable procedure" not in out
+
+
+def test_aggregation_prompt_extra_instructions_are_rendered_when_injected():
+    class StripperWithPromptInstructions(_MappingAwareStripper):
+        prompt_extra_instructions = (
+            "Anonymized markers from this stripper represent user details."
+        )
+
+    agg = _make_aggregator(user_detail_stripper=StripperWithPromptInstructions())
+    captured_variables: dict[str, str] = {}
+
+    def render_prompt(_prompt_id: str, variables: dict[str, str]) -> str:
+        captured_variables.update(variables)
+        return variables["aggregation_prompt_extra_instructions"]
+
+    agg.request_context.prompt_manager.render_prompt.side_effect = render_prompt
+    agg.client.generate_chat_response.return_value = PlaybookAggregationOutput(
+        playbook=StructuredPlaybookContent(
+            content="Use generalized roles.",
+            trigger="When access support is needed.",
+        )
+    )
+
+    with patch.dict("os.environ", {"MOCK_LLM_RESPONSE": ""}):
+        result = agg._generate_playbook_from_cluster([_raw(rid=1)], "None")
+
+    assert result is not None
+    assert captured_variables["aggregation_prompt_extra_instructions"].startswith(
+        "Anonymized markers"
+    )
+
+
+def test_aggregation_prompt_extra_instructions_ignore_non_string_values():
+    class StripperWithInvalidPromptInstructions(_MappingAwareStripper):
+        prompt_extra_instructions: Any = object()
+
+    agg = _make_aggregator(user_detail_stripper=StripperWithInvalidPromptInstructions())
+
+    assert agg.aggregation_prompt_extra_instructions == ""
+
+
+def test_playbook_aggregation_prompt_has_privacy_self_check_before_output():
+    """Privacy checklist should run after source sections and before final JSON output."""
+    from reflexio.server.prompt.prompt_manager import PromptManager
+
+    out = PromptManager().render_prompt(
+        "playbook_aggregation",
+        {
+            "existing_approved_playbooks": "[]",
+            "user_playbooks": "TRIGGER conditions (to be consolidated):\n- when handling account access",
+            "aggregation_prompt_extra_instructions": "",
+        },
+    )
+
+    checklist_index = out.index("Before returning JSON")
+    output_index = out.index("## Output")
+    assert checklist_index < output_index
+    assert "`trigger`, `content`, and `rationale`" in out[checklist_index:output_index]
+    assert (
+        "direct identifiers, secrets, raw contact details, or exact IDs"
+        in out[checklist_index:output_index]
+    )
+    assert (
+        "grounded in the clustered source playbooks"
+        in out[checklist_index:output_index]
+    )
 
 
 def test_playbook_aggregation_prompt_preserves_distinct_orientations():
@@ -1407,6 +1833,7 @@ def test_playbook_aggregation_prompt_preserves_distinct_orientations():
         variables={
             "user_playbooks": '[1]\nContent: "x"\nTrigger: "y"',
             "existing_approved_playbooks": "(none)",
+            "aggregation_prompt_extra_instructions": "",
         },
     )
     # The preserve-distinct-orientations instruction must be present.

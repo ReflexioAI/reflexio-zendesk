@@ -1,8 +1,12 @@
 """Tests for ReflectionDecision and ReflectionResult schema shape."""
 
+import pytest
+from pydantic import ValidationError
+
 from reflexio.server.services.reflection.reflection_service_utils import (
     ReflectionDecision,
     ReflectionResult,
+    ReflectionServiceRequest,
 )
 
 
@@ -53,3 +57,41 @@ def test_reflection_result_no_replaced_count_field():
     # The old replaced_count field was renamed/folded into revised_count.
     fields = ReflectionResult.model_fields
     assert "replaced_count" not in fields
+
+
+def test_reflection_service_request_default_request_id_is_unique():
+    """Two requests constructed without an explicit request_id must differ.
+
+    The 5-col idempotency key for lineage events is (org, profile, op, request_id,
+    ...). A fixed empty-string default meant two reflection passes on the same
+    profile with no explicit request_id produced the SAME key, silently dropping
+    the second revise event via INSERT OR IGNORE. The default_factory ensures each
+    construction yields a distinct hex string.
+    """
+    r1 = ReflectionServiceRequest(user_id="u1")
+    r2 = ReflectionServiceRequest(user_id="u1")
+    assert r1.request_id != ""
+    assert r2.request_id != ""
+    assert r1.request_id != r2.request_id
+
+
+@pytest.mark.parametrize("bad_id", ["", "   "])
+def test_reflection_service_request_rejects_empty_request_id(bad_id):
+    """ReflectionServiceRequest rejects empty and whitespace-only request_id at construction.
+
+    The NonEmptyStr type on request_id ensures an empty string is caught before
+    any storage write, closing the orphan-on-empty path (F001).
+    """
+    with pytest.raises(ValidationError):
+        ReflectionServiceRequest(user_id="u1", request_id=bad_id)
+
+
+def test_reflection_service_request_default_factory_yields_nonempty():
+    """Omitting request_id uses the default_factory and always yields a non-empty UUID hex.
+
+    The default_factory composes correctly with NonEmptyStr: uuid4().hex is never
+    empty, so construction without an explicit request_id always succeeds.
+    """
+    req = ReflectionServiceRequest(user_id="u1")
+    assert req.request_id  # truthy — not empty, not whitespace
+    assert len(req.request_id) == 32  # uuid4().hex is always 32 chars

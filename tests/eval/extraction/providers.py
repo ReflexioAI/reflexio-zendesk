@@ -41,12 +41,12 @@ from typing import TYPE_CHECKING
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.models.api_schema.service_schemas import Interaction, Request
 from reflexio.models.config_schema import PlaybookConfig, ProfileExtractorConfig
-from reflexio.server.services.playbook.playbook_extractor import PlaybookExtractor
-from reflexio.server.services.playbook.playbook_generation_service import (
+from reflexio.server.services.playbook.components.extractor import PlaybookExtractor
+from reflexio.server.services.playbook.service import (
     PlaybookGenerationServiceConfig,
 )
-from reflexio.server.services.profile.profile_extractor import ProfileExtractor
-from reflexio.server.services.profile.profile_generation_service import (
+from reflexio.server.services.profile.components.extractor import ProfileExtractor
+from reflexio.server.services.profile.service import (
     ProfileGenerationServiceConfig,
 )
 
@@ -194,6 +194,11 @@ def make_extraction_provider(
             raw_profiles=raw_profiles,
             user_id=_EVAL_USER_ID,
             request_id=_EVAL_REQUEST_ID,
+            source_interaction_ids=[
+                interaction.interaction_id
+                for interaction in ridm.interactions
+                if interaction.interaction_id
+            ],
         )
         return (profiles, playbooks)
 

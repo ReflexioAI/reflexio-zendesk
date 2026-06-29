@@ -6,6 +6,7 @@ from typing import Any
 from reflexio.models.api_schema.internal_schema import (
     RequestInteractionDataModel,
     SessionDescriptor,
+    SessionFirstRequest,
 )
 from reflexio.models.api_schema.service_schemas import (
     Request,
@@ -14,6 +15,7 @@ from reflexio.models.api_schema.service_schemas import (
 from ._base import (
     SQLiteStorageBase,
     _epoch_to_iso,
+    _iso_to_epoch,
     _row_to_interaction,
     _row_to_request,
 )
@@ -260,3 +262,76 @@ class RequestMixin:
             )
             for r in rows
         ]
+
+    @SQLiteStorageBase.handle_exceptions
+    def get_first_requests_by_session_ids(
+        self, session_ids: list[str]
+    ) -> dict[str, SessionFirstRequest]:
+        if not session_ids:
+            return {}
+        out: dict[str, SessionFirstRequest] = {}
+        ids = sorted(set(session_ids))
+        chunk_size = 500
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i : i + chunk_size]
+            ph = ",".join("?" for _ in chunk)
+            rows = self._fetchall(
+                f"""SELECT session_id, user_id, source, created_at
+                    FROM (
+                        SELECT session_id, user_id, source, created_at,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY session_id
+                                   ORDER BY created_at ASC, request_id ASC
+                               ) AS rn
+                        FROM requests
+                        WHERE session_id IN ({ph})
+                    )
+                    WHERE rn = 1""",  # noqa: S608
+                chunk,
+            )
+            for row in rows:
+                session_id = row["session_id"]
+                out[session_id] = SessionFirstRequest(
+                    session_id=session_id,
+                    user_id=row["user_id"],
+                    source=row["source"] or "",
+                    created_at=_iso_to_epoch(row["created_at"]),
+                )
+        return out
+
+    @SQLiteStorageBase.handle_exceptions
+    def get_first_requests_by_user_session_pairs(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], SessionFirstRequest]:
+        if not pairs:
+            return {}
+        out: dict[tuple[str, str], SessionFirstRequest] = {}
+        pair_list = sorted(set(pairs))
+        chunk_size = 300
+        for i in range(0, len(pair_list), chunk_size):
+            chunk = pair_list[i : i + chunk_size]
+            values = ",".join("(?, ?)" for _ in chunk)
+            params = [value for pair in chunk for value in pair]
+            rows = self._fetchall(
+                f"""SELECT session_id, user_id, source, created_at
+                    FROM (
+                        SELECT session_id, user_id, source, created_at,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY user_id, session_id
+                                   ORDER BY created_at ASC, request_id ASC
+                               ) AS rn
+                        FROM requests
+                        WHERE (user_id, session_id) IN ({values})
+                    )
+                    WHERE rn = 1""",  # noqa: S608
+                params,
+            )
+            for row in rows:
+                key = (row["user_id"], row["session_id"])
+                out[key] = SessionFirstRequest(
+                    session_id=row["session_id"],
+                    user_id=row["user_id"],
+                    source=row["source"] or "",
+                    created_at=_iso_to_epoch(row["created_at"]),
+                )
+        return out

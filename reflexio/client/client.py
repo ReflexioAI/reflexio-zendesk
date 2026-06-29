@@ -12,6 +12,7 @@ from urllib.parse import urljoin
 
 import aiohttp
 import requests
+from pydantic import ConfigDict
 
 from reflexio.defaults import DEFAULT_AGENT_VERSION
 from reflexio.models.api_schema.retriever_schema import (
@@ -118,6 +119,11 @@ from reflexio.models.api_schema.stall_state_schema import (
 from reflexio.models.config_schema import Config
 
 from .cache import InMemoryCache
+
+
+class _ClientConfigPayload(Config):
+    model_config = ConfigDict(extra="allow")
+
 
 T = TypeVar("T")
 
@@ -535,6 +541,7 @@ class ReflexioClient:
         source: str | None = None,
         custom_feature: str | None = None,
         extractor_name: str | None = None,
+        tags: list[str] | None = None,
         threshold: float | None = None,
         enable_reformulation: bool | None = None,
         search_mode: SearchMode | None = None,
@@ -552,6 +559,7 @@ class ReflexioClient:
             source (Optional[str]): Filter by source
             custom_feature (Optional[str]): Filter by custom feature
             extractor_name (Optional[str]): Deprecated compatibility field. Accepted but ignored.
+            tags (Optional[list[str]]): Match profiles having any of these tags.
             threshold (Optional[float]): Similarity threshold (default: 0.7)
             enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
 
@@ -570,6 +578,7 @@ class ReflexioClient:
             source=source,
             custom_feature=custom_feature,
             extractor_name=extractor_name,
+            tags=tags,
             threshold=threshold,
             enable_reformulation=enable_reformulation,
             search_mode=search_mode,
@@ -593,6 +602,7 @@ class ReflexioClient:
         source: str | None = None,
         custom_feature: str | None = None,
         extractor_name: str | None = None,
+        tags: list[str] | None = None,
         threshold: float | None = None,
         enable_reformulation: bool | None = None,
         search_mode: SearchMode | None = None,
@@ -615,6 +625,7 @@ class ReflexioClient:
             source=source,
             custom_feature=custom_feature,
             extractor_name=extractor_name,
+            tags=tags,
             threshold=threshold,
             enable_reformulation=enable_reformulation,
             search_mode=search_mode,
@@ -691,6 +702,7 @@ class ReflexioClient:
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         status_filter: list[Status | None] | None = None,
+        tags: list[str] | None = None,
         top_k: int | None = None,
         threshold: float | None = None,
         enable_reformulation: bool | None = None,
@@ -707,6 +719,7 @@ class ReflexioClient:
             start_time (Optional[datetime]): Start time for created_at filter
             end_time (Optional[datetime]): End time for created_at filter
             status_filter (Optional[list[Optional[Status]]]): Filter by status (None for CURRENT, PENDING, ARCHIVED)
+            tags (Optional[list[str]]): Match playbooks having any of these tags.
             top_k (Optional[int]): Maximum number of results to return (default: 10)
             threshold (Optional[float]): Similarity threshold for vector search (default: 0.4)
             enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
@@ -724,6 +737,7 @@ class ReflexioClient:
             start_time=start_time,
             end_time=end_time,
             status_filter=status_filter,
+            tags=tags,
             top_k=top_k,
             threshold=threshold,
             enable_reformulation=enable_reformulation,
@@ -745,6 +759,7 @@ class ReflexioClient:
         end_time: datetime | None = None,
         status_filter: list[Status | None] | None = None,
         playbook_status_filter: PlaybookStatus | None = None,
+        tags: list[str] | None = None,
         top_k: int | None = None,
         threshold: float | None = None,
         enable_reformulation: bool | None = None,
@@ -761,6 +776,7 @@ class ReflexioClient:
             end_time (Optional[datetime]): End time for created_at filter
             status_filter (Optional[list[Optional[Status]]]): Filter by status (None for CURRENT, PENDING, ARCHIVED)
             playbook_status_filter (Optional[PlaybookStatus]): Filter by playbook status (PENDING, APPROVED, REJECTED)
+            tags (Optional[list[str]]): Match playbooks having any of these tags.
             top_k (Optional[int]): Maximum number of results to return (default: 10)
             threshold (Optional[float]): Similarity threshold for vector search (default: 0.4)
             enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
@@ -778,6 +794,7 @@ class ReflexioClient:
             end_time=end_time,
             status_filter=status_filter,
             playbook_status_filter=playbook_status_filter,
+            tags=tags,
             top_k=top_k,
             threshold=threshold,
             enable_reformulation=enable_reformulation,
@@ -1141,6 +1158,7 @@ class ReflexioClient:
         end_time: datetime | None = None,
         top_k: int | None = None,
         status_filter: list[Status | str | None] | None = None,
+        tags: list[str] | None = None,
     ) -> GetProfilesViewResponse:
         """Get user profiles.
 
@@ -1152,6 +1170,7 @@ class ReflexioClient:
             end_time (Optional[datetime]): Filter by end time
             top_k (Optional[int]): Maximum number of results to return (default: 30)
             status_filter (Optional[list[Optional[Union[Status, str]]]]): Filter by profile status. Accepts Status enum or string values (e.g., "archived", "pending").
+            tags (Optional[list[str]]): Match profiles having any of these tags.
 
         Returns:
             GetProfilesViewResponse: Response containing list of profiles
@@ -1176,6 +1195,7 @@ class ReflexioClient:
             end_time=end_time,
             top_k=top_k,
             status_filter=converted_status_filter,
+            tags=tags,
         )
 
         # Check cache if not forcing refresh
@@ -1187,6 +1207,7 @@ class ReflexioClient:
                 end_time=req.end_time,
                 top_k=req.top_k,
                 status_filter=req.status_filter,
+                tags=req.tags,
             )
             if cached_result is not None:
                 return cached_result
@@ -1208,6 +1229,7 @@ class ReflexioClient:
             end_time=req.end_time,
             top_k=req.top_k,
             status_filter=req.status_filter,
+            tags=req.tags,
         )
 
         return result
@@ -1266,7 +1288,10 @@ class ReflexioClient:
         Returns:
             dict: Response containing success status and message
         """
-        config = self._convert_to_model(config, Config)  # type: ignore[reportAssignmentType]
+        config = self._convert_to_model(  # type: ignore[reportAssignmentType]
+            config,
+            _ClientConfigPayload,
+        )
         return self._make_request(
             "POST",
             "/api/set_config",
@@ -1288,7 +1313,7 @@ class ReflexioClient:
 
         Args:
             partial: Top-level fields to overlay on the existing config.
-                Unknown keys are dropped server-side by Pydantic.
+                Unknown keys are rejected server-side.
 
         Returns:
             dict: ``{"success": bool, "msg": str}`` from the server.
@@ -1312,7 +1337,7 @@ class ReflexioClient:
             "GET",
             "/api/get_config",
         )
-        return Config(**response)
+        return _ClientConfigPayload(**response)
 
     def invalidate_cache(self, org_id: str | None = None) -> dict:
         """Explicitly evict the server-side per-org Reflexio cache entry.
@@ -1354,6 +1379,7 @@ class ReflexioClient:
         playbook_name: str | None = None,
         agent_version: str | None = None,
         status_filter: list[Status | None] | None = None,
+        tags: list[str] | None = None,
     ) -> GetUserPlaybooksViewResponse:
         """Get user playbooks.
 
@@ -1364,6 +1390,7 @@ class ReflexioClient:
             playbook_name (Optional[str]): Filter by playbook name
             agent_version (Optional[str]): Filter by agent version
             status_filter (Optional[list[Optional[Status]]]): Filter by status
+            tags (Optional[list[str]]): Match playbooks having any of these tags.
 
         Returns:
             GetUserPlaybooksViewResponse: Response containing user playbooks
@@ -1376,6 +1403,7 @@ class ReflexioClient:
             playbook_name=playbook_name,
             agent_version=agent_version,
             status_filter=status_filter,
+            tags=tags,
         )
         response = self._make_request(
             "POST",
@@ -1629,6 +1657,7 @@ class ReflexioClient:
         agent_version: str | None = None,
         status_filter: list[Status | None] | None = None,
         playbook_status_filter: PlaybookStatus | None = None,
+        tags: list[str] | None = None,
     ) -> GetAgentPlaybooksViewResponse:
         """Get agent playbooks.
 
@@ -1640,6 +1669,7 @@ class ReflexioClient:
             agent_version (Optional[str]): Filter by agent version
             status_filter (Optional[list[Optional[Status]]]): Filter by status
             playbook_status_filter (Optional[PlaybookStatus]): Filter by playbook status (default: APPROVED)
+            tags (Optional[list[str]]): Match playbooks having any of these tags.
 
         Returns:
             GetAgentPlaybooksViewResponse: Response containing agent playbooks
@@ -1652,6 +1682,7 @@ class ReflexioClient:
             agent_version=agent_version,
             status_filter=status_filter,
             playbook_status_filter=playbook_status_filter,
+            tags=tags,
         )
 
         # Check cache if not forcing refresh
@@ -1660,8 +1691,10 @@ class ReflexioClient:
                 "get_agent_playbooks",
                 limit=req.limit,
                 playbook_name=req.playbook_name,
+                agent_version=req.agent_version,
                 status_filter=req.status_filter,
                 playbook_status_filter=req.playbook_status_filter,
+                tags=req.tags,
             )
             if cached_result is not None:
                 return cached_result
@@ -1680,8 +1713,10 @@ class ReflexioClient:
             result,
             limit=req.limit,
             playbook_name=req.playbook_name,
+            agent_version=req.agent_version,
             status_filter=req.status_filter,
             playbook_status_filter=req.playbook_status_filter,
+            tags=req.tags,
         )
 
         return result
@@ -2213,6 +2248,9 @@ class ReflexioClient:
         enable_agent_answer: bool | None = None,
         conversation_history: list[ConversationTurn] | list[dict] | None = None,
         search_mode: SearchMode | str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        interaction_id: int | None = None,
     ) -> UnifiedSearchViewResponse:
         """Search across all entity types (profiles, agent playbooks, user playbooks).
 
@@ -2236,6 +2274,9 @@ class ReflexioClient:
                 the configured search backend supports it (default: False).
             conversation_history (Optional[list[ConversationTurn] | list[dict]]): Prior conversation turns for context-aware query reformulation. Accepts ConversationTurn objects or dicts with "role" and "content" keys.
             search_mode (Optional[SearchMode | str]): Search mode to use. Accepts SearchMode enum or string value ("vector", "fts", "hybrid").
+            request_id (Optional[str]): Caller correlation id for the search turn.
+            session_id (Optional[str]): Caller session id for the search turn.
+            interaction_id (Optional[int]): Caller interaction id for the search turn.
 
         Returns:
             UnifiedSearchViewResponse: Combined search results from all entity types
@@ -2255,6 +2296,9 @@ class ReflexioClient:
             enable_agent_answer=enable_agent_answer,
             conversation_history=conversation_history,
             search_mode=search_mode,
+            request_id=request_id,
+            session_id=session_id,
+            interaction_id=interaction_id,
         )
         response = self._make_request("POST", "/api/search", json=req.model_dump())
         return UnifiedSearchViewResponse(**response)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
@@ -14,9 +15,6 @@ from reflexio.models.config_schema import (
     StorageConfigSQLite,
 )
 from reflexio.server.api_endpoints.request_context import RequestContext
-from reflexio.server.services.extraction.resumable_agent import (
-    FINISH_EXTRACTION_TOOL_NAME,
-)
 from reflexio.server.services.extraction.resume_worker import ExtractionResumeWorker
 from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
 from reflexio.server.services.storage.storage_base import (
@@ -116,7 +114,7 @@ def _seed_ready_run(storage: SQLiteStorage) -> None:
             generation_request_snapshot={"request_id": "request_1"},
         )
     )
-    now = datetime(2026, 5, 28, tzinfo=UTC)
+    now = datetime.now(UTC)
     question = "What is the deployment target?"
     scope = human_feedback_scope("org_1")
     storage.create_pending_tool_call(
@@ -159,17 +157,18 @@ def test_resume_worker_resumes_profile_run_and_consumes_dependency(
     monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
     _seed_interactions(storage)
     _seed_ready_run(storage)
-    make_tc, _make_stop = tool_call_completion
-    response = make_tc(
-        FINISH_EXTRACTION_TOOL_NAME,
-        {
-            "profiles": [
-                {
-                    "content": "User deployment target is AWS ECS.",
-                    "time_to_live": "infinity",
-                }
-            ]
-        },
+    _make_tc, make_stop = tool_call_completion
+    response = make_stop(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "content": "User deployment target is AWS ECS.",
+                        "time_to_live": "infinity",
+                    }
+                ]
+            }
+        )
     )
     worker = ExtractionResumeWorker(request_context=request_context)
 
@@ -203,24 +202,25 @@ def test_resume_worker_retries_finalization_without_rerunning_agent(
     monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
     _seed_interactions(storage)
     _seed_ready_run(storage)
-    make_tc, _make_stop = tool_call_completion
-    response = make_tc(
-        FINISH_EXTRACTION_TOOL_NAME,
-        {
-            "profiles": [
-                {
-                    "content": "User deployment target is AWS ECS.",
-                    "time_to_live": "infinity",
-                }
-            ]
-        },
+    _make_tc, make_stop = tool_call_completion
+    response = make_stop(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "content": "User deployment target is AWS ECS.",
+                        "time_to_live": "infinity",
+                    }
+                ]
+            }
+        )
     )
     worker = ExtractionResumeWorker(request_context=request_context)
 
     with (
         patch("litellm.completion", side_effect=[response]),
         patch(
-            "reflexio.server.services.profile.profile_generation_service."
+            "reflexio.server.services.profile.service."
             "ProfileGenerationService._finalize_extracted_items",
             side_effect=RuntimeError("storage write failed"),
         ),
@@ -247,7 +247,7 @@ def test_resume_worker_retries_finalization_without_rerunning_agent(
             side_effect=AssertionError("finalization retry must not call LLM"),
         ),
         patch(
-            "reflexio.server.services.profile.profile_generation_service."
+            "reflexio.server.services.profile.service."
             "ProfileGenerationService._finalize_extracted_items",
             return_value=None,
         ) as finalize,
@@ -260,6 +260,31 @@ def test_resume_worker_retries_finalization_without_rerunning_agent(
     assert retried is not None
     assert retried.status == AgentRunStatus.FINALIZED
     assert storage.list_run_tool_dependencies("run_1")[0].consumed_at is not None
+
+
+def test_resume_worker_tagging_schedule_failure_is_best_effort(
+    request_context,
+):
+    run = AgentRunRecord(
+        id="run_tagging",
+        binding=AgentBinding(
+            org_id="org_1",
+            extractor_kind="profile",
+            user_id="user_1",
+            request_id="request_1",
+            agent_version="v1",
+            source="api",
+        ),
+        status=AgentRunStatus.FINALIZED_PENDING_TOOL,
+        generation_request_snapshot={"request_id": "request_1"},
+    )
+    worker = ExtractionResumeWorker(request_context=request_context)
+
+    with patch(
+        "reflexio.server.services.extraction.resume_worker.schedule_tagging",
+        side_effect=RuntimeError("scheduler unavailable"),
+    ):
+        worker._schedule_finalized_tagging(run)
 
 
 def test_resume_worker_fails_run_when_step_budget_exhausted(

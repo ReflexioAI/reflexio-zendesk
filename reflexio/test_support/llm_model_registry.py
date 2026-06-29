@@ -29,23 +29,29 @@ class ModelRegistryEntry:
 
 def _build_registry() -> dict[str, ModelRegistryEntry]:
     """Build the model registry with lazy imports to avoid circular dependencies."""
+    from reflexio.models.api_schema.eval_overview_schema import ShadowComparisonOutput
     from reflexio.server.services.agent_success_evaluation.agent_success_evaluation_constants import (
         AgentSuccessEvaluationOutput,
     )
-    from reflexio.server.services.playbook.playbook_consolidator import (
+    from reflexio.server.services.playbook.components.consolidator import (
         PlaybookConsolidationOutput,
     )
     from reflexio.server.services.playbook.playbook_service_utils import (
         PlaybookAggregationOutput,
         StructuredPlaybookList,
     )
-    from reflexio.server.services.profile.profile_deduplicator import (
+    from reflexio.server.services.playbook_optimizer.models import JudgeOutput
+    from reflexio.server.services.profile.components.consolidator import (
         ProfileDeduplicationOutput,
     )
     from reflexio.server.services.profile.profile_generation_service_utils import (
         ProfileUpdateOutput,
         StructuredProfilesOutput,
     )
+    from reflexio.server.services.reflection.reflection_service_utils import (
+        ReflectionOutput,
+    )
+    from reflexio.server.services.tagging.service import TagsOutput
 
     return {
         "playbook_extraction": ModelRegistryEntry(
@@ -108,9 +114,40 @@ def _build_registry() -> dict[str, ModelRegistryEntry]:
                 "is_escalated": False,
             },
         ),
+        "tagging": ModelRegistryEntry(
+            model_class=TagsOutput,
+            minimal_valid={"tags": ["example_tag"]},
+        ),
+        "reflection": ModelRegistryEntry(
+            model_class=ReflectionOutput,
+            minimal_valid={
+                "decisions": [
+                    {
+                        "target_kind": "profile",
+                        "target_id": "PROFILE-0",
+                        "reason": "no change",
+                    },
+                ],
+            },
+        ),
+        "playbook_optimizer_judge": ModelRegistryEntry(
+            model_class=JudgeOutput,
+            minimal_valid={
+                "verdict": "candidate",
+                "score": 0.5,
+                "likert": 3,
+            },
+        ),
+        "shadow_comparison": ModelRegistryEntry(
+            model_class=ShadowComparisonOutput,
+            minimal_valid={
+                "better_request": "1",
+                "is_significantly_better": True,
+            },
+        ),
         # F1 cleanup: ``agent_success_evaluation_comparison`` was removed along
-        # with the session-level shadow comparison branch. Per-turn shadow
-        # comparison registers its own registry entry alongside its prompt.
+        # with the session-level shadow comparison branch. The per-turn shadow
+        # comparison entry is registered above (``shadow_comparison``).
         "boolean_evaluation": ModelRegistryEntry(
             model_class=None,
             minimal_valid="true",

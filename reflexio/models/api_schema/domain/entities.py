@@ -118,6 +118,11 @@ __all__ = [
     "ShareLink",
     "AdminInvalidateCacheRequest",
     "AdminInvalidateCacheResponse",
+    "PlaybookRetrievalLogItem",
+    "PlaybookRetrievalLog",
+    "LineageEvent",
+    "LineageContext",
+    "RecordRef",
 ]
 
 # ===============================
@@ -221,10 +226,14 @@ class UserProfile(BaseModel):
         None  # Retained provenance data column (merged on dedup); new profiles write None.
     )
     expanded_terms: str | None = None
+    tags: list[str] | None = None  # None = not yet tagged; [] = tagged, no match
+    source_interaction_ids: list[int] = Field(default_factory=list)
     embedding: EmbeddingVector = []
     source_span: str | None = None
     notes: str | None = None
     reader_angle: str | None = None
+    merged_into: str | None = None
+    superseded_by: str | None = None
 
 
 # user playbook for agents
@@ -245,10 +254,13 @@ class UserPlaybook(BaseModel):
     source: str | None = None  # source of the interaction that generated this playbook
     source_interaction_ids: list[int] = Field(default_factory=list)
     expanded_terms: str | None = None
+    tags: list[str] | None = None  # None = not yet tagged; [] = tagged, no match
     embedding: EmbeddingVector = []
     source_span: str | None = None
     notes: str | None = None
     reader_angle: str | None = None
+    merged_into: int | None = None
+    superseded_by: int | None = None
 
 
 class ProfileChangeLog(BaseModel):
@@ -258,7 +270,6 @@ class ProfileChangeLog(BaseModel):
     created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
     added_profiles: list[UserProfile]
     removed_profiles: list[UserProfile]
-    mentioned_profiles: list[UserProfile]
 
 
 class AgentPlaybook(BaseModel):
@@ -273,10 +284,13 @@ class AgentPlaybook(BaseModel):
     playbook_status: PlaybookStatus = PlaybookStatus.PENDING
     playbook_metadata: str = ""
     expanded_terms: str | None = None
+    tags: list[str] | None = None  # None = not yet tagged; [] = tagged, no match
     embedding: EmbeddingVector = []
     status: Status | None = (
         None  # used for tracking intermediate states during playbook aggregation. Status.ARCHIVED for playbooks during aggregation process, None for current playbooks
     )
+    merged_into: int | None = None
+    superseded_by: int | None = None
 
 
 class PlaybookOptimizationJob(BaseModel):
@@ -314,6 +328,7 @@ class PlaybookOptimizationCandidate(BaseModel):
     parent_candidate_ids: list[int] = Field(default_factory=list)
     aggregate_score: float | None = None
     is_winner: bool = False
+    metadata_json: str = "{}"
     created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
 
 
@@ -368,6 +383,7 @@ class AgentPlaybookSourceWindow(BaseModel):
 
 class AgentSuccessEvaluationResult(BaseModel):
     result_id: int = 0
+    user_id: str = ""
     agent_version: str
     session_id: str
     is_success: bool
@@ -380,6 +396,100 @@ class AgentSuccessEvaluationResult(BaseModel):
     user_turns_to_resolution: int | None = None
     is_escalated: bool = False
     embedding: EmbeddingVector = []
+
+
+class PlaybookRetrievalLogItem(BaseModel):
+    """One retrieved agent playbook plus the serve-time attribution snapshot."""
+
+    retrieval_log_item_id: int = 0
+    retrieval_log_id: int = 0
+    ordinal: int
+    agent_playbook_id: int
+    source_user_playbook_ids: list[int] = Field(default_factory=list)
+    source_interaction_ids_by_user_playbook_id: dict[str, list[int]] = Field(
+        default_factory=dict
+    )
+
+
+class PlaybookRetrievalLog(BaseModel):
+    """A retrieval-log header with ordered item rows.
+
+    Used by retrieval-capture consumers to correlate retrieval decisions with
+    downstream outcomes. ``retrieval_log_id`` is assigned by the storage layer;
+    ``shown_items`` stores ids and serve-time attribution snapshots only.
+    """
+
+    retrieval_log_id: int = 0
+    request_id: str
+    session_id: str
+    interaction_id: int | None = None
+    user_id: str
+    query: str | None = None
+    agent_version: str | None = None
+    shown_items: list[PlaybookRetrievalLogItem] = Field(default_factory=list)
+    created_at: int = 0
+
+
+class LineageEvent(BaseModel):
+    """Append-only, content-free provenance record. NEVER carries content/PII.
+
+    Attributes:
+        event_id (int): PK assigned by storage (0 = not yet persisted).
+        org_id (str): Owning org (tenant) — required for RLS / isolation.
+        entity_type (str): One of "profile" | "user_playbook" | "agent_playbook".
+        entity_id (str): The affected record's id, stringified (profile_id is str).
+        op (str): create|revise|merge|aggregate|archive|soft_delete|hard_delete|purge|status_change.
+        prov_relation (str): W3C PROV relation (see spec §14).
+        source_ids (list[str]): Records merged/superseded into entity_id.
+        actor (str): Who/what triggered it (consolidator|reflection|offline_optimizer|...).
+        request_id (str): Triggering request — part of the idempotency key.
+        reason (str): Free-text rationale (no PII).
+        created_at (int): Unix epoch seconds (0 = unset; storage stamps it).
+    """
+
+    event_id: int = 0
+    org_id: str
+    entity_type: str
+    entity_id: str
+    op: str
+    prov_relation: str = ""
+    source_ids: list[str] = []
+    actor: str = ""
+    request_id: str = ""
+    reason: str = ""
+    created_at: int = 0
+    from_status: str | None = None
+    to_status: str | None = None
+    status_namespace: str | None = None
+
+
+class LineageContext(BaseModel):
+    """Caller-supplied intent the storage layer can't infer.
+
+    Required for merge/supersede/aggregate; optional for create/revise/archive.
+    """
+
+    op_kind: str
+    actor: str = ""
+    source_ids: list[str] = []
+    reason: str = ""
+    request_id: str | None = None
+
+
+class RecordRef(BaseModel):
+    """Result of resolve_current — the live survivor's id and whether its body was purged.
+
+    Attributes:
+        id: Primary key of the live survivor record.
+        is_purged: True when the survivor's content body has been blanked by
+            ``purge_content`` (GDPR/erasure).  Any consumer that dereferences the
+            resolved record's content MUST treat ``is_purged=True`` as "erased —
+            skip or treat as absent."  Reading blank content as if it were valid
+            is a silent data-quality bug.
+    """
+
+    id: str
+    is_purged: bool = False
 
 
 class ShareLink(BaseModel):

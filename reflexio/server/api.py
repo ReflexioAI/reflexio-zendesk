@@ -2,11 +2,13 @@ import asyncio
 import inspect
 import logging
 import os
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 
+from anyio.to_thread import current_default_thread_limiter
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -52,6 +54,7 @@ from reflexio.models.api_schema.retriever_schema import (
     GetEvaluationResultsViewResponse,
     GetInteractionsRequest,
     GetInteractionsViewResponse,
+    GetLearningProvenanceRequest,
     GetPlaybookApplicationStatsRequest,
     GetPlaybookApplicationStatsResponse,
     GetProfileStatisticsResponse,
@@ -61,6 +64,7 @@ from reflexio.models.api_schema.retriever_schema import (
     GetUserPlaybooksRequest,
     GetUserPlaybooksViewResponse,
     GetUserProfilesRequest,
+    LearningProvenanceViewResponse,
     ProfileChangeLogViewResponse,
     RequestDataView,
     RerankUserProfilesRequest,
@@ -74,6 +78,7 @@ from reflexio.models.api_schema.retriever_schema import (
     SearchUserProfileRequest,
     SessionView,
     SetConfigResponse,
+    SourceUserPlaybookProvenanceView,
     StorageStatsRequest,
     StorageStatsResponse,
     UnifiedSearchRequest,
@@ -153,6 +158,7 @@ from reflexio.models.api_schema.ui.converters import (
     to_user_playbook_view,
 )
 from reflexio.models.config_schema import (
+    DEFAULT_WINDOW_SIZE,
     SINGLETON_AGENT_SUCCESS_EVALUATION_NAME,
     Config,
 )
@@ -177,14 +183,19 @@ from reflexio.server.correlation import correlation_id_var, generate_correlation
 from reflexio.server.operation_limiter import (
     OperationName,
     limiter_http_exception,
+    log_publish_hardware_capacity,
     run_with_operation_limit,
-)
-from reflexio.server.services.agent_success_evaluation.group_evaluation_runner import (
-    run_group_evaluation,
 )
 from reflexio.server.services.agent_success_evaluation.regen_jobs import (
     REGEN_JOBS,
     run_regen,
+)
+from reflexio.server.services.agent_success_evaluation.runner import (
+    run_group_evaluation,
+)
+from reflexio.server.services.extractor_interaction_utils import (
+    get_effective_source_filter,
+    get_extractor_window_params,
 )
 from reflexio.server.tracing import profile_step
 
@@ -493,12 +504,27 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         cid = generate_correlation_id()
         correlation_id_var.set(cid)
+        try:
+            stats = current_default_thread_limiter().statistics()
+            request.state.tp_borrowed = stats.borrowed_tokens
+            request.state.tp_total = stats.total_tokens
+            request.state.tp_waiting = stats.tasks_waiting
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to snapshot threadpool limiter stats: %s", exc)
+            request.state.tp_borrowed = None
+            request.state.tp_total = None
+            request.state.tp_waiting = None
         response = await call_next(request)
         response.headers["X-Correlation-ID"] = cid
         return response
 
 
 core_router = APIRouter()
+
+
+def _stamp_search_dependencies_done(request: Request) -> None:
+    """Stamp when dependency resolution reaches its final search dependency."""
+    request.state.search_deps_done_monotonic = time.monotonic()
 
 
 def _meter_applied_learnings(
@@ -541,6 +567,38 @@ def _meter_applied_learnings(
     except Exception:
         logger.warning(
             "applied-learnings metering failed for org %s", org_id, exc_info=True
+        )
+
+
+def _meter_search_request(
+    *,
+    org_id: str,
+    caller_type: str,
+    request_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Emit one production-agent search request metric.
+
+    Args:
+        org_id: Organization ID for the requesting caller.
+        caller_type: Resolved caller classification.
+        request_id: Optional request correlation ID from the payload.
+        session_id: Optional session ID from the payload.
+    """
+    if caller_type != "production_agent":
+        return
+    try:
+        from reflexio.server.billing_meter import record_search_request
+
+        record_search_request(
+            org_id=org_id,
+            caller_type=caller_type,
+            request_id=request_id,
+            session_id=session_id,
+        )
+    except Exception:
+        logger.warning(
+            "search-request metering failed for org %s", org_id, exc_info=True
         )
 
 
@@ -750,6 +808,12 @@ def search_user_profiles(
         user_profiles=[to_profile_view(p) for p in response.user_profiles],
         msg=response.msg,
     )
+    _meter_search_request(
+        org_id=org_id,
+        caller_type=caller_type,
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
     _meter_applied_learnings(
         org_id=org_id,
         caller_type=caller_type,
@@ -884,6 +948,12 @@ def search_user_playbooks_endpoint(
         user_playbooks=[to_user_playbook_view(rf) for rf in response.user_playbooks],
         msg=response.msg,
     )
+    _meter_search_request(
+        org_id=org_id,
+        caller_type=caller_type,
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
     _meter_applied_learnings(
         org_id=org_id,
         caller_type=caller_type,
@@ -931,6 +1001,12 @@ def search_agent_playbooks_endpoint(
         agent_playbooks=[to_agent_playbook_view(fb) for fb in response.agent_playbooks],
         msg=response.msg,
     )
+    _meter_search_request(
+        org_id=org_id,
+        caller_type=caller_type,
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
     _meter_applied_learnings(
         org_id=org_id,
         caller_type=caller_type,
@@ -950,9 +1026,11 @@ def search_agent_playbooks_endpoint(
 def unified_search_endpoint(
     request: Request,
     payload: UnifiedSearchRequest,
+    background_tasks: BackgroundTasks,
     org_id: str = Depends(default_get_org_id),
     caller_type: str = Depends(default_get_caller_type),
     _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
+    _deps_done: None = Depends(_stamp_search_dependencies_done),
 ) -> UnifiedSearchViewResponse:
     """Search across all entity types (profiles, agent playbooks, user playbooks).
 
@@ -969,12 +1047,22 @@ def unified_search_endpoint(
     Returns:
         UnifiedSearchViewResponse: Combined search results
     """
+    deps_done = getattr(request.state, "search_deps_done_monotonic", None)
+    deps_to_body_ms = (
+        int((time.monotonic() - deps_done) * 1000) if deps_done is not None else None
+    )
     with profile_step(
         "search.endpoint",
         enabled=bool(payload.enable_reformulation),
         has_conversation_history=bool(payload.conversation_history),
         search_mode=payload.search_mode,
-    ):
+    ) as endpoint_span:
+        endpoint_span.set_data("deps_to_body_ms", deps_to_body_ms)
+        endpoint_span.set_data(
+            "tp_borrowed", getattr(request.state, "tp_borrowed", None)
+        )
+        endpoint_span.set_data("tp_total", getattr(request.state, "tp_total", None))
+        endpoint_span.set_data("tp_waiting", getattr(request.state, "tp_waiting", None))
 
         def run_search() -> Any:
             with profile_step("search.reflexio_cache"):
@@ -997,16 +1085,23 @@ def unified_search_endpoint(
                 agent_trace=response.agent_trace,
                 rehydrated_text=response.rehydrated_text,
             )
-        with profile_step("search.meter_applied_learnings"):
-            _meter_applied_learnings(
-                org_id=org_id,
-                caller_type=caller_type,
-                surfaced_count=len(resp.profiles)
-                + len(resp.agent_playbooks)
-                + len(resp.user_playbooks),
-                request_id=getattr(payload, "request_id", None),
-                session_id=getattr(payload, "session_id", None),
-            )
+        background_tasks.add_task(
+            _meter_search_request,
+            org_id=org_id,
+            caller_type=caller_type,
+            request_id=getattr(payload, "request_id", None),
+            session_id=getattr(payload, "session_id", None),
+        )
+        background_tasks.add_task(
+            _meter_applied_learnings,
+            org_id=org_id,
+            caller_type=caller_type,
+            surfaced_count=len(resp.profiles)
+            + len(resp.agent_playbooks)
+            + len(resp.user_playbooks),
+            request_id=getattr(payload, "request_id", None),
+            session_id=getattr(payload, "session_id", None),
+        )
     return resp
 
 
@@ -1014,6 +1109,9 @@ def unified_search_endpoint(
 def get_profile_change_log(
     org_id: str = Depends(default_get_org_id),
 ) -> ProfileChangeLogViewResponse:
+    # Serves the reconstructed profile change log (rebuilt from lineage events). The
+    # legacy `profile_change_logs` table is no longer written; see
+    # reconstruct_profile_change_log in lib/_profiles.py.
     response = get_reflexio(org_id=org_id).get_profile_change_logs()
     return ProfileChangeLogViewResponse(
         success=response.success,
@@ -1418,6 +1516,307 @@ def get_requests_endpoint(
     )
 
 
+def _learning_provenance_error(
+    payload: GetLearningProvenanceRequest,
+    msg: str,
+) -> LearningProvenanceViewResponse:
+    return LearningProvenanceViewResponse(
+        success=False,
+        target_kind=payload.kind,
+        target_id=payload.id,
+        provenance_status="unavailable",
+        msg=msg,
+    )
+
+
+def _parse_learning_target_int(
+    payload: GetLearningProvenanceRequest,
+) -> int | LearningProvenanceViewResponse:
+    try:
+        return int(payload.id)
+    except ValueError:
+        return _learning_provenance_error(
+            payload,
+            f"{payload.kind} id must be an integer",
+        )
+
+
+def _sort_interactions_by_time(interactions: list[Any]) -> list[Any]:
+    return sorted(
+        interactions,
+        key=lambda i: (
+            getattr(i, "created_at", 0) or 0,
+            getattr(i, "interaction_id", 0),
+        ),
+    )
+
+
+def _interaction_views(interactions: list[Any]) -> list[Any]:
+    return [to_interaction_view(i) for i in _sort_interactions_by_time(interactions)]
+
+
+def _effective_profile_provenance_window(
+    reflexio: Any, trigger_source: str | None
+) -> tuple[int, list[str] | None]:
+    config = reflexio.request_context.configurator.get_config()
+    profile_config = getattr(config, "profile_extractor_config", None)
+    if profile_config is None:
+        return getattr(config, "window_size", DEFAULT_WINDOW_SIZE), None
+
+    window_size, _ = get_extractor_window_params(
+        profile_config,
+        getattr(config, "window_size", None),
+        getattr(config, "stride_size", None),
+    )
+    should_skip, source_filter = get_effective_source_filter(
+        profile_config,
+        trigger_source,
+    )
+    if should_skip:
+        return window_size, None
+    return window_size, source_filter
+
+
+def _get_profile_learning_provenance(
+    payload: GetLearningProvenanceRequest,
+    reflexio: Any,
+) -> LearningProvenanceViewResponse:
+    storage = reflexio.request_context.storage
+    profile = storage.get_profile_by_id(payload.id)
+    if profile is None:
+        return _learning_provenance_error(payload, "Profile not found")
+
+    if profile.source_interaction_ids:
+        interactions = storage.get_interactions_by_ids(profile.source_interaction_ids)
+        return LearningProvenanceViewResponse(
+            success=True,
+            target_kind=payload.kind,
+            target_id=payload.id,
+            provenance_status="exact",
+            trigger_request_id=profile.generated_from_request_id,
+            interactions=_interaction_views(interactions),
+        )
+
+    if not profile.generated_from_request_id:
+        return _learning_provenance_error(
+            payload,
+            "Profile has no generation request for provenance reconstruction",
+        )
+
+    trigger_request = storage.get_request(profile.generated_from_request_id)
+    if trigger_request is None:
+        return _learning_provenance_error(
+            payload,
+            "Profile generation request was not found",
+        )
+
+    trigger_interactions = storage.get_interactions_by_request_ids(
+        [profile.generated_from_request_id]
+    )
+    anchor_time = (
+        max(i.created_at for i in trigger_interactions)
+        if trigger_interactions
+        else trigger_request.created_at
+    )
+    window_size, source_filter = _effective_profile_provenance_window(
+        reflexio,
+        trigger_request.source,
+    )
+    _, interactions = storage.get_last_k_interactions_grouped(
+        user_id=profile.user_id,
+        k=window_size,
+        sources=source_filter,
+        end_time=anchor_time,
+    )
+    return LearningProvenanceViewResponse(
+        success=True,
+        target_kind=payload.kind,
+        target_id=payload.id,
+        provenance_status="best_effort" if interactions else "unavailable",
+        trigger_request_id=profile.generated_from_request_id,
+        interactions=_interaction_views(interactions),
+        msg=None if interactions else "No interactions found for reconstructed window",
+    )
+
+
+def _get_user_playbook_learning_provenance(
+    payload: GetLearningProvenanceRequest,
+    reflexio: Any,
+) -> LearningProvenanceViewResponse:
+    parsed_id = _parse_learning_target_int(payload)
+    if isinstance(parsed_id, LearningProvenanceViewResponse):
+        return parsed_id
+
+    storage = reflexio.request_context.storage
+    playbook = storage.get_user_playbook_by_id(parsed_id)
+    if playbook is None:
+        return _learning_provenance_error(payload, "User playbook not found")
+
+    status = "exact"
+    if playbook.source_interaction_ids:
+        interactions = storage.get_interactions_by_ids(playbook.source_interaction_ids)
+    elif playbook.request_id:
+        status = "best_effort"
+        interactions = storage.get_interactions_by_request_ids([playbook.request_id])
+    else:
+        status = "unavailable"
+        interactions = []
+
+    return LearningProvenanceViewResponse(
+        success=True,
+        target_kind=payload.kind,
+        target_id=payload.id,
+        provenance_status=status if interactions else "unavailable",
+        trigger_request_id=playbook.request_id,
+        interactions=_interaction_views(interactions),
+        msg=None if interactions else "No interactions found for this user playbook",
+    )
+
+
+def _get_agent_playbook_learning_provenance(
+    payload: GetLearningProvenanceRequest,
+    reflexio: Any,
+) -> LearningProvenanceViewResponse:
+    parsed_id = _parse_learning_target_int(payload)
+    if isinstance(parsed_id, LearningProvenanceViewResponse):
+        return parsed_id
+
+    storage = reflexio.request_context.storage
+    agent_playbook = storage.get_agent_playbook_by_id(parsed_id)
+    if agent_playbook is None:
+        return _learning_provenance_error(payload, "Agent playbook not found")
+
+    windows = storage.get_source_windows_for_agent_playbook(parsed_id)
+    if not windows:
+        return LearningProvenanceViewResponse(
+            success=True,
+            target_kind=payload.kind,
+            target_id=payload.id,
+            provenance_status="unavailable",
+            msg="No source user playbooks are recorded for this agent playbook",
+        )
+
+    user_playbook_ids = [window.user_playbook_id for window in windows]
+    user_playbooks = storage.get_user_playbooks_by_ids_any_user(
+        user_playbook_ids,
+        status_filter=None,
+    )
+    user_playbooks_by_id = {
+        playbook.user_playbook_id: playbook for playbook in user_playbooks
+    }
+
+    interaction_ids_to_fetch: set[int] = set()
+    request_ids_to_fetch: set[str] = set()
+    group_sources: dict[int, tuple[list[int], str | None, bool]] = {}
+    for window in windows:
+        source_user_playbook = user_playbooks_by_id.get(window.user_playbook_id)
+        if source_user_playbook is None:
+            continue
+
+        source_ids = list(window.source_interaction_ids)
+        request_id: str | None = None
+        uses_fallback = False
+        if not source_ids and source_user_playbook.source_interaction_ids:
+            source_ids = list(source_user_playbook.source_interaction_ids)
+        elif not source_ids and source_user_playbook.request_id:
+            request_id = source_user_playbook.request_id
+            uses_fallback = True
+        elif not source_ids:
+            uses_fallback = True
+
+        interaction_ids_to_fetch.update(source_ids)
+        if request_id:
+            request_ids_to_fetch.add(request_id)
+        group_sources[window.user_playbook_id] = (source_ids, request_id, uses_fallback)
+
+    interactions_by_id = (
+        {
+            interaction.interaction_id: interaction
+            for interaction in storage.get_interactions_by_ids(
+                sorted(interaction_ids_to_fetch)
+            )
+        }
+        if interaction_ids_to_fetch
+        else {}
+    )
+    request_interactions: dict[str, list[Any]] = {}
+    if request_ids_to_fetch:
+        for interaction in storage.get_interactions_by_request_ids(
+            sorted(request_ids_to_fetch)
+        ):
+            request_interactions.setdefault(interaction.request_id, []).append(
+                interaction
+            )
+
+    groups: list[SourceUserPlaybookProvenanceView] = []
+    used_fallback = False
+    found_interactions = False
+    for window in windows:
+        source_user_playbook = user_playbooks_by_id.get(window.user_playbook_id)
+        if source_user_playbook is None:
+            used_fallback = True
+            continue
+
+        source_ids, request_id, uses_fallback = group_sources.get(
+            window.user_playbook_id,
+            ([], None, True),
+        )
+        used_fallback = used_fallback or uses_fallback
+        interactions = (
+            [interactions_by_id[i] for i in source_ids if i in interactions_by_id]
+            if source_ids
+            else request_interactions.get(request_id or "", [])
+        )
+
+        found_interactions = found_interactions or bool(interactions)
+        groups.append(
+            SourceUserPlaybookProvenanceView(
+                user_playbook=to_user_playbook_view(source_user_playbook),
+                interactions=_interaction_views(interactions),
+                source_interaction_ids=source_ids,
+            )
+        )
+
+    if not groups:
+        return _learning_provenance_error(
+            payload,
+            "Recorded source user playbooks were not found",
+        )
+
+    return LearningProvenanceViewResponse(
+        success=True,
+        target_kind=payload.kind,
+        target_id=payload.id,
+        provenance_status=(
+            "exact"
+            if found_interactions and not used_fallback
+            else "best_effort"
+            if found_interactions
+            else "unavailable"
+        ),
+        source_user_playbooks=groups,
+        msg=None if found_interactions else "No source interactions were found",
+    )
+
+
+@core_router.post(
+    "/api/get_learning_provenance",
+    response_model=LearningProvenanceViewResponse,
+    response_model_exclude_none=True,
+)
+def get_learning_provenance(
+    payload: GetLearningProvenanceRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> LearningProvenanceViewResponse:
+    """Return read-only learning provenance for a generated learning row."""
+    reflexio = get_reflexio(org_id=org_id)
+    if payload.kind == "profile":
+        return _get_profile_learning_provenance(payload, reflexio)
+    if payload.kind == "user_playbook":
+        return _get_user_playbook_learning_provenance(payload, reflexio)
+    return _get_agent_playbook_learning_provenance(payload, reflexio)
+
+
 @core_router.post(
     "/api/get_profiles",
     response_model=GetProfilesViewResponse,
@@ -1527,17 +1926,30 @@ def set_config(
     """Set configuration for the organization.
 
     Args:
-        config (Config): The configuration to set
+        config (dict[str, Any]): The configuration payload to set
         org_id (str): Organization ID
 
     Returns:
         dict: Response containing success status and message
     """
+    from pydantic import ValidationError
+
     # Create Reflexio instance to access the configurator through request_context
     reflexio = get_reflexio(org_id=org_id)
+    configurator = reflexio.request_context.configurator
+    normalized_config = configurator.normalize_config_payload(config)
+    if not isinstance(normalized_config, dict):
+        normalized_config = config
+    try:
+        Config.model_validate(normalized_config)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=exc.errors(),
+        ) from exc
 
     # Set the config using Reflexio's set_config method
-    response = reflexio.set_config(config)
+    response = reflexio.set_config(normalized_config)
 
     # Invalidate cache on successful config change to ensure fresh instance next request
     if response.success:
@@ -2257,10 +2669,8 @@ def _read_grade_on_demand_cache(
 def _resolve_session_user_id(storage: Any, session_id: str) -> str | None:
     """Look up the user_id that owns a session_id without requiring it as input.
 
-    Uses ``get_sessions(session_id=...)`` because it's the only storage
-    method on ``BaseStorage`` that accepts session_id alone — every other
-    request-fetcher requires a user_id paired with it. Returns None when
-    the session has no requests, signalling NO_REQUESTS to the caller.
+    Uses the first-request bulk helper even for this single-session path so the
+    lookup can use the same indexed query shape as evaluation overview.
 
     Args:
         storage: The request's storage backend.
@@ -2270,17 +2680,17 @@ def _resolve_session_user_id(storage: Any, session_id: str) -> str | None:
         str | None: The user_id of the earliest request in the session,
         or None when no requests exist.
     """
-    sessions = storage.get_sessions(session_id=session_id, top_k=100)
-    rows = sessions.get(session_id) or []
-    if not rows:
+    first_requests = storage.get_first_requests_by_session_ids([session_id])
+    first = first_requests.get(session_id)
+    if first is None:
         return None
-    earliest = min(rows, key=lambda r: r.request.created_at)
-    return earliest.request.user_id
+    return first.user_id
 
 
 def _find_fresh_result_id(
     storage: Any,
     *,
+    user_id: str,
     session_id: str,
     agent_version: str,
     evaluation_name: str,
@@ -2288,12 +2698,12 @@ def _find_fresh_result_id(
 ) -> int | None:
     """Locate the result_id written by the most-recent grade for this session.
 
-    The runner writes rows but doesn't return the id. Reading back through
-    ``get_agent_success_evaluation_results`` matches the pattern used by
-    the regen worker's prior-row capture (group_evaluation_runner step 5).
+    The runner writes rows but doesn't return the id. Use the targeted result-id
+    lookup so this path does not scan broad evaluation windows.
 
     Args:
         storage: The request's storage backend.
+        user_id (str): The user whose session slice was graded.
         session_id (str): The graded session.
         agent_version (str): The version dimension.
         evaluation_name (str): Evaluator/result namespace to isolate readback.
@@ -2303,20 +2713,16 @@ def _find_fresh_result_id(
         int | None: result_id of the latest matching row, or None if the
         runner wrote nothing.
     """
-    rows = storage.get_agent_success_evaluation_results(
-        limit=1000, agent_version=agent_version
+    result_ids = storage.get_agent_success_evaluation_result_ids(
+        user_id=user_id,
+        session_id=session_id,
+        evaluation_name=evaluation_name,
+        agent_version=agent_version,
     )
-    matched = [
-        r
-        for r in rows
-        if r.session_id == session_id
-        and r.evaluation_name == evaluation_name
-        and r.result_id not in previous_result_ids
-    ]
-    if not matched:
+    fresh_result_ids = [rid for rid in result_ids if rid not in previous_result_ids]
+    if not fresh_result_ids:
         return None
-    latest = max(matched, key=lambda r: r.created_at)
-    return latest.result_id
+    return max(fresh_result_ids)
 
 
 @core_router.post(
@@ -2387,13 +2793,14 @@ def grade_on_demand(
             skipped_reason="NO_REQUESTS",
         )
 
-    previous_result_ids = {
-        r.result_id
-        for r in storage.get_agent_success_evaluation_results(
-            limit=1000, agent_version=payload.agent_version
+    previous_result_ids = set(
+        storage.get_agent_success_evaluation_result_ids(
+            user_id=user_id,
+            session_id=payload.session_id,
+            evaluation_name=evaluation_name,
+            agent_version=payload.agent_version,
         )
-        if r.session_id == payload.session_id and r.evaluation_name == evaluation_name
-    }
+    )
 
     # Two operation_state rows are intentionally written for this session:
     #   1) `grade_on_demand::{org_id}::{session_id}::{agent_version}::{evaluation_name}`
@@ -2418,6 +2825,7 @@ def grade_on_demand(
 
     result_id = _find_fresh_result_id(
         storage,
+        user_id=user_id,
         session_id=payload.session_id,
         agent_version=payload.agent_version,
         evaluation_name=evaluation_name,
@@ -2470,8 +2878,8 @@ def get_recent_shadow_comparisons(
     Filters to the org's currently pinned
     ``Config.shadow_comparison_judge_prompt_version`` so verdicts produced
     under an older rubric do not mix into the drawer or the Top 10
-    disagreements widget. Storage returns verdicts in ascending ``created_at``
-    order; we reverse to "newest first" and cap at ``limit``.
+    disagreements widget. Storage returns verdicts newest-first and caps the
+    read at ``limit``.
 
     Args:
         limit (int): Max verdicts to return. Clamped to ``[1, 100]``.
@@ -2503,10 +2911,11 @@ def get_recent_shadow_comparisons(
 
     now = int(datetime.now(UTC).timestamp())
     try:
-        verdicts = storage.get_shadow_comparison_verdicts(
+        verdicts = storage.get_recent_shadow_comparison_verdicts(
             from_ts=now - _RECENT_SHADOW_COMPARISONS_LOOKBACK_SECONDS,
             to_ts=now,
             judge_prompt_version=pinned_version,
+            limit=clamped_limit,
         )
     except NotImplementedError:
         # Backends that don't support shadow verdicts (e.g., Disk) should
@@ -2514,9 +2923,7 @@ def get_recent_shadow_comparisons(
         # "no data yet" in the UI.
         return GetRecentShadowComparisonsResponse(verdicts=[])
 
-    # Storage contract returns ascending — flip to "newest first" and cap.
-    newest_first = list(reversed(verdicts))[:clamped_limit]
-    return GetRecentShadowComparisonsResponse(verdicts=newest_first)
+    return GetRecentShadowComparisonsResponse(verdicts=verdicts)
 
 
 @core_router.post(
@@ -2924,6 +3331,9 @@ def create_app(
     from reflexio.server.services.extraction.resume_scheduler import (
         maybe_start_resume_scheduler,
     )
+    from reflexio.server.services.lineage.gc_scheduler import (
+        maybe_start_lineage_gc,
+    )
 
     def _lifespan_org_id() -> str:
         if get_org_id is None:
@@ -2943,7 +3353,9 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         scheduler = None
+        gc_scheduler = None
         if mount_data_plane:
+            log_publish_hardware_capacity()
             validate_llm_availability()
             from reflexio.server.llm.rerank import prewarm as _prewarm_cross_encoder
 
@@ -2956,11 +3368,17 @@ def create_app(
                 lambda org_id: RequestContext(org_id=org_id),
                 bootstrap_org_id=_lifespan_org_id(),
             )
+            gc_scheduler = maybe_start_lineage_gc(
+                lambda org_id: RequestContext(org_id=org_id),
+                bootstrap_org_id=_lifespan_org_id(),
+            )
         try:
             yield
         finally:
             if scheduler is not None:
                 scheduler.stop()
+            if gc_scheduler is not None:
+                gc_scheduler.stop()
 
     app = FastAPI(docs_url="/docs", lifespan=lifespan)
 

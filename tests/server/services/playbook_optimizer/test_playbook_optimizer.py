@@ -498,6 +498,25 @@ def test_optimizer_selects_local_script_assistant(tmp_path):
     assert assistant.command == [sys.executable, "assistant.py"]
 
 
+def test_optimizer_skips_missing_local_script_assistant(tmp_path):
+    storage = _sqlite_storage(tmp_path)
+    config = PlaybookOptimizerConfig(
+        enabled=True,
+        assistant_script_path=str(tmp_path / "missing-assistant"),
+    )
+    optimizer = _optimizer_for_test(
+        storage,
+        Config(
+            storage_config=StorageConfigSQLite(db_path=str(tmp_path / "reflexio.db")),
+            playbook_optimizer_config=config,
+        ),
+    )
+
+    assistant = optimizer._create_assistant(config)
+
+    assert assistant is None
+
+
 def test_optimizer_splits_train_and_validation_windows(tmp_path):
     storage = _sqlite_storage(tmp_path)
     optimizer = _optimizer_for_test(
@@ -1021,6 +1040,44 @@ def test_sqlite_persists_source_mapping_and_winner_candidate(tmp_path):
     [persisted] = storage.list_playbook_optimization_candidates(job.job_id)
     assert persisted.aggregate_score == 0.86
     assert persisted.is_winner is True
+
+
+def test_sqlite_persists_candidate_metadata_json(tmp_path):
+    storage = _sqlite_storage(tmp_path)
+    job = storage.create_playbook_optimization_job(
+        PlaybookOptimizationJob(target_kind="user_playbook", target_id=10)
+    )
+    metadata_json = json.dumps(
+        {
+            "rollback_baseline": {
+                "user_playbook_id": 10,
+                "trigger": "refund request",
+                "content": "Explain the no-refund policy.",
+            },
+            "frozen_selection_set": {
+                "target_user_playbook_id": 10,
+                "sessions": [
+                    {
+                        "session_id": "sess-holdout-1",
+                        "is_success": False,
+                        "selection_reason": "held_out_failure",
+                    }
+                ],
+            },
+        }
+    )
+
+    storage.insert_playbook_optimization_candidate(
+        PlaybookOptimizationCandidate(
+            job_id=job.job_id,
+            candidate_index=0,
+            content="candidate",
+            metadata_json=metadata_json,
+        )
+    )
+
+    [persisted] = storage.list_playbook_optimization_candidates(job.job_id)
+    assert json.loads(persisted.metadata_json) == json.loads(metadata_json)
 
 
 def test_scenario_resolver_uses_snapshotted_source_windows_after_user_delete(tmp_path):

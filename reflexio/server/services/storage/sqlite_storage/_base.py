@@ -22,14 +22,10 @@ from typing import Any, ClassVar, Literal
 from reflexio.models.api_schema.common import BlockingIssue
 from reflexio.models.api_schema.service_schemas import (
     AgentPlaybook,
-    AgentPlaybookSnapshot,
-    AgentPlaybookUpdateEntry,
     AgentSuccessEvaluationResult,
     Citation,
     Interaction,
-    PlaybookAggregationChangeLog,
     PlaybookStatus,
-    ProfileChangeLog,
     ProfileTimeToLive,
     RegularVsShadow,
     Request,
@@ -66,6 +62,7 @@ from reflexio.server.services.storage.retention_mixin import (
 from reflexio.server.services.storage.storage_base import BaseStorage
 from reflexio.server.site_var.site_var_manager import SiteVarManager
 
+from ._governance import init_governance_tables
 from ._stall_state import init_stall_state_table
 
 logger = logging.getLogger(__name__)
@@ -285,6 +282,13 @@ def _true_rrf_merge(
     return [row for row, _ in scored[:match_count]]
 
 
+# Tombstone statuses: rows with these values are excluded from default reads.
+# Tasks 5/9/10 create tombstones; this constant ensures they stay hidden unless
+# explicitly requested via include_tombstones=True on by-id getters, or an
+# explicit status_filter on list/count methods.
+_TOMBSTONE_STATUS_VALUES = (Status.MERGED.value, Status.SUPERSEDED.value)
+
+
 def _status_value(status: Status | None) -> str | None:
     """Convert a Status enum (or None) to its DB string value."""
     if status is None:
@@ -351,9 +355,24 @@ def _iso_to_epoch(iso_str: str | None) -> int:
         return _epoch_now()
 
 
+# Bounds that ``datetime.fromtimestamp(tz=UTC)`` can represent (year 1..9999).
+# Callers pass sentinel "open" bounds — e.g. ``to_ts=10**12`` for "no upper
+# limit" or ``0`` for "from the beginning" — which would otherwise overflow
+# ``datetime.fromtimestamp`` with a ``ValueError``. Clamping to these bounds
+# yields the same query semantics (the ISO string still sorts before/after every
+# stored row) with a valid value.
+_MAX_SAFE_EPOCH_TS = 253_402_300_799  # 9999-12-31T23:59:59Z
+_MIN_SAFE_EPOCH_TS = 0  # 1970-01-01T00:00:00Z
+
+
 def _epoch_to_iso(ts: int) -> str:
-    """Convert a Unix timestamp to ISO 8601 string."""
-    return datetime.fromtimestamp(ts, tz=UTC).isoformat()
+    """Convert a Unix timestamp (seconds) to an ISO 8601 string.
+
+    Out-of-range sentinel bounds are clamped to the representable range so that
+    callers passing "open" window bounds never trigger a ``ValueError``.
+    """
+    clamped = max(_MIN_SAFE_EPOCH_TS, min(ts, _MAX_SAFE_EPOCH_TS))
+    return datetime.fromtimestamp(clamped, tz=UTC).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +398,10 @@ def _row_to_profile(row: sqlite3.Row) -> UserProfile:
         source_span=d.get("source_span"),
         notes=d.get("notes"),
         reader_angle=d.get("reader_angle"),
+        tags=_json_loads(d.get("tags")),
+        source_interaction_ids=_json_loads(d.get("source_interaction_ids")) or [],
+        merged_into=d.get("merged_into"),
+        superseded_by=d.get("superseded_by"),
     )
 
 
@@ -406,6 +429,7 @@ def _row_to_interaction(row: sqlite3.Row) -> Interaction:
         user_action=UserActionType(d["user_action"]),
         user_action_description=d["user_action_description"],
         interacted_image_url=d["interacted_image_url"],
+        image_encoding=d.get("image_encoding") or "",
         shadow_content=d.get("shadow_content") or "",
         expert_content=d.get("expert_content") or "",
         tools_used=tools_used,
@@ -451,11 +475,14 @@ def _row_to_user_playbook(
         status=Status(d["status"]) if d.get("status") else None,
         source=d.get("source"),
         source_interaction_ids=_json_loads(d.get("source_interaction_ids")) or [],
+        tags=_json_loads(d.get("tags")),
         embedding=embedding,
         expanded_terms=d.get("expanded_terms"),
         source_span=d.get("source_span"),
         notes=d.get("notes"),
         reader_angle=d.get("reader_angle"),
+        merged_into=d.get("merged_into"),
+        superseded_by=d.get("superseded_by"),
     )
 
 
@@ -476,9 +503,12 @@ def _row_to_agent_playbook(row: sqlite3.Row) -> AgentPlaybook:
         if d.get("playbook_status")
         else PlaybookStatus.PENDING,
         playbook_metadata=d.get("playbook_metadata") or "",
+        tags=_json_loads(d.get("tags")),
         embedding=[],
         status=Status(d["status"]) if d.get("status") else None,
         expanded_terms=d.get("expanded_terms"),
+        merged_into=d.get("merged_into"),
+        superseded_by=d.get("superseded_by"),
     )
 
 
@@ -486,6 +516,7 @@ def _row_to_eval_result(row: sqlite3.Row) -> AgentSuccessEvaluationResult:
     d = dict(row)
     return AgentSuccessEvaluationResult(
         result_id=d["result_id"],
+        user_id=d.get("user_id") or "",
         session_id=d["session_id"],
         agent_version=d["agent_version"],
         evaluation_name=d.get("evaluation_name"),
@@ -502,53 +533,6 @@ def _row_to_eval_result(row: sqlite3.Row) -> AgentSuccessEvaluationResult:
         user_turns_to_resolution=d.get("user_turns_to_resolution"),
         is_escalated=bool(d.get("is_escalated", False)),
         embedding=[],
-    )
-
-
-def _row_to_profile_change_log(row: sqlite3.Row) -> ProfileChangeLog:
-    d = dict(row)
-    return ProfileChangeLog(
-        id=d["id"],
-        user_id=d["user_id"],
-        request_id=d["request_id"],
-        created_at=d["created_at"],
-        added_profiles=[
-            UserProfile(**p) for p in (_json_loads(d["added_profiles"]) or [])
-        ],
-        removed_profiles=[
-            UserProfile(**p) for p in (_json_loads(d["removed_profiles"]) or [])
-        ],
-        mentioned_profiles=[
-            UserProfile(**p) for p in (_json_loads(d["mentioned_profiles"]) or [])
-        ],
-    )
-
-
-def _row_to_playbook_aggregation_change_log(
-    row: sqlite3.Row,
-) -> PlaybookAggregationChangeLog:
-    d = dict(row)
-    return PlaybookAggregationChangeLog(
-        id=d["id"],
-        created_at=d["created_at"],
-        playbook_name=d["playbook_name"],
-        agent_version=d["agent_version"],
-        run_mode=d["run_mode"],
-        added_agent_playbooks=[
-            AgentPlaybookSnapshot(**fb)
-            for fb in (_json_loads(d.get("added_playbooks")) or [])
-        ],
-        removed_agent_playbooks=[
-            AgentPlaybookSnapshot(**fb)
-            for fb in (_json_loads(d.get("removed_playbooks")) or [])
-        ],
-        updated_agent_playbooks=[
-            AgentPlaybookUpdateEntry(
-                before=AgentPlaybookSnapshot(**entry["before"]),
-                after=AgentPlaybookSnapshot(**entry["after"]),
-            )
-            for entry in (_json_loads(d.get("updated_playbooks")) or [])
-        ],
     )
 
 
@@ -648,9 +632,18 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
     def migrate(self) -> bool:
         self._migrate_feedback_schema()
         self._migrate_interactions_schema()
+        # Backfill columns that _DDL indexes depend on BEFORE running _DDL.
+        # _DDL builds idx_eval_identity_created_at_desc on
+        # agent_success_evaluation_result(user_id, ...). On a pre-existing DB that
+        # table predates user_id, so executescript(_DDL) raises "no such column:
+        # user_id" and migrate() never reaches the backfill below — leaving the DB
+        # permanently stuck. The helper is guarded (no-ops when the table is
+        # absent), so running it before _DDL is safe on fresh databases too.
+        self._migrate_eval_result_user_id()
         with self._lock:
             cur = self.conn.cursor()
             cur.executescript(_DDL)
+            init_governance_tables(self.conn)
             self.conn.commit()
         if self._has_sqlite_vec:
             self._create_vec_tables()
@@ -659,12 +652,22 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         self._migrate_agent_runs_schema()
         self._migrate_pending_tool_calls_schema()
         self._migrate_expanded_terms()
+        self._migrate_tags()
+        self._migrate_profile_source_interaction_ids()
+        self._migrate_interaction_window_indexes()
         self._migrate_agentic_signals()
         self._migrate_agent_playbook_source_windows()
         self._migrate_request_evaluation_only()
         self._migrate_request_session_id_required()
+        # _migrate_eval_result_user_id() runs before _DDL (see above).
         self._migrate_shadow_comparison_verdicts()
         self._migrate_user_playbook_polarity()
+        self._migrate_lineage()
+        self._migrate_retired_at()
+        self._migrate_lineage_event_table()
+        self._migrate_playbook_optimization_candidate_metadata()
+        self._migrate_retire_profile_change_logs()
+        self._migrate_retire_playbook_aggregation_change_logs()
         init_stall_state_table(self.conn)
         return True
 
@@ -703,9 +706,13 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         # Wrap dependency + target deletes in a single critical section so
         # concurrent writers see either both or neither.
         with self._lock:
-            self._retention_delete_dependencies(target, keys)
-            self._retention_delete_target_rows(target, keys)
-            self.conn.commit()
+            try:
+                self._retention_delete_dependencies(target, keys)
+                self._retention_delete_target_rows(target, keys)
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def _retention_delete_dependencies(
         self, target: RetentionTarget, keys: list[tuple[Any, ...]]
@@ -720,10 +727,14 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             self._delete_profile_search_rows([str(v) for v in ids])
         elif target_name == "user_playbooks":
             self._delete_source_windows_for_user_playbook_ids([int(v) for v in ids])
-            self._delete_playbook_search_rows("user", [int(v) for v in ids])
+            self._delete_playbook_search_rows(
+                "user", [int(v) for v in ids], commit=False
+            )
         elif target_name == "agent_playbooks":
             self._delete_source_windows_for_agent_playbook_ids([int(v) for v in ids])
-            self._delete_playbook_search_rows("agent", [int(v) for v in ids])
+            self._delete_playbook_search_rows(
+                "agent", [int(v) for v in ids], commit=False
+            )
         elif target_name == "playbook_optimization_jobs":
             self._delete_optimizer_rows_for_job_ids([int(v) for v in ids])
         elif target_name == "playbook_optimization_candidates":
@@ -798,29 +809,63 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         self._delete_in_chunks("interactions", "request_id", request_ids)
 
     def _delete_interaction_search_rows(self, interaction_ids: list[int]) -> None:
+        """Remove fts + vec index rows for the given interaction IDs.
+
+        Non-committing: participates in the caller's transaction.  Only called
+        from inside the retention atomic block (_retention_perform_delete).
+        """
         if not interaction_ids:
             return
         self._delete_in_chunks("interactions_fts", "rowid", interaction_ids)
-        for interaction_id in interaction_ids:
-            self._vec_delete("interactions_vec", interaction_id)
+        if self._has_sqlite_vec:
+            self._delete_in_chunks("interactions_vec", "rowid", interaction_ids)
 
     def _delete_profile_search_rows(self, profile_ids: list[str]) -> None:
+        """Remove fts + vec index rows for the given profile IDs.
+
+        Non-committing: participates in the caller's transaction.  Only called
+        from inside the retention atomic block (_retention_perform_delete).
+        profiles_fts is keyed by profile_id (TEXT); profiles_vec by rowid (INT).
+        """
         if not profile_ids:
             return
-        rows = self._select_in_chunks(
-            "SELECT rowid, profile_id FROM profiles WHERE profile_id IN ({placeholders})",
-            profile_ids,
-        )
-        for row in rows:
-            self._fts_delete_profile(row["profile_id"])
-            self._vec_delete("profiles_vec", row["rowid"])
+        self._delete_in_chunks("profiles_fts", "profile_id", profile_ids)
+        if self._has_sqlite_vec:
+            rows = self._select_in_chunks(
+                "SELECT rowid FROM profiles WHERE profile_id IN ({placeholders})",
+                profile_ids,
+            )
+            rowids = [row["rowid"] for row in rows]
+            if rowids:
+                self._delete_in_chunks("profiles_vec", "rowid", rowids)
 
-    def _delete_playbook_search_rows(self, kind: str, ids: list[int]) -> None:
+    def _delete_playbook_search_rows(
+        self, kind: str, ids: list[int], *, commit: bool = True
+    ) -> None:
+        """Remove fts + vec index rows for the given playbook IDs.
+
+        Args:
+            kind: ``"user"`` or ``"agent"``.
+            ids: Playbook row IDs to remove from the search indexes.
+            commit: When ``True`` (default) commits after the deletes so the
+                after-commit callers in ``_playbook.py`` get a clean, durable
+                cleanup.  Pass ``commit=False`` from inside the retention atomic
+                block so the deletes participate in the single block-level commit
+                (``_retention_perform_delete``).
+
+        Note: callers may already hold ``self._lock`` when calling this (the
+        ``commit=False`` retention/atomic-delete call sites do). The internal
+        ``with self._lock:`` re-acquire is safe ONLY because ``self._lock`` is a
+        reentrant ``threading.RLock``; a non-reentrant lock would deadlock here.
+        """
         if not ids:
             return
-        self._delete_in_chunks(f"{kind}_playbooks_fts", "rowid", ids)
-        for item_id in ids:
-            self._vec_delete(f"{kind}_playbooks_vec", item_id)
+        with self._lock:
+            self._delete_in_chunks(f"{kind}_playbooks_fts", "rowid", ids)
+            if self._has_sqlite_vec:
+                self._delete_in_chunks(f"{kind}_playbooks_vec", "rowid", ids)
+            if commit:
+                self.conn.commit()
 
     def _delete_source_windows_for_agent_playbook_ids(
         self, agent_playbook_ids: list[int]
@@ -942,6 +987,14 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             logger.info("Adding citations column to interactions table.")
             with self._lock:
                 self.conn.execute("ALTER TABLE interactions ADD COLUMN citations TEXT")
+                self.conn.commit()
+
+        if "image_encoding" not in columns:
+            logger.info("Adding image_encoding column to interactions table.")
+            with self._lock:
+                self.conn.execute(
+                    "ALTER TABLE interactions ADD COLUMN image_encoding TEXT NOT NULL DEFAULT ''"
+                )
                 self.conn.commit()
 
     def _migrate_feedback_schema(self) -> None:
@@ -1106,6 +1159,39 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                 logger.info("Added expanded_terms column to %s", table)
         self.conn.commit()
 
+    def _migrate_tags(self) -> None:
+        """Add tags column if missing."""
+        for table in ("profiles", "user_playbooks", "agent_playbooks"):
+            cols = {
+                row["name"]
+                for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "tags" not in cols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN tags TEXT")
+                logger.info("Added tags column to %s", table)
+        self.conn.commit()
+
+    def _migrate_profile_source_interaction_ids(self) -> None:
+        """Add profile source interaction ids for provenance on existing DBs."""
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(profiles)").fetchall()
+        }
+        if "source_interaction_ids" not in cols:
+            self.conn.execute(
+                "ALTER TABLE profiles ADD COLUMN source_interaction_ids TEXT"
+            )
+            logger.info("Added source_interaction_ids column to profiles")
+        self.conn.commit()
+
+    def _migrate_interaction_window_indexes(self) -> None:
+        """Add composite indexes used by sliding-window provenance lookups."""
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_interactions_user_created_at_desc "
+            "ON interactions(user_id, created_at DESC, interaction_id DESC)"
+        )
+        self.conn.commit()
+
     def _migrate_agent_runs_schema(self) -> None:
         """Add resumable-agent run columns if missing from existing SQLite DBs."""
         cols = {
@@ -1174,6 +1260,194 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             self.conn.execute("ALTER TABLE user_playbooks DROP COLUMN polarity")
             logger.info("Dropped legacy polarity column from user_playbooks")
         self.conn.commit()
+
+    def _migrate_lineage(self) -> None:
+        """Add merged_into/superseded_by forward-pointer columns if missing.
+
+        Backfill-safe: columns are nullable with no default. INTEGER for playbook
+        tables (int foreign-key pointers), TEXT for profiles (str profile_id pointers).
+        """
+        int_tables = {"user_playbooks": "INTEGER", "agent_playbooks": "INTEGER"}
+        str_tables = {"profiles": "TEXT"}
+        for table, coltype in {**int_tables, **str_tables}.items():
+            cols = {
+                row["name"]
+                for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for col in ("merged_into", "superseded_by"):
+                if col not in cols:
+                    self.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"  # noqa: S608
+                    )
+                    logger.info("Added %s column to %s", col, table)
+        self.conn.commit()
+
+    def _migrate_retired_at(self) -> None:
+        """Add nullable ``retired_at INTEGER`` GC column to tombstone-bearing tables.
+
+        Backfill-safe: column is nullable with no default. Existing tombstones
+        will have ``retired_at = NULL`` (conservative — GC T2 uses ``retired_at``
+        as the age signal, so old tombstones without it are simply not yet eligible
+        by the new clock; ops can backfill via T4 if needed).
+        Also creates the covering index for GC queries (idempotent).
+        """
+        with self._lock:
+            for table in ("profiles", "user_playbooks", "agent_playbooks"):
+                cols = {
+                    row["name"]
+                    for row in self.conn.execute(
+                        f"PRAGMA table_info({table})"  # noqa: S608
+                    ).fetchall()
+                }
+                if "retired_at" not in cols:
+                    self.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN retired_at INTEGER"  # noqa: S608
+                    )
+                    logger.info("Added retired_at column to %s", table)
+                self.conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_retired_at "  # noqa: S608
+                    f"ON {table}(status, retired_at)"
+                )
+            self.conn.commit()
+
+    def _migrate_lineage_event_table(self) -> None:
+        """Create the lineage_event table + index for existing databases (idempotent)."""
+        with self._lock:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS lineage_event (
+                    event_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    org_id           TEXT NOT NULL,
+                    entity_type      TEXT NOT NULL,
+                    entity_id        TEXT NOT NULL,
+                    op               TEXT NOT NULL,
+                    prov_relation    TEXT NOT NULL DEFAULT '',
+                    source_ids       TEXT NOT NULL DEFAULT '[]',
+                    actor            TEXT NOT NULL DEFAULT '',
+                    request_id       TEXT NOT NULL DEFAULT '',
+                    reason           TEXT NOT NULL DEFAULT '',
+                    created_at       INTEGER NOT NULL,
+                    UNIQUE (org_id, entity_type, entity_id, op, request_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_lineage_entity
+                    ON lineage_event (entity_type, entity_id);
+            """)
+            existing_cols = {
+                row["name"]
+                for row in self.conn.execute(
+                    "PRAGMA table_info(lineage_event)"
+                ).fetchall()
+            }
+            for col in ("from_status", "to_status", "status_namespace"):
+                if col not in existing_cols:
+                    self.conn.execute(
+                        f"ALTER TABLE lineage_event ADD COLUMN {col} TEXT"  # noqa: S608
+                    )
+                    logger.info("Added %s column to lineage_event", col)
+            self.conn.commit()
+
+    def _migrate_playbook_optimization_candidate_metadata(self) -> None:
+        """Add metadata_json to legacy optimizer candidate tables when missing."""
+        cols = {
+            row["name"]
+            for row in self.conn.execute(
+                "PRAGMA table_info(playbook_optimization_candidates)"
+            ).fetchall()
+        }
+        if not cols:
+            return
+        if "metadata_json" not in cols:
+            self.conn.execute(
+                "ALTER TABLE playbook_optimization_candidates "
+                "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+            logger.info(
+                "Added metadata_json column to playbook_optimization_candidates"
+            )
+        self.conn.commit()
+
+    def _migrate_retire_profile_change_logs(self) -> None:
+        """Retire the frozen ``profile_change_logs`` table via a reversible RENAME.
+
+        Lineage B3 Task 8: the legacy change log is fully de-referenced (no
+        readers, writers, or GDPR delete callers remain) and the view is served
+        from reconstruction. We rename the table out of the way now and DROP it
+        in a later migration after the recovery window — keeping the data
+        recoverable in the interim.
+
+        Idempotent: SQLite has no ``RENAME ... IF EXISTS``, so we guard on the
+        source table's presence and no-op once it has been renamed. The
+        ``CREATE TABLE`` for ``profile_change_logs`` was deleted from ``_DDL`` so
+        ``executescript(_DDL)`` does not recreate an empty table after the rename.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("profile_change_logs",),
+            ).fetchone()
+            if row is None:
+                return
+            target_row = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("profile_change_logs_retired_20260623",),
+            ).fetchone()
+            if target_row is not None:
+                logger.info(
+                    "Retired target profile_change_logs_retired_20260623 already exists;"
+                    " skipping rename (idempotent no-op)."
+                )
+                return
+            self.conn.execute(
+                "ALTER TABLE profile_change_logs "
+                "RENAME TO profile_change_logs_retired_20260623"
+            )
+            logger.info(
+                "Renamed profile_change_logs to "
+                "profile_change_logs_retired_20260623 (B3 Task 8 retirement)"
+            )
+            self.conn.commit()
+
+    def _migrate_retire_playbook_aggregation_change_logs(self) -> None:
+        """Retire the frozen ``playbook_aggregation_change_logs`` table via a reversible RENAME.
+
+        Lineage Track B Task 4: the legacy change log is fully de-referenced (no
+        readers, writers, or GDPR delete callers remain) and the view is served
+        from reconstruction. We rename the table out of the way now and DROP it
+        in a later migration after the recovery window — keeping the data
+        recoverable in the interim.
+
+        Idempotent: SQLite has no ``RENAME ... IF EXISTS``, so we guard on the
+        source table's presence and no-op once it has been renamed. The
+        ``CREATE TABLE`` for ``playbook_aggregation_change_logs`` was deleted from
+        ``_DDL`` so ``executescript(_DDL)`` does not recreate an empty table after
+        the rename.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("playbook_aggregation_change_logs",),
+            ).fetchone()
+            if row is None:
+                return
+            target_row = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("playbook_aggregation_change_logs_retired_20260624",),
+            ).fetchone()
+            if target_row is not None:
+                logger.info(
+                    "Retired target playbook_aggregation_change_logs_retired_20260624"
+                    " already exists; skipping rename (idempotent no-op)."
+                )
+                return
+            self.conn.execute(
+                "ALTER TABLE playbook_aggregation_change_logs "
+                "RENAME TO playbook_aggregation_change_logs_retired_20260624"
+            )
+            logger.info(
+                "Renamed playbook_aggregation_change_logs to "
+                "playbook_aggregation_change_logs_retired_20260624 "
+                "(Track B Task 4 retirement)"
+            )
+            self.conn.commit()
 
     def _migrate_agent_playbook_source_windows(self) -> None:
         """Add source window snapshots to existing agent source mappings."""
@@ -1293,6 +1567,30 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         )
         self.conn.commit()
         logger.info("Migrated requests.session_id to required non-empty values")
+
+    def _migrate_eval_result_user_id(self) -> None:
+        """Add user_id to session evaluation results for per-user identity."""
+        cols = {
+            row["name"]
+            for row in self.conn.execute(
+                "PRAGMA table_info(agent_success_evaluation_result)"
+            ).fetchall()
+        }
+        if not cols:
+            return
+        if "user_id" not in cols:
+            self.conn.execute(
+                "ALTER TABLE agent_success_evaluation_result "
+                "ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"
+            )
+            logger.info("Added user_id column to agent_success_evaluation_result")
+        self.conn.execute("DROP INDEX IF EXISTS idx_eval_identity_created_at_desc")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_eval_identity_created_at_desc "
+            "ON agent_success_evaluation_result"
+            "(user_id, session_id, evaluation_name, agent_version, created_at DESC)"
+        )
+        self.conn.commit()
 
     def _migrate_shadow_comparison_verdicts(self) -> None:
         """F1: create the shadow_comparison_verdicts table if missing.
@@ -1531,28 +1829,51 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
     # ------------------------------------------------------------------
 
     def clear_user_data(self, user_id: str) -> dict[str, int]:
-        """Atomic per-``user_id`` row deletion across all user-scoped tables.
+        """Per-``user_id`` row deletion across all user-scoped tables.
 
-        Overrides the BaseStorage default with a single-transaction SQL
-        implementation. Removes interactions, user playbooks, profiles,
-        and requests scoped to the user. Intentionally does NOT touch
-        ``agent_playbooks`` — they are the cross-project rollup of
-        skills and have no ``user_id`` column.
+        Overrides the BaseStorage default with an optimized SQL implementation.
+        Removes interactions, user playbooks, profiles, and requests scoped to
+        the user. Intentionally does NOT touch ``agent_playbooks`` — they are
+        the cross-project rollup of skills and have no ``user_id`` column.
 
         Also cleans up FTS and vector sidecars for the user's rows so
         subsequent searches don't surface deleted data.
+
+        **Lineage-aware erasure for profiles and user_playbooks:**
+        Rows that are tombstones (``merged_into`` or ``superseded_by`` is set)
+        *or* are pointed-to by another row (``has_inbound_lineage_refs`` returns
+        True) are **content-purged** (skeleton kept, body blanked) rather than
+        hard-deleted. This preserves chain resolution across user erasures.
+        Standalone rows with no lineage involvement are hard-deleted as before.
+
+        The purge/delete decision delegates to
+        ``BaseStorage._partition_purge_vs_delete`` so the logic is defined once
+        and shared with the default ``clear_user_data`` implementation used by
+        Supabase/Postgres backends.
+
+        **Commit ordering (atomicity invariant):**
+        The hard-deletes for interactions, requests, and the delete-sets of
+        profiles/user_playbooks are committed in one transaction first. Then
+        ``purge_content`` is called for each purge-eligible row — each call
+        commits atomically on its own. This two-phase approach is required
+        because ``purge_content`` issues its own ``conn.commit()``, and nesting
+        it inside the outer transaction would prematurely flush the still-pending
+        hard-DELETEs.
 
         Args:
             user_id (str): The user id whose rows should be deleted.
 
         Returns:
-            dict[str, int]: Per-entity deletion counts with keys
-                ``interactions``, ``user_playbooks``, ``profiles``, and
-                ``requests``.
+            dict[str, int]: Per-entity counts with keys ``interactions``,
+                ``user_playbooks``, ``profiles``, ``requests``,
+                ``purged_profiles``, and ``purged_user_playbooks``.
+                ``profiles`` and ``user_playbooks`` reflect hard-deleted counts;
+                purged rows are counted separately.
         """
         with self._lock:
-            # Snapshot rowids/ids that need FTS or vector cleanup before
-            # the DELETE removes them from the main tables.
+            # ------------------------------------------------------------------
+            # Phase 1: snapshot all user-scoped ids before any mutations.
+            # ------------------------------------------------------------------
             interaction_ids = [
                 r["interaction_id"]
                 for r in self.conn.execute(
@@ -1560,7 +1881,7 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                     (user_id,),
                 ).fetchall()
             ]
-            user_playbook_ids = [
+            raw_upb_ids = [
                 r["user_playbook_id"]
                 for r in self.conn.execute(
                     "SELECT user_playbook_id FROM user_playbooks WHERE user_id = ?",
@@ -1571,67 +1892,97 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                 "SELECT rowid, profile_id FROM profiles WHERE user_id = ?",
                 (user_id,),
             ).fetchall()
-            profile_rowids = [r["rowid"] for r in profile_rows]
-            profile_ids = [r["profile_id"] for r in profile_rows]
 
-            # FTS cleanup
-            if interaction_ids:
-                ph = ",".join("?" for _ in interaction_ids)
-                self.conn.execute(
-                    f"DELETE FROM interactions_fts WHERE rowid IN ({ph})",
-                    interaction_ids,
-                )
-            if user_playbook_ids:
-                ph = ",".join("?" for _ in user_playbook_ids)
-                self.conn.execute(
-                    f"DELETE FROM user_playbooks_fts WHERE rowid IN ({ph})",
-                    user_playbook_ids,
-                )
-            if profile_ids:
-                ph = ",".join("?" for _ in profile_ids)
-                self.conn.execute(
-                    f"DELETE FROM profiles_fts WHERE profile_id IN ({ph})",
-                    profile_ids,
-                )
+            # Build a rowid lookup for FTS/vec cleanup (SQLite-specific need).
+            profile_rowid_by_id: dict[str, int] = {
+                r["profile_id"]: r["rowid"] for r in profile_rows
+            }
+            all_profile_ids = list(profile_rowid_by_id.keys())
 
-            # Vector index cleanup (best-effort: only if sqlite-vec loaded)
+            # ------------------------------------------------------------------
+            # Phase 2: partition profiles and user_playbooks into purge vs delete.
+            # Delegates to the shared BaseStorage helper so the decision logic
+            # is defined once and reused by all backends.
+            # ------------------------------------------------------------------
+            purge_profile_ids, delete_profile_ids = self._partition_purge_vs_delete(
+                "profile", all_profile_ids
+            )
+            purge_upb_str_ids, delete_upb_str_ids = self._partition_purge_vs_delete(
+                "user_playbook", [str(uid) for uid in raw_upb_ids]
+            )
+            purge_upb_ids = [int(s) for s in purge_upb_str_ids]
+            delete_upb_ids = [int(s) for s in delete_upb_str_ids]
+
+            # Rowids for the delete-set only (purge_content handles its own cleanup).
+            delete_profile_rowids = [
+                profile_rowid_by_id[pid]
+                for pid in delete_profile_ids
+                if pid in profile_rowid_by_id
+            ]
+
+            # ------------------------------------------------------------------
+            # Phase 3: FTS and vector cleanup — only for the delete-sets
+            # (purge_content handles its own index cleanup for purged rows).
+            # Use _delete_in_chunks to stay under SQLite's SQLITE_MAX_VARIABLE_NUMBER
+            # limit for large user datasets.
+            # ------------------------------------------------------------------
+            self._delete_in_chunks("interactions_fts", "rowid", interaction_ids)
+            self._delete_in_chunks("user_playbooks_fts", "rowid", delete_upb_ids)
+            self._delete_in_chunks("profiles_fts", "profile_id", delete_profile_ids)
+
             if self._has_sqlite_vec:
-                vec_targets = (
-                    ("interactions_vec", interaction_ids),
-                    ("user_playbooks_vec", user_playbook_ids),
-                    ("profiles_vec", profile_rowids),
-                )
-                for vec_table, rowids in vec_targets:
-                    if rowids:
-                        ph = ",".join("?" for _ in rowids)
-                        self.conn.execute(
-                            f"DELETE FROM {vec_table} WHERE rowid IN ({ph})",
-                            rowids,
-                        )
+                self._delete_in_chunks("interactions_vec", "rowid", interaction_ids)
+                self._delete_in_chunks("user_playbooks_vec", "rowid", delete_upb_ids)
+                self._delete_in_chunks("profiles_vec", "rowid", delete_profile_rowids)
 
-            # Main-table deletes. Order matters only for foreign key
-            # integrity; SQLite default has FK off for most tables here
-            # so order is chosen for readability.
+            # ------------------------------------------------------------------
+            # Phase 4: hard-delete the delete-sets and all interactions/requests.
+            # ------------------------------------------------------------------
             interactions_cur = self.conn.execute(
                 "DELETE FROM interactions WHERE user_id = ?", (user_id,)
-            )
-            user_playbooks_cur = self.conn.execute(
-                "DELETE FROM user_playbooks WHERE user_id = ?", (user_id,)
-            )
-            profiles_cur = self.conn.execute(
-                "DELETE FROM profiles WHERE user_id = ?", (user_id,)
             )
             requests_cur = self.conn.execute(
                 "DELETE FROM requests WHERE user_id = ?", (user_id,)
             )
+            upb_deleted_count = 0
+            if delete_upb_ids:
+                # Clean up source-window join rows before deleting the parent rows.
+                self._delete_source_windows_for_user_playbook_ids(delete_upb_ids)
+                self._delete_in_chunks(
+                    "user_playbooks", "user_playbook_id", delete_upb_ids
+                )
+                # rowcount not available from _delete_in_chunks; derive from list length
+                # (all ids came from a pre-snapshot so they exist at delete time).
+                upb_deleted_count = len(delete_upb_ids)
+            profile_deleted_count = 0
+            if delete_profile_ids:
+                self._delete_in_chunks("profiles", "profile_id", delete_profile_ids)
+                profile_deleted_count = len(delete_profile_ids)
+
+            # Commit the hard-deletes before calling purge_content, because
+            # purge_content issues its own conn.commit() and nesting it here
+            # would prematurely flush the still-pending deletes.
             self.conn.commit()
 
-            return {
-                "interactions": interactions_cur.rowcount,
-                "user_playbooks": user_playbooks_cur.rowcount,
-                "profiles": profiles_cur.rowcount,
-                "requests": requests_cur.rowcount,
-            }
+            # Phase 5: content-purge the purge-sets WITHOUT releasing the lock,
+            # so erase-eligible rows are never observable by another thread with
+            # PII still intact between the hard-delete commit and the purge. Each
+            # purge_content call self-commits; self._lock is an RLock so its
+            # internal ``with self._lock`` re-acquires cleanly, and the commit
+            # above already closed the outer transaction (no flush hazard).
+            for pid in purge_profile_ids:
+                self.purge_content(entity_type="profile", entity_id=str(pid))
+            for upid in purge_upb_ids:
+                self.purge_content(entity_type="user_playbook", entity_id=str(upid))
+
+        return {
+            "interactions": interactions_cur.rowcount,
+            "user_playbooks": upb_deleted_count,
+            "profiles": profile_deleted_count,
+            "requests": requests_cur.rowcount,
+            "purged_profiles": len(purge_profile_ids),
+            "purged_user_playbooks": len(purge_upb_ids),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1653,10 +2004,15 @@ CREATE TABLE IF NOT EXISTS profiles (
     status TEXT,
     extractor_names TEXT,
     expanded_terms TEXT,
+    tags TEXT,
+    source_interaction_ids TEXT,
     source_span TEXT,
     notes TEXT,
     reader_angle TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    merged_into TEXT,
+    superseded_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    retired_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_profiles_user_id ON profiles(user_id);
 CREATE INDEX IF NOT EXISTS idx_profiles_status ON profiles(status);
@@ -1671,6 +2027,7 @@ CREATE TABLE IF NOT EXISTS interactions (
     user_action TEXT NOT NULL DEFAULT 'none',
     user_action_description TEXT NOT NULL DEFAULT '',
     interacted_image_url TEXT NOT NULL DEFAULT '',
+    image_encoding TEXT NOT NULL DEFAULT '',
     shadow_content TEXT NOT NULL DEFAULT '',
     expert_content TEXT NOT NULL DEFAULT '',
     tools_used TEXT,
@@ -1680,6 +2037,8 @@ CREATE TABLE IF NOT EXISTS interactions (
 CREATE INDEX IF NOT EXISTS idx_interactions_user_id ON interactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_request_id ON interactions(request_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_created_at ON interactions(created_at);
+CREATE INDEX IF NOT EXISTS idx_interactions_user_created_at_desc
+    ON interactions(user_id, created_at DESC, interaction_id DESC);
 
 CREATE TABLE IF NOT EXISTS requests (
     request_id TEXT PRIMARY KEY,
@@ -1693,6 +2052,8 @@ CREATE TABLE IF NOT EXISTS requests (
 CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id);
 CREATE INDEX IF NOT EXISTS idx_requests_session_id ON requests(session_id);
 CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
+CREATE INDEX IF NOT EXISTS idx_requests_session_created_at_asc
+    ON requests(session_id, created_at ASC, request_id ASC);
 
 CREATE TABLE IF NOT EXISTS user_playbooks (
     user_playbook_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1710,9 +2071,13 @@ CREATE TABLE IF NOT EXISTS user_playbooks (
     source TEXT,
     embedding TEXT,
     expanded_terms TEXT,
+    tags TEXT,
     source_span TEXT,
     notes TEXT,
-    reader_angle TEXT
+    reader_angle TEXT,
+    merged_into INTEGER,
+    superseded_by INTEGER,
+    retired_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_playbook_name ON user_playbooks(playbook_name);
 CREATE INDEX IF NOT EXISTS idx_user_playbooks_agent_version ON user_playbooks(agent_version);
@@ -1732,7 +2097,11 @@ CREATE TABLE IF NOT EXISTS agent_playbooks (
     playbook_metadata TEXT NOT NULL DEFAULT '',
     embedding TEXT,
     expanded_terms TEXT,
-    status TEXT
+    tags TEXT,
+    status TEXT,
+    merged_into INTEGER,
+    superseded_by INTEGER,
+    retired_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_agent_playbooks_playbook_name ON agent_playbooks(playbook_name);
 CREATE INDEX IF NOT EXISTS idx_agent_playbooks_agent_version ON agent_playbooks(agent_version);
@@ -1741,6 +2110,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_playbooks_created_at ON agent_playbooks(cre
 
 CREATE TABLE IF NOT EXISTS agent_success_evaluation_result (
     result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL,
     agent_version TEXT NOT NULL DEFAULT '',
     evaluation_name TEXT,
@@ -1756,31 +2126,12 @@ CREATE TABLE IF NOT EXISTS agent_success_evaluation_result (
 );
 CREATE INDEX IF NOT EXISTS idx_eval_agent_version ON agent_success_evaluation_result(agent_version);
 CREATE INDEX IF NOT EXISTS idx_eval_created_at ON agent_success_evaluation_result(created_at);
-
-CREATE TABLE IF NOT EXISTS profile_change_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    added_profiles TEXT NOT NULL DEFAULT '[]',
-    removed_profiles TEXT NOT NULL DEFAULT '[]',
-    mentioned_profiles TEXT NOT NULL DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_pcl_user_id ON profile_change_logs(user_id);
-CREATE INDEX IF NOT EXISTS idx_pcl_created_at ON profile_change_logs(created_at);
-
-CREATE TABLE IF NOT EXISTS playbook_aggregation_change_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at INTEGER NOT NULL,
-    playbook_name TEXT NOT NULL,
-    agent_version TEXT NOT NULL,
-    run_mode TEXT NOT NULL,
-    added_playbooks TEXT NOT NULL DEFAULT '[]',
-    removed_playbooks TEXT NOT NULL DEFAULT '[]',
-    updated_playbooks TEXT NOT NULL DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_pacl_playbook_name ON playbook_aggregation_change_logs(playbook_name);
-CREATE INDEX IF NOT EXISTS idx_pacl_agent_version ON playbook_aggregation_change_logs(agent_version);
+CREATE INDEX IF NOT EXISTS idx_eval_created_at_desc
+    ON agent_success_evaluation_result(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_eval_agent_version_created_at_desc
+    ON agent_success_evaluation_result(agent_version, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_eval_identity_created_at_desc
+    ON agent_success_evaluation_result(user_id, session_id, evaluation_name, agent_version, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS agent_playbook_source_user_playbooks (
     agent_playbook_id INTEGER NOT NULL,
@@ -1815,6 +2166,7 @@ CREATE TABLE IF NOT EXISTS playbook_optimization_candidates (
     parent_candidate_ids TEXT NOT NULL DEFAULT '[]',
     aggregate_score REAL,
     is_winner INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_poc_job ON playbook_optimization_candidates(job_id);
@@ -2011,5 +2363,30 @@ CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_created_at
     ON shadow_comparison_verdicts (created_at);
 CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_prompt_v
     ON shadow_comparison_verdicts (judge_prompt_version);
+CREATE INDEX IF NOT EXISTS idx_shadow_verdicts_prompt_created_at_desc
+    ON shadow_comparison_verdicts (judge_prompt_version, created_at DESC);
+
+-- ============================================================================
+-- Append-only, content-free lineage event log
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS lineage_event (
+    event_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id           TEXT NOT NULL,
+    entity_type      TEXT NOT NULL,
+    entity_id        TEXT NOT NULL,
+    op               TEXT NOT NULL,
+    prov_relation    TEXT NOT NULL DEFAULT '',
+    source_ids       TEXT NOT NULL DEFAULT '[]',
+    actor            TEXT NOT NULL DEFAULT '',
+    request_id       TEXT NOT NULL DEFAULT '',
+    reason           TEXT NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL,
+    from_status      TEXT,
+    to_status        TEXT,
+    status_namespace TEXT,
+    UNIQUE (org_id, entity_type, entity_id, op, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_entity ON lineage_event (entity_type, entity_id);
 
 """

@@ -57,7 +57,7 @@ import pytest
 from reflexio.models.api_schema.service_schemas import UserPlaybook
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient
-from reflexio.server.services.playbook.playbook_consolidator import (
+from reflexio.server.services.playbook.components.consolidator import (
     DifferentiateDecision,
     PlaybookConsolidationOutput,
     PlaybookConsolidator,
@@ -257,11 +257,12 @@ def _drive_consolidator(
         ),
         patch.dict("os.environ", {"MOCK_LLM_RESPONSE": "false"}),
     ):
-        return consolidator.deduplicate(
+        rows, archive_ids, _merge_groups = consolidator.deduplicate(
             results=[candidates],
             request_id=request_id,
             agent_version="v1",
         )
+    return rows, archive_ids
 
 
 def _apply_to_storage(

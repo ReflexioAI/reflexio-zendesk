@@ -56,6 +56,56 @@ def test_tool_openai_spec_uses_docstring_and_schema():
     assert spec["function"]["parameters"]["properties"]["content"]["type"] == "string"
 
 
+def test_openai_spec_guard_raises_on_unsafe_tool_arg_union():
+    """Tool-arg schemas bypass the response_format path + the registry contract
+    test, so ``openai_spec()`` runs the boundary guard. A plain-BaseModel
+    discriminated-union args_model emits ``oneOf`` → the guard raises under pytest.
+    """
+    from typing import Annotated, Literal
+
+    from pydantic import Field
+
+    class _A(BaseModel):
+        kind: Literal["a"] = "a"
+        a: int
+
+    class _B(BaseModel):
+        kind: Literal["b"] = "b"
+        b: str
+
+    class _UnsafeArgs(BaseModel):
+        choice: Annotated[_A | _B, Field(discriminator="kind")]
+
+    t = Tool(name="unsafe", args_model=_UnsafeArgs, handler=lambda _a, _c: {})
+    with pytest.raises(ValueError, match="provider-unsafe"):
+        t.openai_spec()
+
+
+def test_openai_spec_passes_for_strict_structured_output_tool_arg():
+    """A tool-arg model inheriting StrictStructuredOutput is provider-safe by
+    construction — ``openai_spec()`` does not raise even with a union."""
+    from typing import Annotated, Literal
+
+    from pydantic import Field
+
+    from reflexio.models.structured_output import StrictStructuredOutput
+
+    class _A(BaseModel):
+        kind: Literal["a"] = "a"
+        a: int
+
+    class _B(BaseModel):
+        kind: Literal["b"] = "b"
+        b: str
+
+    class _SafeArgs(StrictStructuredOutput):
+        choice: Annotated[_A | _B, Field(discriminator="kind")]
+
+    t = Tool(name="safe", args_model=_SafeArgs, handler=lambda _a, _c: {})
+    spec = t.openai_spec()  # must not raise
+    assert spec["function"]["name"] == "safe"
+
+
 def test_registry_handle_parses_and_dispatches():
     ctx = Ctx()
     t = Tool(name="emit_profile", args_model=EmitProfileArgs, handler=ctx.emit)
@@ -207,6 +257,40 @@ def test_run_tool_loop_drives_multiple_turns_until_finish(
     assert len(result.trace.turns) == 3
     assert ctx.emitted == ["alpha", "beta"]
     assert ctx.finished is True
+
+
+def test_run_tool_loop_empty_registry_omits_tool_choice_for_structured_finish(
+    monkeypatch, tool_call_completion
+):
+    """Structured-output-only loops must not send tool_choice without tools."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_CLI", raising=False)
+
+    class StructuredFinish(BaseModel):
+        value: str
+
+    _make_tc, make_stop = tool_call_completion
+    response = make_stop(json.dumps({"value": "ok"}))
+
+    config = LiteLLMConfig(model="claude-sonnet-4-6")
+    client = LiteLLMClient(config)
+
+    with patch("litellm.completion", return_value=response) as completion:
+        result = run_tool_loop(
+            client=client,
+            messages=[{"role": "user", "content": "go"}],
+            registry=ToolRegistry([]),
+            model_role=ModelRole.EXTRACTION_AGENT,
+            response_format=StructuredFinish,
+            tool_choice="auto",
+        )
+
+    call_kwargs = completion.call_args.kwargs
+    assert "tools" not in call_kwargs
+    assert "tool_choice" not in call_kwargs
+    assert result.finished_reason == "structured_output"
+    assert isinstance(result.structured_output, StructuredFinish)
+    assert result.structured_output.value == "ok"
 
 
 def test_run_tool_loop_records_async_accepted_and_continues(

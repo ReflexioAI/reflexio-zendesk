@@ -8,11 +8,10 @@ from reflexio.models.api_schema.braintrust_schema import (
     BraintrustConnection,
     ImportedScore,
 )
+from reflexio.models.api_schema.internal_schema import SessionCitation
 from reflexio.models.api_schema.retriever_schema import PlaybookApplicationStat
 from reflexio.models.api_schema.service_schemas import (
     Interaction,
-    PlaybookAggregationChangeLog,
-    ProfileChangeLog,
 )
 
 from ._base import (
@@ -23,8 +22,6 @@ from ._base import (
     _json_dumps,
     _json_loads,
     _row_to_interaction,
-    _row_to_playbook_aggregation_change_log,
-    _row_to_profile_change_log,
 )
 
 type _CitationKind = Literal["playbook", "profile"]
@@ -167,8 +164,14 @@ class ExtrasMixin:
             "SELECT last_modified_timestamp FROM profiles WHERE last_modified_timestamp >= ? AND last_modified_timestamp <= ? ORDER BY last_modified_timestamp",
             (current_start, current_time),
         )
-        playbooks_ts = self._fetchall(
-            "SELECT created_at FROM user_playbooks WHERE created_at >= ? AND created_at <= ? ORDER BY created_at",
+        # Playbooks span two tables; mirror the total_playbooks count above
+        # (user_playbooks + agent_playbooks) so the chart matches the stat card.
+        user_playbooks_ts = self._fetchall(
+            "SELECT created_at FROM user_playbooks WHERE created_at >= ? AND created_at <= ?",
+            (current_start_iso, current_time_iso),
+        )
+        agent_playbooks_ts = self._fetchall(
+            "SELECT created_at FROM agent_playbooks WHERE created_at >= ? AND created_at <= ?",
             (current_start_iso, current_time_iso),
         )
         evals_ts = self._fetchall(
@@ -187,10 +190,13 @@ class ExtrasMixin:
                 {"timestamp": r["last_modified_timestamp"], "value": 1}
                 for r in profiles_ts
             ],
-            "playbooks_time_series": [
-                {"timestamp": _iso_to_epoch(r["created_at"]), "value": 1}
-                for r in playbooks_ts
-            ],
+            "playbooks_time_series": sorted(
+                [
+                    {"timestamp": _iso_to_epoch(r["created_at"]), "value": 1}
+                    for r in (*user_playbooks_ts, *agent_playbooks_ts)
+                ],
+                key=lambda x: x["timestamp"],
+            ),
             "evaluations_time_series": [
                 {
                     "timestamp": _iso_to_epoch(r["created_at"]),
@@ -328,100 +334,6 @@ class ExtrasMixin:
         return stats
 
     # ------------------------------------------------------------------
-    # Profile Change Log methods
-    # ------------------------------------------------------------------
-
-    @SQLiteStorageBase.handle_exceptions
-    def add_profile_change_log(self, profile_change_log: ProfileChangeLog) -> None:
-        self._execute(
-            """INSERT INTO profile_change_logs
-               (user_id, request_id, created_at, added_profiles, removed_profiles, mentioned_profiles)
-               VALUES (?,?,?,?,?,?)""",
-            (
-                profile_change_log.user_id,
-                profile_change_log.request_id,
-                profile_change_log.created_at,
-                _json_dumps(
-                    [p.model_dump() for p in profile_change_log.added_profiles]
-                ),
-                _json_dumps(
-                    [p.model_dump() for p in profile_change_log.removed_profiles]
-                ),
-                _json_dumps(
-                    [p.model_dump() for p in profile_change_log.mentioned_profiles]
-                ),
-            ),
-        )
-
-    @SQLiteStorageBase.handle_exceptions
-    def get_profile_change_logs(self, limit: int = 100) -> list[ProfileChangeLog]:
-        rows = self._fetchall(
-            "SELECT * FROM profile_change_logs ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        )
-        return [_row_to_profile_change_log(r) for r in rows]
-
-    @SQLiteStorageBase.handle_exceptions
-    def delete_profile_change_log_for_user(self, user_id: str) -> None:
-        self._execute("DELETE FROM profile_change_logs WHERE user_id = ?", (user_id,))
-
-    @SQLiteStorageBase.handle_exceptions
-    def delete_all_profile_change_logs(self) -> None:
-        self._execute("DELETE FROM profile_change_logs")
-
-    # ------------------------------------------------------------------
-    # Playbook Aggregation Change Log methods
-    # ------------------------------------------------------------------
-
-    @SQLiteStorageBase.handle_exceptions
-    def add_playbook_aggregation_change_log(
-        self, change_log: PlaybookAggregationChangeLog
-    ) -> None:
-        self._execute(
-            """INSERT INTO playbook_aggregation_change_logs
-               (created_at, playbook_name, agent_version, run_mode,
-                added_playbooks, removed_playbooks, updated_playbooks)
-               VALUES (?,?,?,?,?,?,?)""",
-            (
-                change_log.created_at,
-                change_log.playbook_name,
-                change_log.agent_version,
-                change_log.run_mode,
-                _json_dumps(
-                    [fb.model_dump() for fb in change_log.added_agent_playbooks]
-                ),
-                _json_dumps(
-                    [fb.model_dump() for fb in change_log.removed_agent_playbooks]
-                ),
-                _json_dumps(
-                    [
-                        {"before": e.before.model_dump(), "after": e.after.model_dump()}
-                        for e in change_log.updated_agent_playbooks
-                    ]
-                ),
-            ),
-        )
-
-    @SQLiteStorageBase.handle_exceptions
-    def get_playbook_aggregation_change_logs(
-        self,
-        playbook_name: str,
-        agent_version: str,
-        limit: int = 100,
-    ) -> list[PlaybookAggregationChangeLog]:
-        rows = self._fetchall(
-            """SELECT * FROM playbook_aggregation_change_logs
-               WHERE playbook_name = ? AND agent_version = ?
-               ORDER BY created_at DESC LIMIT ?""",
-            (playbook_name, agent_version, limit),
-        )
-        return [_row_to_playbook_aggregation_change_log(r) for r in rows]
-
-    @SQLiteStorageBase.handle_exceptions
-    def delete_all_playbook_aggregation_change_logs(self) -> None:
-        self._execute("DELETE FROM playbook_aggregation_change_logs")
-
-    # ------------------------------------------------------------------
     # Evaluation-overview support (Plan B-backend)
     # ------------------------------------------------------------------
 
@@ -477,6 +389,51 @@ class ExtrasMixin:
             (session_id,),
         )
         return [_row_to_interaction(r) for r in rows]
+
+    @SQLiteStorageBase.handle_exceptions
+    def get_citations_by_session_ids(
+        self,
+        session_ids: list[str],
+    ) -> list[SessionCitation]:
+        if not session_ids:
+            return []
+        out: list[SessionCitation] = []
+        ids = sorted(set(session_ids))
+        chunk_size = 500
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i : i + chunk_size]
+            ph = ",".join("?" for _ in chunk)
+            rows = self._fetchall(
+                f"""SELECT r.user_id, r.session_id, i.citations
+                    FROM requests r
+                    JOIN interactions i ON i.request_id = r.request_id
+                    WHERE r.session_id IN ({ph})
+                      AND i.citations IS NOT NULL
+                      AND i.citations != ''
+                      AND i.citations != '[]'
+                    ORDER BY r.session_id ASC, i.created_at ASC""",  # noqa: S608
+                chunk,
+            )
+            for row in rows:
+                citations = _json_loads(row["citations"]) or []
+                if not isinstance(citations, list):
+                    continue
+                for citation in citations:
+                    if not isinstance(citation, dict):
+                        continue
+                    kind = citation.get("kind")
+                    real_id = citation.get("real_id")
+                    if kind and real_id:
+                        out.append(
+                            SessionCitation(
+                                user_id=row["user_id"],
+                                session_id=row["session_id"],
+                                kind=str(kind),
+                                real_id=str(real_id),
+                                title=str(citation.get("title") or ""),
+                            )
+                        )
+        return out
 
     # ------------------------------------------------------------------
     # Braintrust connector storage (Plan C-backend + Plan C-overview)

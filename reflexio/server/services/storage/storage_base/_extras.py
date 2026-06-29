@@ -6,14 +6,13 @@ from reflexio.models.api_schema.braintrust_schema import (
 )
 from reflexio.models.api_schema.domain import (
     Interaction,
-    PlaybookAggregationChangeLog,
-    ProfileChangeLog,
 )
+from reflexio.models.api_schema.internal_schema import SessionCitation
 from reflexio.models.api_schema.retriever_schema import PlaybookApplicationStat
 
 
 class ExtrasMixin:
-    """Mixin for dashboard, profile change logs, playbook aggregation change logs, and misc methods."""
+    """Mixin for dashboard, profile change logs, and misc methods."""
 
     # ==============================
     # Dashboard methods
@@ -73,56 +72,6 @@ class ExtrasMixin:
         raise NotImplementedError
 
     # ==============================
-    # Profile Change Log methods
-    # ==============================
-
-    @abstractmethod
-    def add_profile_change_log(self, profile_change_log: ProfileChangeLog) -> None:
-        """Add a profile change log entry."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_profile_change_logs(self, limit: int = 100) -> list[ProfileChangeLog]:
-        """Get profile change logs for an organization."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def delete_profile_change_log_for_user(self, user_id: str) -> None:
-        """Delete all profile change logs for a user."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def delete_all_profile_change_logs(self) -> None:
-        """Delete all profile change logs."""
-        raise NotImplementedError
-
-    # ==============================
-    # Playbook Aggregation Change Log methods
-    # ==============================
-
-    @abstractmethod
-    def add_playbook_aggregation_change_log(
-        self, change_log: PlaybookAggregationChangeLog
-    ) -> None:
-        """Add a playbook aggregation change log entry."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_playbook_aggregation_change_logs(
-        self,
-        playbook_name: str,
-        agent_version: str,
-        limit: int = 100,
-    ) -> list[PlaybookAggregationChangeLog]:
-        """Get playbook aggregation change logs filtered by playbook_name and agent_version."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def delete_all_playbook_aggregation_change_logs(self) -> None:
-        """Delete all playbook aggregation change logs."""
-        raise NotImplementedError
-
-    # ==============================
     # Misc methods
     # ==============================
 
@@ -170,6 +119,40 @@ class ExtrasMixin:
         Default implementation returns []; concrete backends should override.
         """
         return []
+
+    def get_citations_by_session_ids(
+        self,
+        session_ids: list[str],
+    ) -> list[SessionCitation]:
+        """Return rule/profile citations for the requested sessions.
+
+        Default implementation uses ``get_interactions_by_session`` so legacy
+        backends keep working. SQL backends should override with a bulk
+        request/interactions join.
+        """
+        out: list[SessionCitation] = []
+        for session_id in set(session_ids):
+            for interaction in self.get_interactions_by_session(session_id):
+                for cite in getattr(interaction, "citations", []) or []:
+                    if isinstance(cite, dict):
+                        kind = cite.get("kind")
+                        real_id = cite.get("real_id")
+                        title = cite.get("title") or ""
+                    else:
+                        kind = getattr(cite, "kind", None)
+                        real_id = getattr(cite, "real_id", None)
+                        title = getattr(cite, "title", "") or ""
+                    if kind and real_id:
+                        out.append(
+                            SessionCitation(
+                                user_id="",
+                                session_id=session_id,
+                                kind=str(kind),
+                                real_id=str(real_id),
+                                title=str(title),
+                            )
+                        )
+        return out
 
     # ==============================
     # Braintrust connector (default no-ops; backends override)

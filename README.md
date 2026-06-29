@@ -7,7 +7,7 @@
 
 [![Python >= 3.12](https://img.shields.io/badge/python-%3E%3D3.12-blue)](https://www.python.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/reflexio-client)](https://pypi.org/project/reflexio-client/)
+[![PyPI](https://img.shields.io/pypi/v/reflexio-ai)](https://pypi.org/project/reflexio-ai/)
 [![Downloads](https://static.pepy.tech/badge/reflexio-ai/month)](https://pepy.tech/project/reflexio-ai)
 [![Search p50 57ms](https://img.shields.io/badge/search-57ms%20p50-brightgreen)](reflexio/benchmarks/retrieval_latency/results/report.md)
 [![GitHub stars](https://img.shields.io/github/stars/ReflexioAI/reflexio)](https://github.com/ReflexioAI/reflexio/stargazers)
@@ -118,7 +118,7 @@ Publish conversations from your agent, and Reflexio closes the self-improvement 
 pip install reflexio-ai
 
 # start/stop services. data saved under ~/.reflexio
-reflexio services start           # API (8081), Docs (8082), SQLite storage
+reflexio services start           # API (8061), Docs (8062), SQLite storage
 reflexio services stop            # Stop all services
 ```
 
@@ -137,13 +137,13 @@ uv sync                                    # Python (includes workspace packages
 npm --prefix docs install                  # API docs
 
 # start/stop services. data saved under ~/.reflexio
-uv run reflexio services start             # API (8081), Docs (8082), SQLite storage
+uv run reflexio services start             # API (8061), Docs (8062), SQLite storage
 uv run reflexio services stop              # Stop all services
 ```
 
 > Alternative: `python -m reflexio.cli services start` or `./run_services.sh`
 
-Once running, open **[http://localhost:8082](http://localhost:8082)** to interactively browse and try out the API.
+Once running, open **[http://localhost:8062](http://localhost:8062)** to interactively browse and try out the API.
 <p align="center">
   <img src="docs/images/doc_website.png" width="800px" alt="Reflexio Doc Website">
 </p>
@@ -179,7 +179,7 @@ One conversation, two artifacts: a user profile (`production region is us-west-2
 import reflexio
 
 client = reflexio.ReflexioClient(
-    url_endpoint="http://localhost:8081/"
+    url_endpoint="http://localhost:8061/"
 )
 
 # Publish a multi-turn conversation where the user corrects the agent —
@@ -249,10 +249,10 @@ Reflexio will automatically generate profiles and extract playbooks in the backg
 
 For detailed API documentation, see the [full API reference](https://www.reflexio.ai/docs/api-reference).
 
-Install the client:
+Install the package:
 
 ```shell
-pip install reflexio-client
+pip install reflexio-ai
 ```
 
 ### Basic usage
@@ -261,7 +261,7 @@ pip install reflexio-client
 import reflexio
 
 client = reflexio.ReflexioClient(
-    url_endpoint="http://localhost:8081/"
+    url_endpoint="http://localhost:8061/"
 )
 
 # Publish interactions

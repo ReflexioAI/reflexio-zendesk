@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.resources
 import logging
+import os
 import re
 import secrets
 import sys
@@ -15,12 +16,27 @@ from pathlib import Path
 
 _logger = logging.getLogger(__name__)
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from .paths import reflexio_home
 
 _USER_ENV_DIR = reflexio_home()
 _USER_ENV_FILE = _USER_ENV_DIR / ".env"
+
+
+def user_env_file() -> Path:
+    """Return the user-level .env path, honoring ``REFLEXIO_ENV_FILE``.
+
+    When ``REFLEXIO_ENV_FILE`` is set (and non-blank) it overrides the default
+    ``~/.reflexio/.env``. This lets a second local backend keep its env separate
+    from the OSS reflexio default that also lives under ``~/.reflexio`` — e.g.
+    claude-smart points this at ``~/.claude-smart/.env`` so an OSS reflexio
+    ``.env`` (with its own ``REFLEXIO_STORAGE`` etc.) can't leak into it. The data
+    directory is independent (see ``LOCAL_STORAGE_PATH``), so both backends can
+    still share ``~/.reflexio/data``.
+    """
+    override = os.environ.get("REFLEXIO_ENV_FILE", "").strip()
+    return Path(override).expanduser() if override else _USER_ENV_FILE
 
 
 # Path to the .env file that load_reflexio_env last resolved — None until
@@ -33,10 +49,72 @@ _loaded_env_path: Path | None = None
 def get_env_path() -> Path:
     """Return the canonical path to the user-level .env file.
 
-    Returns:
-        Path: ``~/.reflexio/.env``
+    Honors ``REFLEXIO_ENV_FILE`` (see :func:`user_env_file`); defaults to
+    ``~/.reflexio/.env``.
     """
-    return _USER_ENV_FILE
+    return user_env_file()
+
+
+def block_implicit_dotenv_walkup() -> None:
+    """Neutralize path-less ``dotenv.load_dotenv()`` autoloads (the walk-up).
+
+    Third-party libraries — notably ``litellm`` at import time
+    (``litellm/__init__.py``) — call ``load_dotenv()`` with no arguments. With
+    no path, python-dotenv runs ``find_dotenv()``, which walks **up** the
+    directory tree and loads the first ``.env`` it finds. Run from the
+    ``open_source/reflexio`` submodule inside the enterprise monorepo, that
+    climbs to the enterprise-root ``.env`` (platform-configured) and leaks
+    ``BACKEND_PORT`` / ``DEPLOYMENT_MODE`` / ``REFLEXIO_STORAGE`` into the
+    process — silently overriding the OSS launcher's own ``806*`` defaults.
+
+    Reflexio loads env deliberately via :func:`load_reflexio_env`, scoped to
+    ``./.env`` + ``~/.reflexio/.env`` and never walking up, so a library's
+    implicit autoload is redundant. This installs a shim on
+    ``dotenv.load_dotenv`` that no-ops the path-less form while passing explicit
+    ``load_dotenv(dotenv_path=...)`` / ``stream=...`` calls through unchanged.
+    Reflexio's own loader binds ``load_dotenv`` at import and always passes an
+    explicit path, so it is unaffected regardless.
+
+    Must run before the first ``import litellm`` in the process — the CLI entry
+    point (:func:`reflexio.cli.__main__.main`) calls it first thing. Idempotent.
+    Only the CLI launcher installs this: the spawned server subprocesses bind
+    the parent-resolved ``--port`` and the OSS server never reads
+    ``DEPLOYMENT_MODE``, so the launcher process is the only place the leak
+    changes behavior.
+    """
+    import functools
+    from typing import IO
+
+    import dotenv
+
+    original = dotenv.load_dotenv
+    if getattr(original, "__reflexio_walkup_guarded__", False):
+        return
+
+    @functools.wraps(original)
+    def _guarded(
+        dotenv_path: str | os.PathLike[str] | None = None,
+        stream: IO[str] | None = None,
+        verbose: bool = False,
+        override: bool = False,
+        interpolate: bool = True,
+        encoding: str | None = "utf-8",
+    ) -> bool:
+        if dotenv_path is None and stream is None:
+            # Path-less call would walk up past reflexio's controlled search
+            # scope (./.env + ~/.reflexio/.env). Ignore it.
+            return False
+        return original(
+            dotenv_path,
+            stream,
+            verbose=verbose,
+            override=override,
+            interpolate=interpolate,
+            encoding=encoding,
+        )
+
+    _guarded.__reflexio_walkup_guarded__ = True  # type: ignore[attr-defined]
+    dotenv.load_dotenv = _guarded
 
 
 def get_loaded_env_path() -> Path | None:
@@ -87,10 +165,43 @@ def set_env_var(env_path: Path, key: str, value: str) -> None:
     env_path.chmod(0o600)
 
 
-_ENV_SEARCH_PATHS = [
-    Path(".env"),  # 1. Current directory (local dev / project-level)
-    _USER_ENV_FILE,  # 2. User home default (~/.reflexio/.env)
-]
+def _env_search_paths() -> list[Path]:
+    """OSS .env search order, resolved at call time so ``REFLEXIO_ENV_FILE`` is honored."""
+    return [
+        Path(".env"),  # 1. Current directory (local dev / project-level)
+        user_env_file(),  # 2. User-level file (REFLEXIO_ENV_FILE override, else ~/.reflexio/.env)
+    ]
+
+
+def _load_dotenv_pruned(path: Path, *, override: bool = False) -> None:
+    """Load a .env file, treating blank assignments (``KEY=``) as unset.
+
+    python-dotenv exports a blank ``KEY=`` line as ``os.environ["KEY"] = ""``
+    rather than leaving the key unset. That empty string silently defeats every
+    ``os.getenv("KEY", default)`` fallback — the root cause of the HF_HOME
+    cache-in-repo-root bug, and of any ``int()``/``float()`` parse that crashes
+    on ``""``. This wrapper normalizes "set to blank" to "unset" so callers that
+    rely on a default behave correctly.
+
+    After loading, it drops any key the FILE assigned a blank/whitespace value,
+    but only when the resulting environment value is still blank — so a real
+    process-env value (task definition, shell ``export``) or an earlier-loaded
+    file value is never removed.
+
+    Args:
+        path: Path to the .env file to load.
+        override: Forwarded to ``load_dotenv``. When False (default) the existing
+            process environment wins over the file's values.
+    """
+    file_vals = dotenv_values(path)
+    load_dotenv(dotenv_path=path, override=override)
+    for key, value in file_vals.items():
+        if (
+            value is not None
+            and not value.strip()
+            and not os.environ.get(key, "").strip()
+        ):
+            os.environ.pop(key, None)
 
 
 def load_reflexio_env(
@@ -116,9 +227,9 @@ def load_reflexio_env(
         Path to the loaded .env file, or None if no .env was found/created.
     """
     global _loaded_env_path
-    for env_path in _ENV_SEARCH_PATHS:
+    for env_path in _env_search_paths():
         if env_path.exists():
-            load_dotenv(dotenv_path=env_path)
+            _load_dotenv_pruned(env_path)
             resolved = env_path.resolve()
             _logger.debug("Loaded env from: %s", resolved)
             _loaded_env_path = resolved
@@ -157,8 +268,6 @@ def resolve_mode(cli_mode: str | None = None) -> str | None:
     Raises:
         ValueError: If the selected mode is not a safe slug.
     """
-    import os
-
     raw_mode = cli_mode if cli_mode is not None else os.environ.get("DEPLOYMENT_MODE")
     if raw_mode is None:
         return None
@@ -211,12 +320,12 @@ def load_reflexio_env_for_mode(
     # process env both still win where they define the same keys.
     home_secrets = _USER_ENV_DIR / f".env.{mode}"
     if home_secrets.exists():
-        load_dotenv(dotenv_path=home_secrets, override=False)
+        _load_dotenv_pruned(home_secrets, override=False)
 
     loaded: Path | None = None
     for env_path in (Path(f".env.{mode}"), home_secrets):
         if env_path.exists():
-            load_dotenv(dotenv_path=env_path, override=False)
+            _load_dotenv_pruned(env_path, override=False)
             _loaded_env_path = env_path.resolve()
             _logger.debug("Loaded mode env from: %s (mode=%s)", _loaded_env_path, mode)
             loaded = env_path
@@ -253,7 +362,7 @@ def _create_default_env_for_mode(mode: str, package_data_module: str) -> Path | 
     target = _USER_ENV_DIR / f".env.{mode}"
     target.write_text(content)
     target.chmod(0o600)
-    load_dotenv(dotenv_path=target, override=False)
+    _load_dotenv_pruned(target, override=False)
     _loaded_env_path = target.resolve()
     return target
 
@@ -322,7 +431,7 @@ def ensure_user_env_for_setup(
     """
     global _loaded_env_path
     if _USER_ENV_FILE.exists():
-        load_dotenv(dotenv_path=_USER_ENV_FILE)
+        _load_dotenv_pruned(_USER_ENV_FILE)
         resolved = _USER_ENV_FILE.resolve()
         _logger.debug("Loaded user env from: %s", resolved)
         _loaded_env_path = resolved
@@ -345,8 +454,6 @@ def _backfill_missing_keys(env_path: Path, keys: list[str]) -> None:
         env_path: Path to the existing .env file.
         keys: Env var names to check/generate.
     """
-    import os
-
     generated: list[str] = []
     for key in keys:
         if os.environ.get(key):
@@ -417,10 +524,12 @@ def _create_default_env(
         sys.stdout.flush()
         return None
 
-    created_dir = not _USER_ENV_DIR.exists()
-    _USER_ENV_DIR.mkdir(parents=True, exist_ok=True)
+    target = user_env_file()  # honors REFLEXIO_ENV_FILE (e.g. ~/.claude-smart/.env)
+    target_dir = target.parent
+    created_dir = not target_dir.exists()
+    target_dir.mkdir(parents=True, exist_ok=True)
     if created_dir:
-        sys.stdout.write(f"Created directory: {_USER_ENV_DIR}\n")
+        sys.stdout.write(f"Created directory: {target_dir}\n")
 
     # Auto-generate secret keys
     for key in auto_generate_keys:
@@ -433,13 +542,13 @@ def _create_default_env(
             flags=re.MULTILINE,
         )
 
-    _USER_ENV_FILE.write_text(content)
-    _USER_ENV_FILE.chmod(0o600)
-    load_dotenv(dotenv_path=_USER_ENV_FILE)
+    target.write_text(content)
+    target.chmod(0o600)
+    _load_dotenv_pruned(target)
 
-    sys.stdout.write(f"Created env file: {_USER_ENV_FILE}\n")
+    sys.stdout.write(f"Created env file: {target}\n")
     if auto_generate_keys:
         sys.stdout.write(f"  Auto-generated: {', '.join(auto_generate_keys)}\n")
-    sys.stdout.write(f"  Edit {_USER_ENV_FILE} to add your API keys.\n\n")
+    sys.stdout.write(f"  Edit {target} to add your API keys.\n\n")
     sys.stdout.flush()
-    return _USER_ENV_FILE
+    return target
