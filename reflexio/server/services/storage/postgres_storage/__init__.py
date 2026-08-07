@@ -3,6 +3,9 @@
 from reflexio.server.services.storage.postgres_storage._agent_run import (
     PostgresAgentRunMixin,
 )
+from reflexio.server.services.storage.postgres_storage._aggregation import (
+    PostgresPlaybookAggregationStoreMixin,
+)
 from reflexio.server.services.storage.postgres_storage._extras import ExtrasMixin
 from reflexio.server.services.storage.postgres_storage._governance import (
     PostgresGovernanceMixin,
@@ -41,6 +44,7 @@ from ._base import PostgresStorageBase
 
 
 class PostgresStorage(
+    PostgresPlaybookAggregationStoreMixin,
     PostgresLearningJobStoreMixin,
     PostgresAgentRunMixin,
     ProfileMixin,

@@ -17,6 +17,7 @@ from reflexio.models.config_schema import (
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.services.extraction.resume_worker import (
     ExtractionResumeWorker,
+    _resolved_tool_review_context,
     _run_playbook_contract_selection,
     _run_uses_strict_playbook_evidence,
 )
@@ -265,6 +266,18 @@ def test_resume_worker_resumes_profile_run_and_consumes_dependency(
     assert [profile.content for profile in profiles] == [
         "User deployment target is AWS ECS."
     ]
+
+
+def test_resolved_tool_review_context_includes_durable_answer(storage):
+    _seed_ready_run(storage)
+    record = storage.get_pending_tool_call("ptc_1")
+    assert record is not None
+
+    context = _resolved_tool_review_context([record])
+
+    assert "ask_human" in context
+    assert "Use AWS ECS." in context
+    assert record.id in context
 
 
 def test_resume_worker_retries_finalization_without_rerunning_agent(

@@ -171,6 +171,22 @@ def _calculate_success_rate(eval_data: list[dict[str, Any]]) -> float:
     return success_count / total * 100
 
 
+class _ScopedConnectionProxy:
+    """Join an outer commit scope while leaving transaction ownership outside."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def commit(self) -> None:
+        """Let the outer ``commit_scope`` commit the shared connection."""
+
+    def rollback(self) -> None:
+        """Let an exception escape so the outer scope rolls back atomically."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
 class PostgresStorageBase(RetentionMixin, BaseStorage):
     """Base storage implementation for direct PostgreSQL access."""
 
@@ -340,6 +356,31 @@ class PostgresStorageBase(RetentionMixin, BaseStorage):
             return False
         self._transaction_state.search_operations.append((method_name, args, kwargs))
         return True
+
+    @contextlib.contextmanager
+    def _writer_connection(
+        self, *, operation: str = "storage"
+    ) -> Generator[Any, None, None]:
+        """Yield a writer connection that participates in ``commit_scope``.
+
+        Aggregation operations explicitly commit their own standalone transactions.
+        Within a larger storage transaction the proxy turns those calls into no-ops,
+        preserving the outer scope as the sole transaction owner.
+        """
+        _ = operation
+        scoped_conn = getattr(self._transaction_state, "connection", None)
+        if scoped_conn is not None:
+            yield _ScopedConnectionProxy(scoped_conn)
+            return
+
+        conn = self.pool.getconn()
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self.pool.putconn(conn)
 
     def _ensure_migrated(self) -> None:
         target = (self.db_url, self.schema_name)

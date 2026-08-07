@@ -284,6 +284,57 @@ def test_postgres_lineage_round_trip(
 
 
 @skip_in_precommit
+def test_postgres_incremental_playbook_aggregation_contract(
+    postgres_storage: PostgresStorage,
+) -> None:
+    run_id = uuid.uuid4().hex[:8]
+    agent_version = f"pg-aggregation-{run_id}"
+    playbooks = [
+        UserPlaybook(
+            user_id=f"pg-aggregation-user-{run_id}",
+            request_id=f"pg-aggregation-request-{run_id}-{index}",
+            agent_version=agent_version,
+            playbook_name="postgres-aggregation",
+            content=f"Postgres aggregation evidence {index}",
+            trigger=f"When Postgres aggregation case {index} occurs",
+        )
+        for index in range(2)
+    ]
+    postgres_storage.save_user_playbooks(playbooks)
+
+    assert postgres_storage.supports_incremental_playbook_aggregation is True
+    postgres_storage.schedule_playbook_aggregation(agent_version)
+    claim = postgres_storage.claim_due_playbook_aggregation(
+        owner="postgres-aggregation-e2e",
+        lease_seconds=60,
+        agent_version=agent_version,
+    )
+    assert claim is not None
+    assert postgres_storage.validate_playbook_aggregation_claim(claim)
+
+    staged = postgres_storage.stage_playbook_aggregation_intake(
+        agent_version,
+        limit=100,
+    )
+    expected_ids: list[int] = []
+    for playbook in playbooks:
+        assert playbook.user_playbook_id is not None
+        expected_ids.append(playbook.user_playbook_id)
+    assert staged == sorted(expected_ids, reverse=True)
+    backlog = postgres_storage.get_playbook_aggregation_backlog(agent_version)
+    assert backlog.residual == 2
+    assert backlog.pending
+    assert postgres_storage.finish_playbook_aggregation_claim(
+        claim,
+        success=True,
+        retry_after_seconds=60,
+        backlog_retry_after_seconds=0,
+        min_interval_seconds=3_600,
+        backlog=backlog,
+    )
+
+
+@skip_in_precommit
 def test_postgres_upstream_storage_contract_round_trip(
     postgres_storage: PostgresStorage,
 ) -> None:

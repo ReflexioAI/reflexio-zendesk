@@ -14,6 +14,7 @@ def test_dev_mode_passes_reload_true() -> None:
         main(["--port", "8081", "--reload"])
     kwargs = run.call_args.kwargs
     assert kwargs["reload"] is True
+    assert kwargs["timeout_keep_alive"] == 30
     # Dev mode must not pass workers > 1.
     assert kwargs.get("workers", 1) == 1
 
@@ -40,6 +41,7 @@ def test_daemon_mode_passes_workers_and_max_requests() -> None:
     assert kwargs["limit_max_requests"] == 5000
     assert kwargs["limit_max_requests_jitter"] == 500
     assert kwargs["timeout_graceful_shutdown"] == 20
+    assert kwargs["timeout_keep_alive"] == 30
 
 
 def test_reload_with_workers_gt_1_rejected() -> None:

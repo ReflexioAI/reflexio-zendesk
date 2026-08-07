@@ -94,6 +94,8 @@ class PlaybookGenerationServiceConfig:
         rerun_start_time: Optional start time filter for rerun flows (Unix timestamp)
         rerun_end_time: Optional end time filter for rerun flows (Unix timestamp)
         auto_run: True for regular flow (checks stride_size), False for rerun/manual (skips stride_size)
+        review_tool_result_context: Resolved extraction-tool results that the
+            second-pass reviewer must consider alongside the interaction window.
     """
 
     request_id: str
@@ -105,6 +107,7 @@ class PlaybookGenerationServiceConfig:
     rerun_end_time: int | None = None
     auto_run: bool = True
     force_extraction: bool = False
+    review_tool_result_context: str = ""
 
 
 def _consolidation_search_keys(playbooks: list[UserPlaybook]) -> set[str]:
@@ -456,6 +459,15 @@ class PlaybookGenerationService(
                         tool_context = "\n".join(
                             f"{tool.tool_name}: {tool.tool_description}"
                             for tool in root_config.tool_can_use
+                        )
+                    if self.service_config.review_tool_result_context:
+                        tool_context = "\n\n".join(
+                            part
+                            for part in (
+                                tool_context,
+                                self.service_config.review_tool_result_context,
+                            )
+                            if part
                         )
                     search_keys_before = _consolidation_search_keys(all_playbooks)
                     all_playbooks = dedupe_and_drop_empty(

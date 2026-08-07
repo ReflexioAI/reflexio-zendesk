@@ -87,6 +87,29 @@ def _next_retry_at(attempt_count: int) -> datetime:
     return datetime.now(UTC) + timedelta(seconds=delay_seconds)
 
 
+def _resolved_tool_review_context(
+    records: Sequence[PendingToolCallRecord],
+) -> str:
+    """Render durable human/tool answers for the playbook review pass."""
+    if not records:
+        return ""
+    sections = ["Resolved extraction tool results (durable Agent Builder feedback):"]
+    for record in records:
+        sections.extend(
+            (
+                f"Tool result {record.id}",
+                f"Tool: {record.tool_name}",
+                f"Question: {record.question_text}",
+                f"Result: {record.result or {}}",
+            )
+        )
+    sections.append(
+        "Use these results only when relevant to the candidate and current "
+        "interaction window."
+    )
+    return "\n".join(sections)
+
+
 def _create_llm_client(request_context: RequestContext) -> LiteLLMClient:
     # The tool loop re-resolves the model per call via ModelRole.EXTRACTION_AGENT
     # (see run_tool_loop); this client's model name is only a fallback. We resolve
@@ -892,6 +915,9 @@ class ExtractionResumeWorker:
             )
             return
         if run.binding.extractor_kind == "playbook":
+            resolved_tool_context = _resolved_tool_review_context(
+                self._load_resolved_tool_calls(run)
+            )
             service = PlaybookGenerationService(
                 llm_client=self.client,
                 request_context=self.request_context,
@@ -903,6 +929,7 @@ class ExtractionResumeWorker:
                 source=run.binding.source,
                 auto_run=False,
                 force_extraction=True,
+                review_tool_result_context=resolved_tool_context,
             )
             persisted_items = service._finalize_extracted_items(
                 items, model_provenance=model_provenance

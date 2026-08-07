@@ -656,6 +656,9 @@ def test_resolve_write_plan_reviews_grounded_normal_candidates_before_consolidat
             user_id="test_user",
             source="test_source",
             auto_run=False,
+            review_tool_result_context=(
+                "Resolved extraction tool results: AWS ECS Fargate."
+            ),
         )
         playbook_config = PlaybookConfig(
             extractor_name="test_playbook",
@@ -722,6 +725,7 @@ def test_resolve_write_plan_reviews_grounded_normal_candidates_before_consolidat
         assert plan is not None
         assert plan.new_playbooks == [reviewed]
         reviewer.review.assert_called_once()
+        assert "AWS ECS Fargate" in reviewer.review.call_args.kwargs["tool_context"]
         consolidator.deduplicate.assert_called_once()
         assert consolidator.deduplicate.call_args.args[0] == [[reviewed]]
 

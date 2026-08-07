@@ -22,6 +22,8 @@ import uvicorn
 
 from reflexio.server.uvicorn_logging import UVICORN_LOG_CONFIG
 
+_KEEP_ALIVE_SECONDS = 30
+
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser.
@@ -111,6 +113,7 @@ def main(argv: list[str] | None = None) -> None:
             port=args.port,
             reload=True,
             reload_includes=args.reload_include or None,
+            timeout_keep_alive=_KEEP_ALIVE_SECONDS,
             log_config=UVICORN_LOG_CONFIG,
         )
         return
@@ -128,6 +131,7 @@ def main(argv: list[str] | None = None) -> None:
         limit_max_requests=limit_max_requests,
         limit_max_requests_jitter=args.max_requests_jitter,
         timeout_graceful_shutdown=args.graceful_shutdown_sec,
+        timeout_keep_alive=_KEEP_ALIVE_SECONDS,
         log_config=UVICORN_LOG_CONFIG,
     )
 
