@@ -11,8 +11,8 @@ from psycopg2.extras import Json
 
 from reflexio.models.api_schema.domain.entities import LineageContext, LineageEvent
 from reflexio.models.api_schema.domain.enums import Status
+from reflexio.server.error_reporting import capture_anomaly
 from reflexio.server.services.storage.postgres_storage._base import PostgresStorageBase
-from reflexio.server.tracing import capture_anomaly
 
 EntityType = Literal["user_playbook", "agent_playbook", "profile"]
 
@@ -45,6 +45,7 @@ class PostgresLineageMixin:
     _opensearch: Any
     _fetch_all: Any
     _table_identifier: Any
+    commit_scope: Any
 
     @handle_exceptions
     def append_lineage_event(self, event: LineageEvent) -> int:
@@ -54,9 +55,9 @@ class PostgresLineageMixin:
             INSERT INTO {} (
                 org_id, entity_type, entity_id, op, prov_relation, source_ids,
                 actor, request_id, reason, created_at, from_status, to_status,
-                status_namespace
+                status_namespace, model_name, provider
             )
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
             DO UPDATE SET event_id = lineage_event.event_id
             RETURNING event_id
@@ -78,6 +79,8 @@ class PostgresLineageMixin:
                 event.from_status,
                 event.to_status,
                 event.status_namespace,
+                event.model_name,
+                event.provider,
             ],
         )
         return int(rows[0]["event_id"]) if rows else 0
@@ -130,6 +133,8 @@ class PostgresLineageMixin:
                 from_status=cast(str | None, row.get("from_status")),
                 to_status=cast(str | None, row.get("to_status")),
                 status_namespace=cast(str | None, row.get("status_namespace")),
+                model_name=cast(str | None, row.get("model_name")),
+                provider=cast(str | None, row.get("provider")),
             )
             for row in rows
         ]
@@ -149,52 +154,53 @@ class PostgresLineageMixin:
             return
         table, pk = _resolve_table(entity_type)
         now = int(time.time())
-        conn = self.pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    sql.SQL(
-                        "UPDATE {} SET status = %s, merged_into = %s, retired_at = %s "
-                        "WHERE {} = ANY(%s) AND (status IS NULL OR status NOT IN %s)"
-                    ).format(self._table_identifier(table), sql.Identifier(pk)),
-                    (
-                        Status.MERGED.value,
-                        survivor_id,
-                        now,
-                        source_ids,
-                        tuple(_GC_ELIGIBLE_STATUSES),
-                    ),
+        with self.commit_scope():
+            changed = self._fetch_all(
+                sql.SQL(
+                    "UPDATE {} SET status = %s, merged_into = %s, retired_at = %s "
+                    "WHERE {}::text = ANY(%s) "
+                    "AND (status IS NULL OR status NOT IN %s) RETURNING {}"
+                ).format(
+                    self._table_identifier(table),
+                    sql.Identifier(pk),
+                    sql.Identifier(pk),
+                ),
+                [
+                    Status.MERGED.value,
+                    survivor_id,
+                    now,
+                    source_ids,
+                    tuple(_GC_ELIGIBLE_STATUSES),
+                ],
+            )
+            self._fetch_all(
+                sql.SQL(
+                    """INSERT INTO {} (
+                           org_id, entity_type, entity_id, op, prov_relation,
+                           source_ids, actor, request_id, reason, created_at,
+                           model_name, provider
+                       ) VALUES (%s, %s, %s, 'merge', 'wasDerivedFrom',
+                                 %s::jsonb, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
+                       DO NOTHING RETURNING event_id"""
+                ).format(self._table_identifier("lineage_event")),
+                [
+                    self.org_id,
+                    entity_type,
+                    survivor_id,
+                    Json(source_ids),
+                    context.actor,
+                    context.request_id,
+                    context.reason,
+                    now,
+                    context.model_name,
+                    context.provider,
+                ],
+            )
+            if changed and self._opensearch:
+                self._opensearch.delete_ids(
+                    table, [row[pk] for row in changed if pk in row]
                 )
-                cur.execute(
-                    sql.SQL(
-                        """
-                        INSERT INTO {} (
-                            org_id, entity_type, entity_id, op, prov_relation,
-                            source_ids, actor, request_id, reason, created_at
-                        )
-                        VALUES (%s, %s, %s, 'merge', 'wasDerivedFrom', %s::jsonb, %s, %s, %s, %s)
-                        ON CONFLICT (org_id, entity_type, entity_id, op, request_id) DO NOTHING
-                        """
-                    ).format(self._table_identifier("lineage_event")),
-                    (
-                        self.org_id,
-                        entity_type,
-                        survivor_id,
-                        Json(source_ids),
-                        context.actor,
-                        context.request_id,
-                        context.reason,
-                        now,
-                    ),
-                )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self.pool.putconn(conn)
-        if self._opensearch:
-            self._opensearch.delete_ids(table, source_ids)
 
     @handle_exceptions
     def supersede_record(
@@ -209,48 +215,46 @@ class PostgresLineageMixin:
             raise ValueError(f"lineage supersede: {_EMPTY_REQUEST_ID_MSG}")
         table, pk = _resolve_table(entity_type)
         now = int(time.time())
-        conn = self.pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
+        with self.commit_scope():
+            rows = self._fetch_all(
+                sql.SQL(
+                    "UPDATE {} SET status = %s, superseded_by = %s, retired_at = %s "
+                    "WHERE {}::text = %s AND status IS NULL RETURNING {}"
+                ).format(
+                    self._table_identifier(table),
+                    sql.Identifier(pk),
+                    sql.Identifier(pk),
+                ),
+                [Status.SUPERSEDED.value, successor_id, now, incumbent_id],
+            )
+            changed = bool(rows)
+            if changed:
+                self._fetch_all(
                     sql.SQL(
-                        "UPDATE {} SET status = %s, superseded_by = %s, retired_at = %s "
-                        "WHERE {} = %s AND status IS NULL"
-                    ).format(self._table_identifier(table), sql.Identifier(pk)),
-                    (Status.SUPERSEDED.value, successor_id, now, incumbent_id),
+                        """INSERT INTO {} (
+                               org_id, entity_type, entity_id, op, prov_relation,
+                               source_ids, actor, request_id, reason, created_at,
+                               model_name, provider
+                           ) VALUES (%s, %s, %s, 'revise', 'wasRevisionOf',
+                                     %s::jsonb, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
+                           DO NOTHING RETURNING event_id"""
+                    ).format(self._table_identifier("lineage_event")),
+                    [
+                        self.org_id,
+                        entity_type,
+                        successor_id,
+                        Json([incumbent_id]),
+                        context.actor,
+                        context.request_id,
+                        context.reason,
+                        now,
+                        context.model_name,
+                        context.provider,
+                    ],
                 )
-                changed = cur.rowcount > 0
-                if changed:
-                    cur.execute(
-                        sql.SQL(
-                            """
-                            INSERT INTO {} (
-                                org_id, entity_type, entity_id, op, prov_relation,
-                                source_ids, actor, request_id, reason, created_at
-                            )
-                            VALUES (%s, %s, %s, 'revise', 'wasRevisionOf', %s::jsonb, %s, %s, %s, %s)
-                            ON CONFLICT (org_id, entity_type, entity_id, op, request_id) DO NOTHING
-                            """
-                        ).format(self._table_identifier("lineage_event")),
-                        (
-                            self.org_id,
-                            entity_type,
-                            successor_id,
-                            Json([incumbent_id]),
-                            context.actor,
-                            context.request_id,
-                            context.reason,
-                            now,
-                        ),
-                    )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self.pool.putconn(conn)
-        if changed and self._opensearch:
-            self._opensearch.delete_ids(table, [incumbent_id])
+                if self._opensearch:
+                    self._opensearch.delete_ids(table, [incumbent_id])
         return changed
 
     @handle_exceptions
@@ -289,44 +293,38 @@ class PostgresLineageMixin:
                 tags = NULL, source_span = NULL, notes = NULL, reader_angle = NULL
                 """
             )
-        conn = self.pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    sql.SQL("UPDATE {} SET {} WHERE {} = %s").format(
-                        self._table_identifier(table), set_sql, sql.Identifier(pk)
-                    ),
-                    (entity_id,),
+        with self.commit_scope():
+            rows = self._fetch_all(
+                sql.SQL("UPDATE {} SET {} WHERE {}::text = %s RETURNING {}").format(
+                    self._table_identifier(table),
+                    set_sql,
+                    sql.Identifier(pk),
+                    sql.Identifier(pk),
+                ),
+                [entity_id],
+            )
+            found = bool(rows)
+            if found:
+                self._fetch_all(
+                    sql.SQL(
+                        """INSERT INTO {} (
+                               org_id, entity_type, entity_id, op, prov_relation,
+                               source_ids, actor, request_id, reason, created_at)
+                           VALUES (%s, %s, %s, 'purge', 'wasPurged', '[]'::jsonb,
+                                   'erasure', %s, 'content_purge', %s)
+                           ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
+                           DO NOTHING RETURNING event_id"""
+                    ).format(self._table_identifier("lineage_event")),
+                    [
+                        self.org_id,
+                        entity_type,
+                        entity_id,
+                        f"purge_{entity_id}",
+                        int(time.time()),
+                    ],
                 )
-                found = cur.rowcount > 0
-                if found:
-                    cur.execute(
-                        sql.SQL(
-                            """
-                            INSERT INTO {} (
-                                org_id, entity_type, entity_id, op, prov_relation,
-                                source_ids, actor, request_id, reason, created_at
-                            )
-                            VALUES (%s, %s, %s, 'purge', 'wasPurged', '[]'::jsonb, 'erasure', %s, 'content_purge', %s)
-                            ON CONFLICT (org_id, entity_type, entity_id, op, request_id) DO NOTHING
-                            """
-                        ).format(self._table_identifier("lineage_event")),
-                        (
-                            self.org_id,
-                            entity_type,
-                            entity_id,
-                            f"purge_{entity_id}",
-                            int(time.time()),
-                        ),
-                    )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self.pool.putconn(conn)
-        if found and self._opensearch:
-            self._opensearch.delete_ids(table, [entity_id])
+                if self._opensearch:
+                    self._opensearch.delete_ids(table, [entity_id])
         return found
 
     def _is_on_legal_hold(

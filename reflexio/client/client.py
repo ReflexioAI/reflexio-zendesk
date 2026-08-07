@@ -7,14 +7,21 @@ import warnings
 from collections.abc import Callable, Coroutine, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from urllib.parse import urljoin
 
 import aiohttp
 import requests
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict
 
 from reflexio.defaults import DEFAULT_AGENT_VERSION
+from reflexio.models.api_schema.eval_overview_schema import (
+    GradeOnDemandRequest,
+    GradeOnDemandResponse,
+    RegenerateRequest,
+    RegenerateStartResponse,
+    RegenerateStatusResponse,
+)
 from reflexio.models.api_schema.retriever_schema import (
     ConversationTurn,
     GetAgentPlaybooksRequest,
@@ -26,11 +33,15 @@ from reflexio.models.api_schema.retriever_schema import (
     GetProfilesViewResponse,
     GetRequestsRequest,
     GetRequestsViewResponse,
+    GetRetrievedLearningEvaluationResultsRequest,
+    GetRetrievedLearningEvaluationResultsResponse,
     GetUserPlaybooksRequest,
     GetUserPlaybooksViewResponse,
     GetUserProfilesRequest,
     ProfileChangeLogViewResponse,
     RerankUserProfilesRequest,
+    RetrievalExperimentListResponse,
+    RetrievalExperimentResultsResponse,
     SearchAgentPlaybookRequest,
     SearchAgentPlaybooksViewResponse,
     SearchInteractionRequest,
@@ -39,6 +50,8 @@ from reflexio.models.api_schema.retriever_schema import (
     SearchUserPlaybookRequest,
     SearchUserPlaybooksViewResponse,
     SearchUserProfileRequest,
+    StartRetrievalExperimentRequest,
+    StopRetrievalExperimentRequest,
     StorageStatsResponse,
     UnifiedSearchRequest,
     UnifiedSearchViewResponse,
@@ -54,6 +67,7 @@ from reflexio.models.config_schema import SearchMode
 IS_TEST_ENV = os.environ.get("IS_TEST_ENV", "false").strip() == "true"
 
 BACKEND_URL = "http://127.0.0.1:8000" if IS_TEST_ENV else "https://www.reflexio.ai/"
+REVIEW_USER_PLAYBOOKS_TIMEOUT_SECONDS = 600
 
 from reflexio.models.api_schema.domain.entities import (
     UpgradeProfilesRequest,
@@ -93,6 +107,8 @@ from reflexio.models.api_schema.service_schemas import (
     DeleteUserProfileRequest,
     DeleteUserProfileResponse,
     GetOperationStatusResponse,
+    GetSessionOutcomesRequest,
+    GetSessionOutcomesResponse,
     InteractionData,
     ManualPlaybookGenerationRequest,
     ManualProfileGenerationRequest,
@@ -105,8 +121,13 @@ from reflexio.models.api_schema.service_schemas import (
     RerunPlaybookGenerationResponse,
     RerunProfileGenerationRequest,
     RerunProfileGenerationResponse,
+    ReviewUserPlaybooksRequest,
+    ReviewUserPlaybooksResponse,
     RunPlaybookAggregationRequest,
     RunPlaybookAggregationResponse,
+    SessionOutcomeKind,
+    SetSessionOutcomeRequest,
+    SetSessionOutcomeResponse,
     Status,
     UserPlaybook,
     UserProfile,
@@ -121,7 +142,12 @@ from reflexio.models.config_schema import Config
 from .cache import InMemoryCache
 
 
-class _ClientConfigPayload(Config):
+class OfflineTunerConfigResponse(BaseModel):
+    enabled: bool
+
+
+class ConfigResponse(Config):
+    offline_tuner_config: OfflineTunerConfigResponse | None = None
     model_config = ConfigDict(extra="allow")
 
 
@@ -306,9 +332,8 @@ class ReflexioClient:
         if headers:
             request_headers.update(headers)
 
-        self.session.headers.update(request_headers)
         kwargs.setdefault("timeout", self.timeout)
-        response = self.session.request(method, url, **kwargs)
+        response = self.session.request(method, url, headers=request_headers, **kwargs)
         response.raise_for_status()
 
         # Empty body on a successful response (e.g. 204 No Content).
@@ -362,7 +387,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/publish_interaction",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
             params=params,
         )
         return PublishUserInteractionResponse(**response)
@@ -382,7 +407,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "POST",
             "/api/publish_interaction",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
             params=params,
         )
         return PublishUserInteractionResponse(**response)
@@ -399,6 +424,8 @@ class ReflexioClient:
         force_extraction: bool = False,
         evaluation_only: bool = False,
         override_learning_stall: bool = False,
+        retrieval_experiment_id: str | None = None,
+        retrieval_experiment_arm: Literal["treatment", "holdout"] | None = None,
     ) -> PublishUserInteractionResponse:
         """Publish user interactions.
 
@@ -443,14 +470,31 @@ class ReflexioClient:
                 Reflexio has recorded a provider auth/billing stall. Keep
                 this False for automatic hook publishes; use it only for an
                 explicit retry after reauth or limit reset.
+            retrieval_experiment_id: Experiment ID returned by the learning
+                search used for this response. Supply together with
+                ``retrieval_experiment_arm``.
+            retrieval_experiment_arm: ``"treatment"`` or ``"holdout"`` as
+                returned by learning search. Supply together with the ID.
 
         Returns:
-            PublishUserInteractionResponse: Server response. In
-                ``wait_for_response=False`` mode this is a bare
-                acknowledgement ("Interaction queued for processing")
-                without extraction counts; in ``wait_for_response=True``
-                mode it includes request_id, storage routing, and
-                deltas.
+            PublishUserInteractionResponse: Server response.
+
+                In deferred mode (``wait_for_response=False``) the
+                response carries ``learning_status="deferred"`` and a
+                ``request_id``; ``profiles_added``/``playbooks_added`` are
+                0 because extraction has not run yet. Poll
+                ``get_learning_status(request_id)`` for completion.
+
+                In ``wait_for_response=True`` mode the server waits for
+                extraction and the response includes ``request_id``,
+                storage routing, and real profile/playbook deltas.
+
+                ``warnings`` reports anything quietly altered: unrecognised
+                interaction fields that were stripped (a key you sent did not
+                bind and its value was discarded — check for a typo), and
+                interactions that carried nothing and were skipped. Indices
+                refer to the list as you passed it. The list is bounded, so on
+                a large batch treat it as a sample.
         """
         if session_id is None or not session_id.strip():
             raise ValueError("session_id is required and cannot be empty")
@@ -473,13 +517,52 @@ class ReflexioClient:
             force_extraction=force_extraction,
             evaluation_only=evaluation_only,
             override_learning_stall=override_learning_stall,
+            retrieval_experiment_id=retrieval_experiment_id,
+            retrieval_experiment_arm=retrieval_experiment_arm,
         )
         result = self._publish_interaction_sync(
             request, wait_for_response=wait_for_response
         )
+        # Merge the warnings detected locally. Building InteractionData above
+        # already stripped the caller's unknown keys, so request.model_dump()
+        # sends a clean payload and the server never sees them -- it cannot echo
+        # what it was never told. Without this, unrecognised fields are reported
+        # over raw HTTP but invisible through the SDK, which is the primary
+        # integration path and the one this method's docstring promises.
+        if local_warnings := request.payload_warnings():
+            result.warnings = [*result.warnings, *local_warnings]
         self._cache.invalidate("get_profiles")
         self._cache.invalidate("get_agent_playbooks")
         return result
+
+    def get_learning_status(self, request_id: str) -> str:
+        """Poll the learning status for a previously published request.
+
+        Call this after a deferred ``publish_interaction`` (where
+        ``wait_for_response=False``).  The response carries
+        ``learning_status="deferred"`` to signal that extraction has been
+        queued; use this method to track progress once the durable queue
+        is active.
+
+        Args:
+            request_id: The ``request_id`` of the published interaction, as
+                returned in ``PublishUserInteractionResponse.request_id``
+                (populated on both the deferred and ``wait_for_response=True``
+                paths) or known by the caller.
+
+        Returns:
+            One of: ``"pending"`` | ``"processing"`` | ``"done"`` | ``"failed"``.
+
+        Raises:
+            requests.HTTPError: 404 when the request_id is not known to the
+                server for this org.
+        """
+        response = self._make_request(
+            "GET",
+            "/api/learning_status",
+            params={"request_id": request_id},
+        )
+        return str(response["status"])
 
     def search_interactions(
         self,
@@ -492,6 +575,7 @@ class ReflexioClient:
         end_time: datetime | None = None,
         top_k: int | None = None,
         most_recent_k: int | None = None,
+        threshold: float | None = None,
         search_mode: SearchMode | None = None,
     ) -> SearchInteractionsViewResponse:
         """Search for user interactions.
@@ -505,6 +589,8 @@ class ReflexioClient:
             end_time (Optional[datetime]): Filter by end time
             top_k (Optional[int]): Maximum number of results to return
             most_recent_k (Optional[int]): Return most recent k interactions
+            threshold (Optional[float]): Similarity threshold. When omitted,
+                the embedding model's default is used.
 
         Returns:
             SearchInteractionsViewResponse: Response containing matching interactions
@@ -519,12 +605,13 @@ class ReflexioClient:
             end_time=end_time,
             top_k=top_k,
             most_recent_k=most_recent_k,
+            threshold=threshold,
             search_mode=search_mode,
         )
         response = self._make_request(
             "POST",
             "/api/search_interactions",
-            json=req.model_dump(),
+            json=req.model_dump(mode="json"),
         )
         return SearchInteractionsViewResponse(**response)
 
@@ -560,7 +647,8 @@ class ReflexioClient:
             custom_feature (Optional[str]): Filter by custom feature
             extractor_name (Optional[str]): Deprecated compatibility field. Accepted but ignored.
             tags (Optional[list[str]]): Match profiles having any of these tags.
-            threshold (Optional[float]): Similarity threshold (default: 0.7)
+            threshold (Optional[float]): Similarity threshold. When omitted,
+                the embedding model's default is used.
             enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
 
         Returns:
@@ -584,7 +672,7 @@ class ReflexioClient:
             search_mode=search_mode,
         )
         response = self._make_request(
-            "POST", "/api/search_profiles", json=req.model_dump()
+            "POST", "/api/search_profiles", json=req.model_dump(mode="json")
         )
         return SearchProfilesViewResponse(**response)
 
@@ -667,7 +755,7 @@ class ReflexioClient:
             top_k=top_k,
         )
         response = self._make_request(
-            "POST", "/api/rerank_user_profiles", json=req.model_dump()
+            "POST", "/api/rerank_user_profiles", json=req.model_dump(mode="json")
         )
         return SearchProfilesViewResponse(**response)
 
@@ -721,7 +809,8 @@ class ReflexioClient:
             status_filter (Optional[list[Optional[Status]]]): Filter by status (None for CURRENT, PENDING, ARCHIVED)
             tags (Optional[list[str]]): Match playbooks having any of these tags.
             top_k (Optional[int]): Maximum number of results to return (default: 10)
-            threshold (Optional[float]): Similarity threshold for vector search (default: 0.4)
+            threshold (Optional[float]): Similarity threshold for vector search.
+                When omitted, the embedding model's default is used.
             enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
 
         Returns:
@@ -744,7 +833,7 @@ class ReflexioClient:
             search_mode=search_mode,
         )
         response = self._make_request(
-            "POST", "/api/search_user_playbooks", json=req.model_dump()
+            "POST", "/api/search_user_playbooks", json=req.model_dump(mode="json")
         )
         return SearchUserPlaybooksViewResponse(**response)
 
@@ -753,6 +842,7 @@ class ReflexioClient:
         request: SearchAgentPlaybookRequest | dict | None = None,
         *,
         query: str | None = None,
+        user_id: str | None = None,
         agent_version: str | None = None,
         playbook_name: str | None = None,
         start_time: datetime | None = None,
@@ -770,6 +860,8 @@ class ReflexioClient:
         Args:
             request (Optional[SearchAgentPlaybookRequest]): The search request object (alternative to kwargs)
             query (Optional[str]): Query for semantic/text search
+            user_id (Optional[str]): User receiving the playbooks. Used for
+                retrieval-experiment assignment; it does not filter agent playbooks.
             agent_version (Optional[str]): Filter by agent version
             playbook_name (Optional[str]): Filter by playbook name
             start_time (Optional[datetime]): Start time for created_at filter
@@ -778,7 +870,8 @@ class ReflexioClient:
             playbook_status_filter (Optional[PlaybookStatus]): Filter by playbook status (PENDING, APPROVED, REJECTED)
             tags (Optional[list[str]]): Match playbooks having any of these tags.
             top_k (Optional[int]): Maximum number of results to return (default: 10)
-            threshold (Optional[float]): Similarity threshold for vector search (default: 0.4)
+            threshold (Optional[float]): Similarity threshold for vector search.
+                When omitted, the embedding model's default is used.
             enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
 
         Returns:
@@ -788,6 +881,7 @@ class ReflexioClient:
             request,
             SearchAgentPlaybookRequest,
             query=query,
+            user_id=user_id,
             agent_version=agent_version,
             playbook_name=playbook_name,
             start_time=start_time,
@@ -801,7 +895,7 @@ class ReflexioClient:
             search_mode=search_mode,
         )
         response = self._make_request(
-            "POST", "/api/search_agent_playbooks", json=req.model_dump()
+            "POST", "/api/search_agent_playbooks", json=req.model_dump(mode="json")
         )
         return SearchAgentPlaybooksViewResponse(**response)
 
@@ -812,7 +906,7 @@ class ReflexioClient:
         response = self._make_request(
             "DELETE",
             "/api/delete_profile",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteUserProfileResponse(**response)
 
@@ -823,7 +917,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "DELETE",
             "/api/delete_profile",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteUserProfileResponse(**response)
 
@@ -870,7 +964,7 @@ class ReflexioClient:
         response = self._make_request(
             "DELETE",
             "/api/delete_interaction",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteUserInteractionResponse(**response)
 
@@ -881,7 +975,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "DELETE",
             "/api/delete_interaction",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteUserInteractionResponse(**response)
 
@@ -921,7 +1015,7 @@ class ReflexioClient:
         response = self._make_request(
             "DELETE",
             "/api/delete_request",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteRequestResponse(**response)
 
@@ -932,7 +1026,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "DELETE",
             "/api/delete_request",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteRequestResponse(**response)
 
@@ -968,7 +1062,7 @@ class ReflexioClient:
         response = self._make_request(
             "DELETE",
             "/api/delete_session",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteSessionResponse(**response)
 
@@ -979,7 +1073,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "DELETE",
             "/api/delete_session",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteSessionResponse(**response)
 
@@ -1008,6 +1102,67 @@ class ReflexioClient:
         self._fire_and_forget(self._delete_session_async, request)
         return None
 
+    def mark_session_outcome(
+        self,
+        *,
+        session_id: str,
+        outcome: SessionOutcomeKind | str,
+        occurred_at: int,
+        label: str | None = None,
+        value: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SetSessionOutcomeResponse:
+        """Record the first terminal outcome for a published session.
+
+        The session must already contain at least one published request. Reflexio
+        derives both ``user_id`` and ``source`` from the earliest request ordered
+        by ``(created_at, request_id)``. Only the first outcome is recorded;
+        retries return ``success=True`` and ``recorded=False``. Sessions are not
+        required to report an outcome.
+        """
+        request = SetSessionOutcomeRequest(
+            session_id=session_id,
+            outcome=SessionOutcomeKind(outcome),
+            occurred_at=occurred_at,
+            label=label,
+            value=value,
+            metadata=metadata,
+        )
+        response = self._make_request(
+            "POST", "/api/session_outcome", json=request.model_dump(mode="json")
+        )
+        return SetSessionOutcomeResponse(**response)
+
+    def get_session_outcomes(
+        self,
+        *,
+        session_ids: list[str] | None = None,
+        user_id: str | None = None,
+        source: str | None = None,
+        outcome: SessionOutcomeKind | str | None = None,
+        label: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        top_k: int = 100,
+        offset: int = 0,
+    ) -> GetSessionOutcomesResponse:
+        """Read session outcomes using exact optional filters."""
+        payload = GetSessionOutcomesRequest(
+            session_ids=session_ids,
+            user_id=user_id,
+            source=source,
+            outcome=SessionOutcomeKind(outcome) if outcome is not None else None,
+            label=label,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+            offset=offset,
+        )
+        response = self._make_request(
+            "POST", "/api/get_session_outcomes", json=payload.model_dump(mode="json")
+        )
+        return GetSessionOutcomesResponse(**response)
+
     def _delete_agent_playbook_sync(
         self, request: DeleteAgentPlaybookRequest
     ) -> DeleteAgentPlaybookResponse:
@@ -1015,7 +1170,7 @@ class ReflexioClient:
         response = self._make_request(
             "DELETE",
             "/api/delete_agent_playbook",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteAgentPlaybookResponse(**response)
 
@@ -1026,7 +1181,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "DELETE",
             "/api/delete_agent_playbook",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteAgentPlaybookResponse(**response)
 
@@ -1063,7 +1218,7 @@ class ReflexioClient:
         response = self._make_request(
             "DELETE",
             "/api/delete_user_playbook",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteUserPlaybookResponse(**response)
 
@@ -1074,7 +1229,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "DELETE",
             "/api/delete_user_playbook",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return DeleteUserPlaybookResponse(**response)
 
@@ -1144,7 +1299,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/get_interactions",
-            json=req.model_dump(),
+            json=req.model_dump(mode="json"),
         )
         return GetInteractionsViewResponse(**response)
 
@@ -1154,9 +1309,13 @@ class ReflexioClient:
         force_refresh: bool = False,
         *,
         user_id: str | None = None,
+        profile_id: str | None = None,
+        query: str | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         top_k: int | None = None,
+        source: str | None = None,
+        profile_time_to_live: str | None = None,
         status_filter: list[Status | str | None] | None = None,
         tags: list[str] | None = None,
     ) -> GetProfilesViewResponse:
@@ -1166,9 +1325,13 @@ class ReflexioClient:
             request (Optional[GetUserProfilesRequest]): The list request object (alternative to kwargs)
             force_refresh (bool, optional): If True, bypass cache and fetch fresh data. Defaults to False.
             user_id (str): The user ID to get profiles for
+            profile_id (Optional[str]): Exact profile ID filter.
+            query (Optional[str]): Case-insensitive text filter across visible fields.
             start_time (Optional[datetime]): Filter by start time
             end_time (Optional[datetime]): Filter by end time
             top_k (Optional[int]): Maximum number of results to return (default: 30)
+            source (Optional[str]): Filter by profile source.
+            profile_time_to_live (Optional[str]): Filter by profile TTL value.
             status_filter (Optional[list[Optional[Union[Status, str]]]]): Filter by profile status. Accepts Status enum or string values (e.g., "archived", "pending").
             tags (Optional[list[str]]): Match profiles having any of these tags.
 
@@ -1191,9 +1354,13 @@ class ReflexioClient:
             request,
             GetUserProfilesRequest,
             user_id=user_id,
+            profile_id=profile_id,
+            query=query,
             start_time=start_time,
             end_time=end_time,
             top_k=top_k,
+            source=source,
+            profile_time_to_live=profile_time_to_live,
             status_filter=converted_status_filter,
             tags=tags,
         )
@@ -1203,9 +1370,13 @@ class ReflexioClient:
             cached_result = self._cache.get(
                 "get_profiles",
                 user_id=req.user_id,
+                profile_id=req.profile_id,
+                query=req.query,
                 start_time=req.start_time,
                 end_time=req.end_time,
                 top_k=req.top_k,
+                source=req.source,
+                profile_time_to_live=req.profile_time_to_live,
                 status_filter=req.status_filter,
                 tags=req.tags,
             )
@@ -1216,7 +1387,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/get_profiles",
-            json=req.model_dump(),
+            json=req.model_dump(mode="json"),
         )
         result = GetProfilesViewResponse(**response)
 
@@ -1225,9 +1396,13 @@ class ReflexioClient:
             "get_profiles",
             result,
             user_id=req.user_id,
+            profile_id=req.profile_id,
+            query=req.query,
             start_time=req.start_time,
             end_time=req.end_time,
             top_k=req.top_k,
+            source=req.source,
+            profile_time_to_live=req.profile_time_to_live,
             status_filter=req.status_filter,
             tags=req.tags,
         )
@@ -1256,6 +1431,13 @@ class ReflexioClient:
         self,
         limit: int = 100,
         status_filter: str | None = None,
+        user_id: str | None = None,
+        profile_id: str | None = None,
+        query: str | None = None,
+        source: str | None = None,
+        profile_time_to_live: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
     ) -> GetProfilesViewResponse:
         """Get all user profiles across all users.
 
@@ -1264,6 +1446,13 @@ class ReflexioClient:
             status_filter (str, optional): Filter by profile status. Accepts
                 ``"current"``, ``"pending"``, or ``"archived"``. If ``None``
                 (the default), profiles with any status are returned.
+            user_id (str, optional): Filter by exact user ID.
+            profile_id (str, optional): Filter by exact profile ID.
+            query (str, optional): Case-insensitive text filter across visible fields.
+            source (str, optional): Filter by exact profile source.
+            profile_time_to_live (str, optional): Filter by profile TTL value.
+            start_time (int, optional): Minimum last-modified epoch seconds.
+            end_time (int, optional): Maximum last-modified epoch seconds.
 
         Returns:
             GetProfilesViewResponse: Response containing all user profiles
@@ -1273,6 +1462,21 @@ class ReflexioClient:
         params: dict[str, str | int] = {"limit": limit}
         if status_filter:
             params["status_filter"] = status_filter
+        params.update(
+            {
+                key: value
+                for key, value in {
+                    "user_id": user_id,
+                    "profile_id": profile_id,
+                    "query": query,
+                    "source": source,
+                    "profile_time_to_live": profile_time_to_live,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                }.items()
+                if value is not None
+            }
+        )
         response = self._make_request(
             "GET",
             f"/api/get_all_profiles?{urlencode(params)}",
@@ -1288,14 +1492,20 @@ class ReflexioClient:
         Returns:
             dict: Response containing success status and message
         """
-        config = self._convert_to_model(  # type: ignore[reportAssignmentType]
-            config,
-            _ClientConfigPayload,
-        )
+        if isinstance(config, Config):
+            config = Config.model_validate(
+                config.model_dump(mode="python"),
+                extra="ignore",
+            )
+        else:
+            config = self._convert_to_model(  # type: ignore[reportAssignmentType]
+                config,
+                Config,
+            )
         return self._make_request(
             "POST",
             "/api/set_config",
-            json=config.model_dump(),  # type: ignore[reportAttributeAccessIssue]
+            json=config.model_dump(mode="json"),  # type: ignore[reportAttributeAccessIssue]
         )
 
     def update_config(self, partial: dict) -> dict:
@@ -1327,17 +1537,59 @@ class ReflexioClient:
             )
         return self._make_request("POST", "/api/update_config", json=partial)
 
-    def get_config(self) -> Config:
+    def list_retrieval_experiments(self) -> RetrievalExperimentListResponse:
+        """List the active and historical user-level retrieval experiments."""
+        response = self._make_request("GET", "/api/retrieval_experiments")
+        return RetrievalExperimentListResponse(**response)
+
+    def start_retrieval_experiment(
+        self, experiment_id: str, holdout_percentage: float
+    ) -> RetrievalExperimentListResponse:
+        """Start the organization's only active retrieval experiment."""
+        request = StartRetrievalExperimentRequest(
+            experiment_id=experiment_id,
+            holdout_percentage=holdout_percentage,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/retrieval_experiments",
+            json=request.model_dump(mode="json"),
+        )
+        return RetrievalExperimentListResponse(**response)
+
+    def stop_retrieval_experiment(
+        self, experiment_id: str
+    ) -> RetrievalExperimentListResponse:
+        """Stop the active retrieval experiment while retaining its history."""
+        request = StopRetrievalExperimentRequest(experiment_id=experiment_id)
+        response = self._make_request(
+            "POST",
+            "/api/retrieval_experiments/stop",
+            json=request.model_dump(mode="json"),
+        )
+        return RetrievalExperimentListResponse(**response)
+
+    def get_retrieval_experiment_results(
+        self, experiment_id: str
+    ) -> RetrievalExperimentResultsResponse:
+        """Return session-success metrics grouped by the users' assigned arms."""
+        response = self._make_request(
+            "GET",
+            f"/api/retrieval_experiments/{experiment_id}/results",
+        )
+        return RetrievalExperimentResultsResponse(**response)
+
+    def get_config(self) -> ConfigResponse:
         """Get configuration for the organization.
 
         Returns:
-            Config: The current configuration
+            ConfigResponse: The current configuration, including response overlays.
         """
         response = self._make_request(
             "GET",
             "/api/get_config",
         )
-        return _ClientConfigPayload(**response)
+        return ConfigResponse(**response)
 
     def invalidate_cache(self, org_id: str | None = None) -> dict:
         """Explicitly evict the server-side per-org Reflexio cache entry.
@@ -1375,9 +1627,14 @@ class ReflexioClient:
         request: GetUserPlaybooksRequest | dict | None = None,
         *,
         limit: int | None = None,
+        user_playbook_id: int | None = None,
         user_id: str | None = None,
+        request_id: str | None = None,
+        query: str | None = None,
         playbook_name: str | None = None,
         agent_version: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
         status_filter: list[Status | None] | None = None,
         tags: list[str] | None = None,
     ) -> GetUserPlaybooksViewResponse:
@@ -1386,9 +1643,14 @@ class ReflexioClient:
         Args:
             request (Optional[GetUserPlaybooksRequest]): The get request object (alternative to kwargs)
             limit (Optional[int]): Maximum number of results to return (default: 100)
+            user_playbook_id (Optional[int]): Exact user playbook ID filter.
             user_id (Optional[str]): Filter by user ID
+            request_id (Optional[str]): Filter by generating request ID.
+            query (Optional[str]): Case-insensitive text filter across visible fields.
             playbook_name (Optional[str]): Filter by playbook name
             agent_version (Optional[str]): Filter by agent version
+            start_time (Optional[datetime]): Filter by start time.
+            end_time (Optional[datetime]): Filter by end time.
             status_filter (Optional[list[Optional[Status]]]): Filter by status
             tags (Optional[list[str]]): Match playbooks having any of these tags.
 
@@ -1399,18 +1661,66 @@ class ReflexioClient:
             request,
             GetUserPlaybooksRequest,
             limit=limit,
+            user_playbook_id=user_playbook_id,
             user_id=user_id,
+            request_id=request_id,
+            query=query,
             playbook_name=playbook_name,
             agent_version=agent_version,
+            start_time=start_time,
+            end_time=end_time,
             status_filter=status_filter,
             tags=tags,
         )
         response = self._make_request(
             "POST",
             "/api/get_user_playbooks",
-            json=req.model_dump(),
+            json=req.model_dump(mode="json"),
         )
         return GetUserPlaybooksViewResponse(**response)
+
+    def review_user_playbooks(
+        self,
+        *,
+        start_time: datetime,
+        end_time: datetime,
+        top_k: int = 10,
+        report_only: bool = True,
+    ) -> ReviewUserPlaybooksResponse:
+        """Re-review current user playbooks created within a bounded window.
+
+        The default ``report_only=True`` runs inline and returns one decision per
+        selected playbook. Each playbook is reviewed from its full finalized
+        extraction-run window plus any cited consolidation evidence, independent
+        of the current extractor window size or source filter. Rows with missing
+        or invalid persisted provenance are skipped. Only cited interactions are
+        reviewer evidence; other run-window interactions provide chronology.
+
+        With ``report_only=False`` the server accepts the run and applies it in
+        the background, so the response carries only ``run_id`` — not
+        ``results``. The run reviews newest-first and commits each completed
+        decision before moving to the next playbook: accepted rows stay
+        unchanged, rejected rows are archived, and an edit inserts the
+        replacement as current while superseding its incumbent. Applied edits are
+        recorded on the replacement's lineage under ``run_id``.
+        """
+        request = ReviewUserPlaybooksRequest(
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+            report_only=report_only,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/review_user_playbooks",
+            json=request.model_dump(mode="json"),
+            timeout=(
+                max(self.timeout, REVIEW_USER_PLAYBOOKS_TIMEOUT_SECONDS)
+                if report_only
+                else self.timeout
+            ),
+        )
+        return ReviewUserPlaybooksResponse(**response)
 
     def add_user_playbook(
         self,
@@ -1437,7 +1747,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/add_user_playbook",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return AddUserPlaybookResponse(**response)
 
@@ -1468,7 +1778,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/add_agent_playbook",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return AddAgentPlaybookResponse(**response)
 
@@ -1528,7 +1838,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/add_user_profile",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return AddUserProfileResponse(**response)
 
@@ -1566,7 +1876,7 @@ class ReflexioClient:
         response = self._make_request(
             "PUT",
             "/api/update_user_playbook",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return UpdateUserPlaybookResponse(**response)
 
@@ -1608,7 +1918,7 @@ class ReflexioClient:
         response = self._make_request(
             "PUT",
             "/api/update_agent_playbook",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         self._cache.invalidate("get_agent_playbooks")
         return UpdateAgentPlaybookResponse(**response)
@@ -1642,7 +1952,7 @@ class ReflexioClient:
         response = self._make_request(
             "PUT",
             "/api/update_agent_playbook_status",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         self._cache.invalidate("get_agent_playbooks")
         return UpdatePlaybookStatusResponse(**response)
@@ -1653,8 +1963,12 @@ class ReflexioClient:
         force_refresh: bool = False,
         *,
         limit: int | None = None,
+        agent_playbook_id: int | None = None,
+        query: str | None = None,
         playbook_name: str | None = None,
         agent_version: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
         status_filter: list[Status | None] | None = None,
         playbook_status_filter: PlaybookStatus | None = None,
         tags: list[str] | None = None,
@@ -1665,8 +1979,12 @@ class ReflexioClient:
             request (Optional[GetAgentPlaybooksRequest]): The get request object (alternative to kwargs)
             force_refresh (bool, optional): If True, bypass cache and fetch fresh data. Defaults to False.
             limit (Optional[int]): Maximum number of results to return (default: 100)
+            agent_playbook_id (Optional[int]): Exact agent playbook ID filter.
+            query (Optional[str]): Case-insensitive text filter across visible fields.
             playbook_name (Optional[str]): Filter by playbook name
             agent_version (Optional[str]): Filter by agent version
+            start_time (Optional[datetime]): Filter by start time.
+            end_time (Optional[datetime]): Filter by end time.
             status_filter (Optional[list[Optional[Status]]]): Filter by status
             playbook_status_filter (Optional[PlaybookStatus]): Filter by playbook status (default: APPROVED)
             tags (Optional[list[str]]): Match playbooks having any of these tags.
@@ -1678,8 +1996,12 @@ class ReflexioClient:
             request,
             GetAgentPlaybooksRequest,
             limit=limit,
+            agent_playbook_id=agent_playbook_id,
+            query=query,
             playbook_name=playbook_name,
             agent_version=agent_version,
+            start_time=start_time,
+            end_time=end_time,
             status_filter=status_filter,
             playbook_status_filter=playbook_status_filter,
             tags=tags,
@@ -1690,8 +2012,12 @@ class ReflexioClient:
             cached_result = self._cache.get(
                 "get_agent_playbooks",
                 limit=req.limit,
+                agent_playbook_id=req.agent_playbook_id,
+                query=req.query,
                 playbook_name=req.playbook_name,
                 agent_version=req.agent_version,
+                start_time=req.start_time,
+                end_time=req.end_time,
                 status_filter=req.status_filter,
                 playbook_status_filter=req.playbook_status_filter,
                 tags=req.tags,
@@ -1703,7 +2029,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/get_agent_playbooks",
-            json=req.model_dump(),
+            json=req.model_dump(mode="json"),
         )
         result = GetAgentPlaybooksViewResponse(**response)
 
@@ -1712,8 +2038,12 @@ class ReflexioClient:
             "get_agent_playbooks",
             result,
             limit=req.limit,
+            agent_playbook_id=req.agent_playbook_id,
+            query=req.query,
             playbook_name=req.playbook_name,
             agent_version=req.agent_version,
+            start_time=req.start_time,
+            end_time=req.end_time,
             status_filter=req.status_filter,
             playbook_status_filter=req.playbook_status_filter,
             tags=req.tags,
@@ -1727,6 +2057,8 @@ class ReflexioClient:
         *,
         user_id: str | None = None,
         request_id: str | None = None,
+        session_id: str | None = None,
+        source: str | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         top_k: int | None = None,
@@ -1737,6 +2069,8 @@ class ReflexioClient:
             request (Optional[GetRequestsRequest]): The get request object (alternative to kwargs)
             user_id (Optional[str]): Filter by user ID
             request_id (Optional[str]): Filter by request ID
+            session_id (Optional[str]): Filter by session ID
+            source (Optional[str]): Filter by request source
             start_time (Optional[datetime]): Filter by start time
             end_time (Optional[datetime]): Filter by end time
             top_k (Optional[int]): Maximum number of results to return (default: 30)
@@ -1749,6 +2083,8 @@ class ReflexioClient:
             GetRequestsRequest,
             user_id=user_id,
             request_id=request_id,
+            session_id=session_id,
+            source=source,
             start_time=start_time,
             end_time=end_time,
             top_k=top_k,
@@ -1756,7 +2092,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/get_requests",
-            json=req.model_dump(),
+            json=req.model_dump(mode="json"),
         )
         return GetRequestsViewResponse(**response)
 
@@ -1766,6 +2102,8 @@ class ReflexioClient:
         *,
         limit: int | None = None,
         agent_version: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
     ) -> GetEvaluationResultsViewResponse:
         """Get agent success evaluation results.
 
@@ -1773,6 +2111,8 @@ class ReflexioClient:
             request (Optional[GetAgentSuccessEvaluationResultsRequest]): The get request object (alternative to kwargs)
             limit (Optional[int]): Maximum number of results to return (default: 100)
             agent_version (Optional[str]): Filter by agent version
+            start_time (Optional[datetime]): Filter by start time
+            end_time (Optional[datetime]): Filter by end time
 
         Returns:
             GetEvaluationResultsViewResponse: Response containing agent success evaluation results
@@ -1782,13 +2122,133 @@ class ReflexioClient:
             GetAgentSuccessEvaluationResultsRequest,
             limit=limit,
             agent_version=agent_version,
+            start_time=start_time,
+            end_time=end_time,
         )
         response = self._make_request(
             "POST",
             "/api/get_agent_success_evaluation_results",
-            json=req.model_dump(),
+            json=req.model_dump(mode="json"),
         )
         return GetEvaluationResultsViewResponse(**response)
+
+    def get_retrieved_learning_evaluation_results(
+        self,
+        request: GetRetrievedLearningEvaluationResultsRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> GetRetrievedLearningEvaluationResultsResponse:
+        """Get per-learning relevance and impact verdicts for retrieved context.
+
+        Time filters apply to the interaction that received the learning, not
+        to the later timestamp when its evaluation row was generated.
+        """
+        req = self._build_request(
+            request,
+            GetRetrievedLearningEvaluationResultsRequest,
+            user_id=user_id,
+            session_id=session_id,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/get_retrieved_learning_evaluation_results",
+            json=req.model_dump(mode="json"),
+        )
+        return GetRetrievedLearningEvaluationResultsResponse(**response)
+
+    def regenerate_evaluations(
+        self,
+        request: RegenerateRequest | dict | None = None,
+        *,
+        from_ts: int | None = None,
+        to_ts: int | None = None,
+        evaluation_name: str | None = None,
+    ) -> RegenerateStartResponse:
+        """Start a replay-the-judge regeneration job over a time window.
+
+        Args:
+            request: Optional ``RegenerateRequest`` or dict. If omitted,
+                keyword arguments are used.
+            from_ts: Inclusive lower bound of the window as Unix seconds.
+            to_ts: Inclusive upper bound of the window as Unix seconds.
+            evaluation_name: Deprecated compatibility field accepted by the
+                API but ignored by the singleton evaluator.
+
+        Returns:
+            RegenerateStartResponse: The job id and number of queued sessions.
+        """
+        req = self._build_request(
+            request,
+            RegenerateRequest,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            evaluation_name=evaluation_name,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/evaluations/regenerate",
+            json=req.model_dump(mode="json"),
+        )
+        return RegenerateStartResponse(**response)
+
+    def get_evaluation_regeneration_status(
+        self, job_id: str
+    ) -> RegenerateStatusResponse:
+        """Get status for an evaluation regeneration job."""
+        response = self._make_request(
+            "GET",
+            f"/api/evaluations/regenerate/{job_id}",
+        )
+        return RegenerateStatusResponse(**response)
+
+    def cancel_evaluation_regeneration(self, job_id: str) -> dict[str, str]:
+        """Request cancellation for an evaluation regeneration job."""
+        return self._make_request(
+            "DELETE",
+            f"/api/evaluations/regenerate/{job_id}",
+        )
+
+    def grade_on_demand(
+        self,
+        request: GradeOnDemandRequest | dict | None = None,
+        *,
+        session_id: str | None = None,
+        agent_version: str | None = None,
+        evaluation_name: str | None = None,
+    ) -> GradeOnDemandResponse:
+        """Grade a single session synchronously.
+
+        Args:
+            request: Optional ``GradeOnDemandRequest`` or dict. If omitted,
+                keyword arguments are used.
+            session_id: Session to grade.
+            agent_version: Agent version to grade.
+            evaluation_name: Deprecated compatibility field accepted by the
+                API but ignored by the singleton evaluator.
+
+        Returns:
+            GradeOnDemandResponse: Result id, cache flag, or skipped reason.
+        """
+        req = self._build_request(
+            request,
+            GradeOnDemandRequest,
+            session_id=session_id,
+            agent_version=agent_version,
+            evaluation_name=evaluation_name,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/evaluations/grade_on_demand",
+            json=req.model_dump(mode="json"),
+        )
+        return GradeOnDemandResponse(**response)
 
     def _poll_operation_status(
         self,
@@ -1829,7 +2289,10 @@ class ReflexioClient:
                 continue
             status_response = GetOperationStatusResponse(**response)
             op = status_response.operation_status
-            if op and min_started_at is not None and op.started_at < min_started_at:
+            # The API stores operation timestamps at second precision. Accept a
+            # one-second skew so a just-submitted operation that starts near the
+            # client timestamp boundary is not treated as stale forever.
+            if op and min_started_at is not None and op.started_at < min_started_at - 1:
                 op = None
             if op and op.status in (
                 OperationStatus.COMPLETED,
@@ -1855,7 +2318,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/rerun_profile_generation",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         initial = RerunProfileGenerationResponse(**response)
         if not initial.success:
@@ -1893,7 +2356,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "POST",
             "/api/rerun_profile_generation",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return RerunProfileGenerationResponse(**response)
 
@@ -1963,7 +2426,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/upgrade_all_profiles",
-            json=req.model_dump(),
+            json=req.model_dump(mode="json"),
         )
         return UpgradeProfilesResponse(**response)
 
@@ -1989,7 +2452,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/upgrade_all_user_playbooks",
-            json=req.model_dump(),
+            json=req.model_dump(mode="json"),
         )
         return UpgradeUserPlaybooksResponse(**response)
 
@@ -2000,7 +2463,7 @@ class ReflexioClient:
         await self._make_async_request(
             "POST",
             "/api/manual_profile_generation",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
 
     def manual_profile_generation(
@@ -2048,7 +2511,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/rerun_playbook_generation",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         initial = RerunPlaybookGenerationResponse(**response)
         if not initial.success:
@@ -2086,7 +2549,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "POST",
             "/api/rerun_playbook_generation",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return RerunPlaybookGenerationResponse(**response)
 
@@ -2138,7 +2601,7 @@ class ReflexioClient:
         await self._make_async_request(
             "POST",
             "/api/manual_playbook_generation",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
 
     def manual_playbook_generation(
@@ -2182,7 +2645,7 @@ class ReflexioClient:
         response = self._make_request(
             "POST",
             "/api/run_playbook_aggregation",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return RunPlaybookAggregationResponse(**response)
 
@@ -2193,7 +2656,7 @@ class ReflexioClient:
         response = await self._make_async_request(
             "POST",
             "/api/run_playbook_aggregation",
-            json=request.model_dump(),
+            json=request.model_dump(mode="json"),
         )
         return RunPlaybookAggregationResponse(**response)
 
@@ -2242,6 +2705,7 @@ class ReflexioClient:
         agent_version: str | None = None,
         playbook_name: str | None = None,
         user_id: str | None = None,
+        tags: list[str] | None = None,
         entity_types: list[str] | None = None,
         agent_playbook_status_filter: list[PlaybookStatus | str] | None = None,
         enable_reformulation: bool | None = None,
@@ -2261,15 +2725,22 @@ class ReflexioClient:
             request (Optional[UnifiedSearchRequest]): The search request object (alternative to kwargs)
             query (str): Search query text
             top_k (Optional[int]): Maximum results per entity type (default: 5)
-            threshold (Optional[float]): Similarity threshold for vector search (default: 0.3)
+            threshold (Optional[float]): Similarity threshold for vector search.
+                When omitted, the embedding model's default is used.
             agent_version (Optional[str]): Filter by agent version (agent_playbooks, user_playbooks)
             playbook_name (Optional[str]): Filter by playbook name (agent_playbooks, user_playbooks)
             user_id (Optional[str]): Filter by user ID (profiles, user_playbooks)
+            tags (Optional[list[str]]): Match entities having any requested tag.
             entity_types (Optional[list[str]]): Entity types to search. Valid values:
                 "profiles", "user_playbooks", "agent_playbooks".
             agent_playbook_status_filter (Optional[list[Union[PlaybookStatus, str]]]):
                 Agent-playbook approval statuses to include.
-            enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
+            enable_reformulation (Optional[bool]): Enable the pre-search LLM
+                query reformulation call (default: False). Besides rewriting
+                the query, it extracts temporal signals — time windows
+                ("this week"), as-of boundaries, and current-value intent —
+                that make retrieval time-sensitive (window filters,
+                freshness-preferred ranking for superseded facts).
             enable_agent_answer (Optional[bool]): Enable agentic answer synthesis when
                 the configured search backend supports it (default: False).
             conversation_history (Optional[list[ConversationTurn] | list[dict]]): Prior conversation turns for context-aware query reformulation. Accepts ConversationTurn objects or dicts with "role" and "content" keys.
@@ -2290,6 +2761,7 @@ class ReflexioClient:
             agent_version=agent_version,
             playbook_name=playbook_name,
             user_id=user_id,
+            tags=tags,
             entity_types=entity_types,
             agent_playbook_status_filter=agent_playbook_status_filter,
             enable_reformulation=enable_reformulation,
@@ -2300,7 +2772,9 @@ class ReflexioClient:
             session_id=session_id,
             interaction_id=interaction_id,
         )
-        response = self._make_request("POST", "/api/search", json=req.model_dump())
+        response = self._make_request(
+            "POST", "/api/search", json=req.model_dump(mode="json")
+        )
         return UnifiedSearchViewResponse(**response)
 
     # =========================================================================
@@ -2318,7 +2792,7 @@ class ReflexioClient:
         """
         req = DeleteRequestsByIdsRequest(request_ids=request_ids)
         response = self._make_request(
-            "DELETE", "/api/delete_requests_by_ids", json=req.model_dump()
+            "DELETE", "/api/delete_requests_by_ids", json=req.model_dump(mode="json")
         )
         return BulkDeleteResponse(**response)
 
@@ -2333,7 +2807,7 @@ class ReflexioClient:
         """
         req = DeleteProfilesByIdsRequest(profile_ids=profile_ids)
         response = self._make_request(
-            "DELETE", "/api/delete_profiles_by_ids", json=req.model_dump()
+            "DELETE", "/api/delete_profiles_by_ids", json=req.model_dump(mode="json")
         )
         self._cache.invalidate("get_profiles")
         return BulkDeleteResponse(**response)
@@ -2351,7 +2825,9 @@ class ReflexioClient:
         """
         req = DeleteAgentPlaybooksByIdsRequest(agent_playbook_ids=agent_playbook_ids)
         response = self._make_request(
-            "DELETE", "/api/delete_agent_playbooks_by_ids", json=req.model_dump()
+            "DELETE",
+            "/api/delete_agent_playbooks_by_ids",
+            json=req.model_dump(mode="json"),
         )
         self._cache.invalidate("get_agent_playbooks")
         return BulkDeleteResponse(**response)
@@ -2369,7 +2845,9 @@ class ReflexioClient:
         """
         req = DeleteUserPlaybooksByIdsRequest(user_playbook_ids=user_playbook_ids)
         response = self._make_request(
-            "DELETE", "/api/delete_user_playbooks_by_ids", json=req.model_dump()
+            "DELETE",
+            "/api/delete_user_playbooks_by_ids",
+            json=req.model_dump(mode="json"),
         )
         return BulkDeleteResponse(**response)
 
@@ -2651,7 +3129,7 @@ class ReflexioClient:
         """
         req = ClearUserDataRequest(user_id=user_id)
         response = self._make_request(
-            "POST", "/api/clear_user_data", json=req.model_dump()
+            "POST", "/api/clear_user_data", json=req.model_dump(mode="json")
         )
         # Nuclear — clear everything that could reference this user.
         self._cache.clear()

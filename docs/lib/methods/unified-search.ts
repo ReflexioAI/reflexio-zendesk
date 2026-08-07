@@ -71,7 +71,8 @@ export const unifiedSearchMethods: MethodDef[] = [
         type: "boolean",
         required: false,
         default: false,
-        description: "Enable LLM query reformulation",
+        description:
+          "Enable pre-search LLM query reformulation; also extracts temporal signals (time windows, current-value intent) that make ranking time-sensitive",
       },
       {
         name: "conversation_history",
@@ -88,6 +89,13 @@ export const unifiedSearchMethods: MethodDef[] = [
         description:
           "Search mode: vector (embedding similarity), fts (full-text search), or hybrid (combined with RRF)",
         enumValues: ["vector", "fts", "hybrid"],
+      },
+      {
+        name: "session_id",
+        type: "string",
+        required: false,
+        description:
+          "Agent session this search serves. When set, results already returned to the same session are skipped and next-best matches backfilled; searches without it neither read nor record session dedup state",
       },
     ],
   },

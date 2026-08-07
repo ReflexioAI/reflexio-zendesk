@@ -11,6 +11,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from reflexio.models.api_schema.domain import CitationKind
 from reflexio.models.api_schema.validators import NonEmptyStr
 from reflexio.models.structured_output import StrictStructuredOutput
 
@@ -21,10 +22,11 @@ BucketLiteral = Literal["day", "week"]
 class HeroBucket(BaseModel):
     """One point on the trend chart in the hero block.
 
-    ``avg_corrections`` is the mean of ``number_of_correction_per_session``
-    across this bucket's evaluation results. Surfaced so the frontend can
-    plot a "corrections over time" line beside the success-rate trend.
-    Lower is better.
+    ``avg_corrections`` is the mean judge-derived count of user turns that
+    corrected or redirected an earlier agent response, across every evaluation
+    result in this bucket (including zero-count sessions). Surfaced so the
+    frontend can plot a "corrections over time" line beside the success-rate
+    trend. Lower is better.
 
     ``escalation_rate`` is the fraction of sessions in this bucket whose
     eval result had ``is_escalated=True``. Range 0.0 – 1.0. Surfaced so
@@ -61,15 +63,32 @@ class PercentWithDelta(BaseModel):
     delta_pp: float
 
 
+class BehaviorSuccessMetric(BaseModel):
+    """Agent-behavior success after excluding system reliability failures.
+
+    ``current`` is nullable because a window containing only ``system_error``
+    rows has no behavior-evaluable sessions. ``delta_pp`` is nullable whenever
+    either the current or prior seven-day window has no eligible denominator.
+    Counts describe the current seven-day window shown by the metric tile.
+    """
+
+    current: float | None = Field(default=None, ge=0.0, le=100.0)
+    delta_pp: float | None = None
+    eligible_sessions: int = Field(default=0, ge=0)
+    excluded_system_errors: int = Field(default=0, ge=0)
+
+
 class ContextTile(BaseModel):
-    """Wrapper for the four mini-tiles in the context band.
+    """Wrapper for the session-level metric tiles in the context band.
 
     Each tile is rendered with an absolute value + a delta vs the previous
     7d window. Percent-shaped values carry `delta_pp` (percentage points);
-    raw counts carry `delta` (absolute difference).
+    raw counts carry `delta` (absolute difference). Behavior success excludes
+    rows classified as ``system_error`` while task success does not.
     """
 
     success: PercentWithDelta
+    behavior_success: BehaviorSuccessMetric
     corrections: NumberWithDelta
     turns: NumberWithDelta
     escalation: PercentWithDelta
@@ -79,7 +98,7 @@ class RuleAttributionRow(BaseModel):
     """One row in the "rules that moved the needle" panel."""
 
     rule_id: str
-    kind: Literal["playbook", "profile"]
+    kind: CitationKind
     title: str = ""
     successes_with: int = Field(ge=0)
     failures_with: int = Field(ge=0)
@@ -416,12 +435,17 @@ class GradeOnDemandResponse(BaseModel):
             window. False on a fresh grade.
         skipped_reason (str | None): If grading was skipped, the reason
             (e.g., "NO_REQUESTS"). None on success.
+        retrieved_learning_status (str | None): Outcome of the
+            retrieved-learning evaluation for this session (e.g.
+            "complete", "degraded", "failed", "not_applicable"). None on
+            legacy cache entries and skipped grades.
     """
 
     session_id: str
     result_id: int | None = None
     cached: bool = False
     skipped_reason: str | None = None
+    retrieved_learning_status: str | None = None
 
 
 # ---------------------------------------------------------------------------

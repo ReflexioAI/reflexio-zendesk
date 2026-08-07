@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ from reflexio.models.config_schema import (
     ProfileExtractorConfig,
     StorageConfigPostgres,
     StorageConfigSQLite,
-    normalize_legacy_config_shape,
+    validate_stored_config,
 )
 from reflexio.server.services.configurator.config_storage import ConfigStorage
 from reflexio.server.services.configurator.postgres_env import (
@@ -103,12 +104,9 @@ class LocalFileConfigStorage(ConfigStorage):
             with Path(self.config_file).open(encoding="utf-8") as f:
                 config_content = f.read()
                 data = json.loads(str(config_content))
-                # Upgrade retired list-valued extractor fields (e.g.
-                # agent_success_configs) to their singular replacements before
-                # validation. Without this, Config would drop the unknown legacy
-                # keys and silently lose the user's customization.
-                if isinstance(data, dict):
-                    data = normalize_legacy_config_shape(data)
+                if not isinstance(data, dict):
+                    raise ValueError("Configuration JSON must decode to an object")
+                original_payload = copy.deepcopy(data)
                 # Detect legacy on-disk configs that used the removed "disk"
                 # storage backend and rewrite only the storage_config field
                 # to default SQLite. Other persisted fields (extractors,
@@ -128,7 +126,17 @@ class LocalFileConfigStorage(ConfigStorage):
                     )
                     data = dict(data)
                     data["storage_config"] = self._default_storage_config().model_dump()
-                config: Config = Config(**data)
+                config = validate_stored_config(data)
+                if config.model_dump(mode="json") != original_payload:
+                    try:
+                        self._save_config_to_local_dir(config=config)
+                    except OSError:
+                        logger.exception(
+                            "Loaded config from %s after normalizing its stored "
+                            "schema, but could not rewrite the file; cleanup will "
+                            "be retried on the next load.",
+                            self.config_file,
+                        )
                 return config
         except Exception:
             logger.exception(

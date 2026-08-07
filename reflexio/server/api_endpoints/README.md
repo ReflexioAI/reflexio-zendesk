@@ -1,5 +1,5 @@
 # server/api_endpoints
-Description: Bridge between FastAPI routes and business logic — builds `RequestContext`, validates requests, and delegates into `Reflexio`. Most endpoints are registered on the `core_router` in `../api.py`; the files here are the handlers/helpers it calls.
+Description: Shared helpers between FastAPI domain routes and business logic — builds `RequestContext`, validates requests, and delegates into `Reflexio`. Public route declarations live in `../routes/` and are aggregated by `core_router` in `../api.py`; the files here are reusable handlers/helpers those routes call.
 
 > For the complete endpoint list (publish, retrieval, search, profile/playbook lifecycle, evaluation, Braintrust, operations), see the parent [server README](../README.md#api-endpoints).
 
@@ -8,7 +8,7 @@ Description: Bridge between FastAPI routes and business logic — builds `Reques
 | File | Purpose |
 |------|---------|
 | `request_context.py` | `RequestContext` — bundles `org_id`, `storage`, `configurator`, `prompt_manager`. Built per request via `get_request_context()` (FastAPI `Depends`). The one object every handler reads storage/config/prompts through. |
-| `publisher_api.py` | Publishing + direct CRUD helpers: `add_user_interaction/profile/playbook`, `update_*`, and the full family of single / by-ids / bulk delete helpers for interactions, profiles, playbooks, requests, and sessions; plus `run_playbook_aggregation()` and `clear_user_data()`. |
+| `publisher_api.py` | Publishing + direct CRUD helpers: `add_user_interaction/profile/playbook`, session outcome collection/read, `update_*`, and the full family of single / by-ids / bulk delete helpers for interactions, profiles, playbooks, requests, and sessions; plus `run_playbook_aggregation()` and `clear_user_data()`. |
 | `account_api.py` | Identity/config helpers behind `/api/whoami`, `/api/my_config`. |
 | `health_api.py` | `GET /`, `/health`, `/healthz`, `/healthz/eval`; `install()` adds response-time + liveness tracking. |
 | `pending_tool_call_api.py` | Router for resumable-extraction human clarification: list/get, `resolve`, `answer`, `not_applicable`, `cancel`; HMAC signature verify + migration-retry helpers. |
@@ -18,8 +18,9 @@ Description: Bridge between FastAPI routes and business logic — builds `Reques
 ## Architecture Pattern
 
 ```
-api.py (core_router + sub-routers)
-  -> Depends(get_request_context) -> RequestContext(org_id, storage, configurator, prompt_manager)
+api.py (create_app + core_router)
+  -> routes/<domain>.py (FastAPI routers)
+    -> Depends(get_request_context) -> RequestContext(org_id, storage, configurator, prompt_manager)
     -> get_reflexio(org_id) -> Reflexio (reflexio_lib) -> services/
 ```
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from reflexio.server.llm._litellm_types import ModelProvenance
 from reflexio.server.llm.llm_utils import (
     assert_provider_safe_schema,
     make_strict_json_schema,
@@ -189,16 +190,30 @@ class ToolLoopResult(BaseModel):
     # (the structured-output terminus, used by the extraction agent instead of a
     # finish-sentinel tool call).
     structured_output: BaseModel | None = None
+    # Runtime-only attribution for the final accepted LLM turn. Persistence is
+    # explicit at the lineage boundary; this must not leak into API payloads.
+    provenance: ModelProvenance | None = Field(default=None, exclude=True)
 
 
 # Models we know support function calling per vendor docs but that litellm's
 # model_cost registry hasn't catalogued yet. When litellm returns False
-# (without raising) for a model whose name starts with one of these prefixes,
+# (without raising) for one of the exact models or model-family prefixes below,
 # treat that as a registry gap rather than an actual capability gap.
 #
 # Each entry must be justified by (a) the vendor docs and (b) a confirmed
 # round-trip tool call against the live API. Update this list when litellm
 # upstreams the registration so the override becomes redundant.
+_TOOL_CALLING_EXACT_OVERRIDES: frozenset[str] = frozenset(
+    {
+        # https://docs.z.ai/guides/tools/function-calling documents the
+        # OpenAI-compatible tools protocol. Verified against the coding endpoint
+        # with three consecutive dependent sequences: get_weather tool call, tool
+        # result, convert_temperature tool call, tool result, structured terminus.
+        # LiteLLM 1.82.2 still reports supports_function_calling=False.
+        "zai/glm-5.2",
+    }
+)
+
 _TOOL_CALLING_OVERRIDES: tuple[str, ...] = (
     # https://platform.minimax.io/docs/guides/text-m2-function-call says
     # MiniMax-M2.7 supports tool use + interleaved thinking via OpenAI-compatible
@@ -228,22 +243,24 @@ def supports_tool_calling(model: str) -> bool:
     Wrapped so tests can monkeypatch the probe without touching litellm.
     On any internal error we optimistically assume support — cheaper to
     attempt a real call than to wrongly fall back. When litellm returns
-    False (without raising) for a model in :data:`_TOOL_CALLING_OVERRIDES`,
-    we override to True — see the constant for the rationale.
+    False (without raising) for a model in the exact or prefix overrides, we
+    override to True — see the constants for the rationale.
 
     Args:
         model (str): Fully-qualified model name.
 
     Returns:
         bool: True if litellm advertises function-calling for ``model``,
-            or the model name matches a known-good override prefix.
+            or the model name matches a known-good override.
     """
     try:
         import litellm
 
         if bool(litellm.supports_function_calling(model=model)):
             return True
-        if any(model.startswith(prefix) for prefix in _TOOL_CALLING_OVERRIDES):
+        if model in _TOOL_CALLING_EXACT_OVERRIDES or any(
+            model.startswith(prefix) for prefix in _TOOL_CALLING_OVERRIDES
+        ):
             logger.debug(
                 "litellm.supports_function_calling returned False for %s; "
                 "applying override (see _TOOL_CALLING_OVERRIDES)",
@@ -365,16 +382,19 @@ def _run_multi_stage_fallback(
             log_model_response,
         )
 
+    latest_provenance: ModelProvenance | None = None
     for turn_idx in range(max_steps):
         turn_label = f"(multi-stage turn {turn_idx + 1})"
         if log_label:
             log_llm_messages(logger, f"{log_label} {turn_label}", messages)
         tool_t0 = time.monotonic()
-        parsed = client.generate_chat_response(
+        completion = client.generate_chat_response_with_provenance(
             messages=messages,
             response_format=multi_stage_schema,
             model_role=model_role,
         )
+        parsed = completion.value
+        latest_provenance = completion.provenance
         if log_label:
             log_model_response(logger, f"{log_label} {turn_label}", parsed)
         if not isinstance(parsed, BaseModel):
@@ -431,6 +451,7 @@ def _run_multi_stage_fallback(
                 messages=messages,
                 pending_tool_call_ids=pending_tool_call_ids,
                 max_steps_remaining=max_steps - turn_idx - 1,
+                provenance=latest_provenance,
             )
 
         outcome = registry.handle_outcome(tool_name, args_json, ctx)
@@ -461,6 +482,7 @@ def _run_multi_stage_fallback(
         messages=messages,
         pending_tool_call_ids=pending_tool_call_ids,
         max_steps_remaining=0,
+        provenance=latest_provenance,
     )
 
 
@@ -477,6 +499,7 @@ def run_tool_loop(
     fallback_tool_name: str | None = None,
     multi_stage_schema: type[BaseModel] | None = None,
     response_format: type[BaseModel] | None = None,
+    structured_output_validator: Callable[[BaseModel], Sequence[str]] | None = None,
     tool_choice: str | dict[str, Any] = "auto",
     log_label: str | None = None,
 ) -> ToolLoopResult:
@@ -525,6 +548,9 @@ def run_tool_loop(
             agent finishes (a direct structured answer) while still letting the
             model call intermediate tools such as ``ask_human``. Leave unset for
             finish-sentinel-tool loops.
+        structured_output_validator: Optional validator that opts structured
+            responses into one corrective same-model repair turn. Returning an
+            empty sequence accepts any response that satisfies the schema.
         tool_choice (str | dict): Forwarded to each native tool-calling turn.
             Defaults to ``"auto"``. Pass an OpenAI tool-choice dict (e.g.
             ``{"type": "function", "function": {"name": "finish"}}``) to force a
@@ -583,11 +609,13 @@ def run_tool_loop(
             )
         if log_label:
             log_llm_messages(logger, f"{log_label} (fallback)", messages)
-        parsed = client.generate_chat_response(
+        completion = client.generate_chat_response_with_provenance(
             messages=messages,
             response_format=fallback_schema,
             model_role=model_role,
         )
+        parsed = completion.value
+        provenance = completion.provenance
         if log_label:
             log_model_response(logger, f"{log_label} (fallback)", parsed)
         # The fallback path always passes response_format so the client
@@ -629,6 +657,7 @@ def run_tool_loop(
             messages=messages,
             pending_tool_call_ids=pending_tool_call_ids,
             max_steps_remaining=0 if exceeded else max_steps - len(bounded_items),
+            provenance=provenance,
         )
 
     # ---- Native tool loop ---------------------------------------------
@@ -636,18 +665,22 @@ def run_tool_loop(
     from reflexio.server.llm.litellm_client import LiteLLMClientError
 
     local_msgs = list(messages)
+    provenance: ModelProvenance | None = None
     try:
         tool_specs = registry.openai_specs()
         for _step in range(max_steps):
             if log_label:
                 log_llm_messages(logger, f"{log_label} (turn {_step + 1})", local_msgs)
-            resp = client.generate_chat_response(
+            completion = client.generate_chat_response_with_provenance(
                 messages=local_msgs,
                 tools=tool_specs or None,
                 tool_choice=tool_choice if tool_specs else None,
                 model_role=model_role,
                 response_format=response_format,
+                structured_output_validator=structured_output_validator,
             )
+            resp = completion.value
+            provenance = completion.provenance
             if log_label:
                 log_model_response(logger, f"{log_label} (turn {_step + 1})", resp)
 
@@ -691,6 +724,7 @@ def run_tool_loop(
                             # The structured answer is committed on this turn —
                             # one LLM call consumed, mirroring the finish_tool path.
                             max_steps_remaining=max_steps - _step - 1,
+                            provenance=provenance,
                         )
                 # No response_format requested (or nothing parseable): the finish
                 # handler did NOT run, so no structured output was committed.
@@ -706,6 +740,7 @@ def run_tool_loop(
                     messages=local_msgs,
                     pending_tool_call_ids=pending_tool_call_ids,
                     max_steps_remaining=max_steps - _step,
+                    provenance=provenance,
                 )
             normalized_tool_calls = [
                 _normalize_tool_call_for_history(tc) for tc in tool_calls
@@ -769,11 +804,12 @@ def run_tool_loop(
                     messages=local_msgs,
                     pending_tool_call_ids=pending_tool_call_ids,
                     max_steps_remaining=max_steps - _step - 1,
+                    provenance=provenance,
                 )
     except LiteLLMClientError as e:
         # LLM failure after the client exhausted its retries and fallbacks —
         # a known failure mode (timeouts, provider errors), not a bug. Log at
-        # warning so it doesn't surface as a Sentry error.
+        # warning so it doesn't surface as a reported error.
         logger.warning("event=tool_loop_llm_error error=%s", e)
         trace.finished = False
         return ToolLoopResult(
@@ -803,4 +839,5 @@ def run_tool_loop(
         messages=local_msgs,
         pending_tool_call_ids=pending_tool_call_ids,
         max_steps_remaining=0,
+        provenance=provenance,
     )

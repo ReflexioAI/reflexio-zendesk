@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from typing import Literal
 
 from reflexio.models.api_schema.domain import Request
 from reflexio.models.api_schema.internal_schema import (
@@ -80,6 +81,7 @@ class RequestMixin:
         end_time: int | None = None,
         top_k: int | None = 30,
         offset: int = 0,
+        source: str | None = None,
     ) -> dict[str, list[RequestInteractionDataModel]]:
         """Get requests with their associated interactions, grouped by session_id.
 
@@ -87,6 +89,7 @@ class RequestMixin:
             user_id (str, optional): User ID to filter requests.
             request_id (str, optional): Specific request ID to retrieve
             session_id (str, optional): Specific session ID to retrieve
+            source (str, optional): Request source to match exactly.
             start_time (int, optional): Start timestamp for filtering
             end_time (int, optional): End timestamp for filtering
             top_k (int, optional): Maximum number of requests to return
@@ -130,6 +133,24 @@ class RequestMixin:
 
         Returns:
             list[Request]: List of Request objects in the session
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_retrieval_experiment_assignments(
+        self, experiment_id: str
+    ) -> dict[tuple[str, str], Literal["treatment", "holdout"]]:
+        """Return the earliest published experiment arm for every tagged session."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_retrieval_experiment_output_token_counts(
+        self, experiment_id: str
+    ) -> dict[tuple[str, str], int]:
+        """Return stored output-token totals for fully measured tagged sessions.
+
+        A session is omitted when any non-user interaction has a NULL token count.
+        Sessions with no non-user interactions are included with a zero total.
         """
         raise NotImplementedError
 

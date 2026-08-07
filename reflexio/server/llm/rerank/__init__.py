@@ -1,6 +1,8 @@
-"""Reranking helpers — local cross-encoder + LLM relevance judge."""
+"""Supported reranking helpers."""
 
-from reflexio.server.llm.rerank.cross_encoder_reranker import prewarm, score_pairs
-from reflexio.server.llm.rerank.llm_reranker import score_pairs_llm
+from reflexio.server.llm.rerank.cross_encoder_reranker import (
+    score_pairs,
+    score_pairs_with_model,
+)
 
-__all__ = ["prewarm", "score_pairs", "score_pairs_llm"]
+__all__ = ["score_pairs", "score_pairs_with_model"]

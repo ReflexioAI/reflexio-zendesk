@@ -1,6 +1,6 @@
 [project]
 name = "reflexio-ai"
-version = "0.2.26"
+version = "0.2.29"
 description = "A Python library for the Reflexio"
 authors = [{name = "Reflexio Team"}]
 readme = "README.md"
@@ -141,6 +141,7 @@ markers = [
     "integration: Tests with real storage but mocked LLM",
     "e2e: Full workflow tests with real storage and services",
     "requires_credentials: Tests that need API keys (costs money)",
+    "deploy_guard: Structural contracts that block deployment when package layout drifts",
 ]
 filterwarnings = [
     "ignore:This process \\(pid=.*\\) is multi-threaded, use of fork\\(\\) may lead to deadlocks in the child\\.:DeprecationWarning:multiprocessing\\.popen_fork",
@@ -221,6 +222,7 @@ ignore = [
 "reflexio/scripts/**" = ["S101", "G004", "ANN"]
 "reflexio/benchmarks/**" = ["S311"]
 "reflexio/server/api.py" = ["B008", "ARG001", "ARG002"]
+"reflexio/server/routes/**" = ["B008", "ARG001", "ARG002"]
 "reflexio/server/api_endpoints/**" = ["B008", "ARG001", "ARG002"]
 "reflexio/integrations/**" = ["ARG002"]
 # The openclaw plugin is a nested package; its tests/scripts/cli are not reached

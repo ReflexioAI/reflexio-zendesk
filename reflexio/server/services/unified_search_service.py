@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from reflexio.models.api_schema.retriever_schema import (
     ConversationTurn,
+    ReformulationResult,
     SearchAgentPlaybookRequest,
     SearchUserPlaybookRequest,
     SearchUserProfileRequest,
@@ -40,7 +41,9 @@ from reflexio.models.config_schema import (
     SearchOptions,
 )
 from reflexio.server.llm.litellm_client import LiteLLMClient
+from reflexio.server.llm.rerank.common import reranker_enabled
 from reflexio.server.prompt.prompt_manager import PromptManager
+from reflexio.server.services.embedding_text import resolve_retrieval_threshold
 from reflexio.server.services.pre_retrieval import QueryReformulator
 from reflexio.server.services.retrieval.recency import (
     RecencyConfig,
@@ -50,6 +53,18 @@ from reflexio.server.services.retrieval.recency import (
     multiplicative_factor,
 )
 from reflexio.server.services.retrieval.relevance_floor import apply_relevance_floors
+from reflexio.server.services.retrieval.session_dedup import (
+    EntityKey,
+    session_seen_cache,
+)
+from reflexio.server.services.retrieval.temporal import (
+    freshness_collapse,
+    sort_by_recency,
+    window_bounds,
+)
+from reflexio.server.services.retrieval.user_context_guard import (
+    should_suppress_user_context,
+)
 from reflexio.server.services.storage.storage_base import BaseStorage
 from reflexio.server.tracing import profile_step, set_span_data
 
@@ -76,6 +91,20 @@ _SEARCH_FANOUT_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="reflexio-search",
 )
 _ENV_SINGLE_RPC = "REFLEXIO_UNIFIED_SEARCH_SINGLE_RPC"
+# Working-pool floor for temporal reordering (freshness collapse / recency
+# sort): matches the RecencyConfig default pool so the fresh version of a
+# fact can be promoted even when it ranks below top_k on text relevance.
+_TEMPORAL_POOL_SIZE = 20
+# Session dedup widens the fetch pool so filtered-out (already served) items
+# can be backfilled, but never by more than this many extra candidates.
+_SESSION_DEDUP_FETCH_BUMP_CAP = 50
+# Singular dedup kinds (session_dedup EntityKey vocabulary) — deliberately
+# distinct from the plural request-level ``entity_types`` values.
+_ENTITY_ID_ATTRS = {
+    "profile": "profile_id",
+    "user_playbook": "user_playbook_id",
+    "agent_playbook": "agent_playbook_id",
+}
 _EMBEDDING_CACHE_TTL_SECONDS = max(
     0, int(os.getenv("REFLEXIO_QUERY_EMBEDDING_CACHE_TTL_SECONDS", "300") or "300")
 )
@@ -86,20 +115,6 @@ _embedding_cache_lock = threading.Lock()
 _embedding_cache: OrderedDict[tuple[str, int, str, str], tuple[float, list[float]]] = (
     OrderedDict()
 )
-RetrievalCaptureHook = Callable[
-    [UnifiedSearchRequest, UnifiedSearchResponse, BaseStorage, str], None
-]
-_retrieval_capture_hook: RetrievalCaptureHook | None = None
-
-
-def configure_retrieval_capture_hook(hook: RetrievalCaptureHook | None) -> None:
-    """Register an optional final-response retrieval capture hook.
-
-    Deployments that capture retrieval logs install the hook; OSS leaves it
-    unset so unified search behavior is unchanged by default.
-    """
-    global _retrieval_capture_hook
-    _retrieval_capture_hook = hook
 
 
 def run_unified_search(
@@ -133,20 +148,33 @@ def run_unified_search(
     if not request.query:
         return UnifiedSearchResponse(success=True, msg="No query provided")
 
-    top_k = request.top_k if request.top_k is not None else 5
-    threshold = request.threshold if request.threshold is not None else 0.3
+    with profile_step("search.user_context_guard", entity_type="all") as span:
+        suppress_user_context = should_suppress_user_context(request.query)
+        span.set_data("suppressed", suppress_user_context)
+    if suppress_user_context:
+        requested_entity_types = set(request.entity_types or _DEFAULT_ENTITY_TYPES)
+        effective_entity_types = requested_entity_types - {
+            "profiles",
+            "user_playbooks",
+        }
+        if not effective_entity_types:
+            return UnifiedSearchResponse(success=True)
+        request = request.model_copy(
+            update={"entity_types": sorted(effective_entity_types)}
+        )
 
-    floor_cfg = retrieval_floor or RetrievalFloorConfig()
-    floor_on = floor_cfg.enabled
-    recency_on = bool(recency and recency.enabled)
-    fetch_k = max(
-        top_k,
-        floor_cfg.pool_size if floor_on else 0,
-        recency.pool_size if recency_on and recency is not None else 0,
+    top_k = request.top_k if request.top_k is not None else 5
+    threshold = resolve_retrieval_threshold(
+        request.threshold,
+        model_name=storage.embedding_model_name,
     )
 
-    # --- Phase A: query reformulation + embedding generation ---
-    reformulated_query, embedding = _run_phase_a(
+    floor_cfg = retrieval_floor or RetrievalFloorConfig()
+    floor_on = floor_cfg.enabled and reranker_enabled()
+    recency_on = bool(recency and recency.enabled)
+
+    # --- Phase A: query reformulation (+ temporal signals) + embedding ---
+    reformulation, embedding, embedding_failed = _run_phase_a(
         query=request.query,
         storage=storage,
         llm_client=llm_client,
@@ -157,6 +185,50 @@ def run_unified_search(
         pre_retrieval_model_name=pre_retrieval_model_name,
         search_mode=request.search_mode,
     )
+    reformulated_query = reformulation.standalone_query
+
+    # Degrade-to-FTS: when embedding GENERATION failed (distinct from the
+    # benign None cases), force the effective mode to FTS for the entire
+    # Phase B fan-out. Storage then takes the zero-placeholder branch and
+    # never re-embeds — closing the historical second-embed leak where a
+    # None embedding + a vector/hybrid mode caused the storage layer to retry
+    # the embed and raise unguarded. Benign None (FTS-only, unsupported)
+    # leaves the requested mode untouched.
+    effective_search_mode = request.search_mode
+    if embedding_failed:
+        effective_search_mode = SearchMode.FTS
+        logger.warning(
+            "event=search_degraded_to_fts reason=embedding_generation_failed "
+            "backend=%s requested_mode=%s",
+            _storage_backend_name(storage),
+            request.search_mode.value,
+        )
+    window_start, window_end = window_bounds(
+        reformulation.start_days_ago, reformulation.end_days_ago
+    )
+
+    # Temporal reordering (freshness collapse / recency sort) happens after
+    # relevance ranking, so it needs a wider working pool: the fresh version
+    # of a fact may rank below top_k on text relevance alone. When signals
+    # are present, fetch and rank a larger pool and cut to top_k only after
+    # the temporal pass.
+    temporal_reorder = reformulation.wants_current or reformulation.recency_dominant
+    fetch_k = max(
+        top_k,
+        floor_cfg.pool_size if floor_on else 0,
+        recency.pool_size if recency_on and recency is not None else 0,
+        _TEMPORAL_POOL_SIZE if temporal_reorder else 0,
+    )
+    result_cap = max(top_k, _TEMPORAL_POOL_SIZE) if temporal_reorder else top_k
+
+    # Session dedup: a request that carries a session_id skips items already
+    # served to that (org, session) and backfills from a widened pool.
+    session_id = (request.session_id or "").strip()
+    seen_keys = (
+        session_seen_cache.seen(org_id, session_id) if session_id else frozenset()
+    )
+    if seen_keys:
+        fetch_k += min(len(seen_keys), _SESSION_DEDUP_FETCH_BUMP_CAP)
 
     # --- Phase B: parallel searches across all entity types ---
     profiles, agent_playbooks, user_playbooks = _run_phase_b(
@@ -168,10 +240,23 @@ def run_unified_search(
         top_k=fetch_k,
         threshold=threshold,
         recency_on=recency_on,
+        start_time=window_start,
+        end_time=window_end,
+        search_mode=effective_search_mode,
     )
 
     if profiles is None:
         return UnifiedSearchResponse(success=False, msg="Search failed")
+
+    if seen_keys:
+        # Drop before the floors so seen items spend no cross-encoder budget.
+        profiles = _drop_seen_items(profiles or [], "profile", seen_keys)
+        agent_playbooks = _drop_seen_items(
+            agent_playbooks or [], "agent_playbook", seen_keys
+        )
+        user_playbooks = _drop_seen_items(
+            user_playbooks or [], "user_playbook", seen_keys
+        )
 
     if floor_on:
         profiles, agent_playbooks, user_playbooks = _apply_floors(
@@ -179,30 +264,41 @@ def run_unified_search(
             profiles=profiles,
             agent_playbooks=agent_playbooks,  # type: ignore[arg-type]
             user_playbooks=user_playbooks,  # type: ignore[arg-type]
-            top_k=top_k,
+            top_k=result_cap,
             cfg=floor_cfg,
             recency=recency if recency_on else None,
         )
     elif recency_on and recency is not None:
         profiles = _apply_combined_score_recency(
-            profiles or [], entity_type="profiles", top_k=top_k, cfg=recency
+            profiles or [], entity_type="profiles", top_k=result_cap, cfg=recency
         )
         agent_playbooks = _apply_combined_score_recency(
             agent_playbooks or [],
             entity_type="agent_playbooks",
-            top_k=top_k,
+            top_k=result_cap,
             cfg=recency,
         )
         user_playbooks = _apply_combined_score_recency(
             user_playbooks or [],
             entity_type="user_playbooks",
-            top_k=top_k,
+            top_k=result_cap,
             cfg=recency,
         )
     else:
-        profiles = _unwrap_items(profiles or [])[:top_k]
-        agent_playbooks = _unwrap_items(agent_playbooks or [])[:top_k]
-        user_playbooks = _unwrap_items(user_playbooks or [])[:top_k]
+        profiles = _unwrap_items(profiles or [])[:result_cap]
+        agent_playbooks = _unwrap_items(agent_playbooks or [])[:result_cap]
+        user_playbooks = _unwrap_items(user_playbooks or [])[:result_cap]
+
+    # --- Temporal post-processing from query-derived signals ---
+    if temporal_reorder:
+        arms = [profiles or [], agent_playbooks or [], user_playbooks or []]
+        if reformulation.wants_current:
+            arms = [freshness_collapse(arm) for arm in arms]
+        if reformulation.recency_dominant:
+            arms = [sort_by_recency(arm) for arm in arms]
+        # Final cut to top_k only after the temporal pass, so items promoted
+        # from the wider pool can take the top slots.
+        profiles, agent_playbooks, user_playbooks = (arm[:top_k] for arm in arms)
 
     user_playbooks = _suppress_source_user_playbooks(
         storage=storage,
@@ -218,33 +314,12 @@ def run_unified_search(
         reformulated_query=reformulated_query
         if reformulated_query != request.query
         else None,
+        degraded=embedding_failed,
+        search_mode_effective=effective_search_mode.value if embedding_failed else None,
     )
-    _maybe_capture_final_response(
-        request=request,
-        response=response,
-        storage=storage,
-        org_id=org_id,
-    )
+    if session_id:
+        session_seen_cache.record(org_id, session_id, _served_entity_keys(response))
     return response
-
-
-def _maybe_capture_final_response(
-    *,
-    request: UnifiedSearchRequest,
-    response: UnifiedSearchResponse,
-    storage: BaseStorage,
-    org_id: str,
-) -> None:
-    hook = _retrieval_capture_hook
-    if hook is None:
-        return
-    try:
-        hook(request, response, storage, org_id)
-    except Exception:
-        logger.warning(
-            "Unified search retrieval capture hook failed",
-            exc_info=True,
-        )
 
 
 def _run_phase_a(
@@ -257,7 +332,7 @@ def _run_phase_a(
     enable_reformulation: bool = False,
     pre_retrieval_model_name: str | None = None,
     search_mode: SearchMode = SearchMode.HYBRID,
-) -> tuple[str, list[float] | None]:
+) -> tuple[ReformulationResult, list[float] | None, bool]:
     """Run query reformulation and embedding generation sequentially.
 
     Args:
@@ -273,7 +348,16 @@ def _run_phase_a(
         search_mode (SearchMode): Search mode; FTS-only mode skips embedding generation entirely
 
     Returns:
-        tuple[str, Optional[list[float]]]: (standalone_query, embedding_vector) — embedding is None when unsupported or on failure
+        tuple[ReformulationResult, Optional[list[float]], bool]: The
+            reformulation result (standalone query + temporal signals;
+            signal-free pass-through of the original query when reformulation
+            is disabled), the query embedding (None when unsupported, when the
+            mode is FTS-only, or when generation failed), and
+            ``embedding_failed`` — True *only* when an embedding attempt was
+            made and raised. The benign None cases (FTS-only mode,
+            ``supports_embedding`` False) leave ``embedding_failed`` False so
+            callers can distinguish a real failure from a mode that never
+            needed an embedding.
     """
     reformulator = QueryReformulator(
         llm_client=llm_client,
@@ -288,14 +372,14 @@ def _run_phase_a(
         has_conversation_history=bool(conversation_history),
     ):
         if enable_reformulation:
-            result = reformulator.rewrite(query, conversation_history)
-            standalone_query = result.standalone_query
+            reformulation = reformulator.rewrite(query, conversation_history)
         else:
-            standalone_query = query
+            reformulation = ReformulationResult(standalone_query=query)
 
     # Embedding generation (uses reformulated query for semantic accuracy).
     # FTS-only search has no use for an embedding, so skip the call entirely.
     embedding = None
+    embedding_failed = False
     if supports_embedding and search_mode != SearchMode.FTS:
         with profile_step(
             "search.embedding",
@@ -303,13 +387,24 @@ def _run_phase_a(
             purpose="query",
         ) as span:
             try:
-                embedding = _get_cached_query_embedding(storage, standalone_query)
+                embedding = _get_cached_query_embedding(
+                    storage, reformulation.standalone_query
+                )
+                # A falsy result (None or []) means the embedder produced no
+                # usable query vector — e.g. a storage backend that swallows
+                # EmbeddingUnavailableError and returns [] on a provider outage.
+                # Treat it the same as a raised failure: degrade to FTS rather
+                # than run a vector search with an empty embedding.
+                if not embedding:
+                    embedding = None
+                    embedding_failed = True
                 span.set_data("embedding_generated", embedding is not None)
             except Exception as e:
                 span.set_data("embedding_generated", False)
-                logger.error("Embedding generation failed: %s", e)
+                embedding_failed = True
+                logger.exception("Embedding generation failed: %s", e)
 
-    return standalone_query, embedding
+    return reformulation, embedding, embedding_failed
 
 
 def _run_phase_b(
@@ -321,6 +416,9 @@ def _run_phase_b(
     top_k: int,
     threshold: float,
     recency_on: bool = False,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    search_mode: SearchMode = SearchMode.HYBRID,
 ) -> tuple[
     list[Any] | None,
     list[Any] | None,
@@ -336,11 +434,19 @@ def _run_phase_b(
         query (str): Query string (possibly rewritten) for FTS
         top_k (int): Maximum results per entity type
         threshold (float): Minimum match threshold
+        start_time (Optional[datetime]): Query-derived time-window lower bound
+            (from reformulation temporal signals); forces the per-arm fan-out
+            path since the combined single RPC has no time parameters.
+        end_time (Optional[datetime]): Query-derived time-window upper bound.
+        search_mode (SearchMode): The EFFECTIVE search mode for this fan-out —
+            equal to ``request.search_mode`` normally, but forced to FTS by the
+            caller when embedding generation failed (degrade-to-FTS). Threaded
+            into every arm so storage never re-embeds a failed query.
 
     Returns:
         tuple: (profiles, agent_playbooks, user_playbooks) — all None on timeout/failure
     """
-    options = SearchOptions(query_embedding=embedding, search_mode=request.search_mode)
+    options = SearchOptions(query_embedding=embedding, search_mode=search_mode)
 
     entity_types = set(request.entity_types or _DEFAULT_ENTITY_TYPES)
     allowed_agent_statuses = request.agent_playbook_status_filter
@@ -360,9 +466,16 @@ def _run_phase_b(
             wants_scored_single_rpc = recency_on and callable(
                 getattr(storage, "unified_hybrid_search_scored", None)
             )
-            if _unified_single_rpc_enabled() and (
-                getattr(storage, "supports_unified_hybrid_search", False)
-                or wants_scored_single_rpc
+            # A query-derived time window forces the per-arm fan-out: the
+            # combined single RPC has no time parameters.
+            has_time_window = start_time is not None or end_time is not None
+            if (
+                not has_time_window
+                and _unified_single_rpc_enabled()
+                and (
+                    getattr(storage, "supports_unified_hybrid_search", False)
+                    or wants_scored_single_rpc
+                )
             ):
                 combined = _run_phase_b_single_rpc(
                     request=request,
@@ -374,6 +487,7 @@ def _run_phase_b(
                     entity_types=entity_types,
                     allowed_agent_statuses=allowed_agent_statuses,
                     recency_on=recency_on,
+                    search_mode=search_mode,
                 )
                 if combined is not None:
                     profiles, agent_playbooks, user_playbooks = combined
@@ -398,7 +512,10 @@ def _run_phase_b(
                     threshold,
                     request.user_id,
                     embedding,
-                    request.search_mode,
+                    search_mode,
+                    start_time,
+                    end_time,
+                    tags=request.tags,
                 )
                 if "profiles" in entity_types
                 else None
@@ -415,6 +532,9 @@ def _run_phase_b(
                     request.playbook_name,
                     allowed_agent_statuses,
                     options,
+                    start_time,
+                    end_time,
+                    tags=request.tags,
                 )
                 if "agent_playbooks" in entity_types
                 else None
@@ -425,10 +545,13 @@ def _run_phase_b(
                     user_id=request.user_id,
                     agent_version=request.agent_version,
                     playbook_name=request.playbook_name,
+                    tags=request.tags,
                     status_filter=None,
                     threshold=threshold,
                     top_k=top_k,
-                    search_mode=request.search_mode,
+                    search_mode=search_mode,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
                 user_playbooks_future = _submit_with_current_context(
                     _SEARCH_FANOUT_EXECUTOR,
@@ -485,6 +608,7 @@ def _run_phase_b_single_rpc(
     entity_types: set[str],
     allowed_agent_statuses: list[PlaybookStatus] | None,
     recency_on: bool = False,
+    search_mode: SearchMode = SearchMode.HYBRID,
 ) -> tuple[list[Any], list[Any], list[Any]] | None:
     """Run all Phase B arms through one combined storage round trip.
 
@@ -528,8 +652,9 @@ def _run_phase_b_single_rpc(
         user_id=request.user_id,
         agent_version=request.agent_version,
         playbook_name=request.playbook_name,
+        tags=request.tags,
         agent_playbook_statuses=statuses,
-        search_mode=request.search_mode,
+        search_mode=search_mode,
         include_profiles="profiles" in entity_types and bool(request.user_id),
         include_agent_playbooks="agent_playbooks" in entity_types,
         include_user_playbooks="user_playbooks" in entity_types,
@@ -664,6 +789,34 @@ def _unwrap_items(items: list[Any]) -> list[Any]:
     return [_unwrap_item(item) for item in items]
 
 
+def _entity_key(kind: str, item: Any) -> EntityKey | None:
+    """Return the session-dedup key for a (possibly score-wrapped) item."""
+    raw_id = getattr(_unwrap_item(item), _ENTITY_ID_ATTRS[kind], None)
+    if raw_id in (None, "", 0):
+        return None
+    return (kind, str(raw_id))
+
+
+def _drop_seen_items(
+    items: list[Any], kind: str, seen: frozenset[EntityKey]
+) -> list[Any]:
+    return [item for item in items if _entity_key(kind, item) not in seen]
+
+
+def _served_entity_keys(response: UnifiedSearchResponse) -> list[EntityKey]:
+    arms: tuple[tuple[str, list[Any]], ...] = (
+        ("profile", response.profiles or []),
+        ("user_playbook", response.user_playbooks or []),
+        ("agent_playbook", response.agent_playbooks or []),
+    )
+    return [
+        key
+        for kind, items in arms
+        for item in items
+        if (key := _entity_key(kind, item)) is not None
+    ]
+
+
 def _suppress_source_user_playbooks(
     *,
     storage: BaseStorage,
@@ -730,7 +883,7 @@ def _get_cached_query_embedding(
     query: str,
 ) -> list[float]:
     """Return a cached query embedding when available."""
-    model_name = str(getattr(storage, "embedding_model_name", "unknown"))
+    model_name = storage.embedding_model_name
     dimensions = int(getattr(storage, "embedding_dimensions", 0) or 0)
     normalized_query = " ".join(query.casefold().split())
     key = (model_name, dimensions, normalized_query, "query")
@@ -764,12 +917,19 @@ def _search_agent_playbooks_via_storage(
     playbook_name: str | None,
     allowed_statuses: list[PlaybookStatus] | None,
     options: SearchOptions,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    tags: list[str] | None = None,
 ) -> list[AgentPlaybook]:
     """Search agent playbooks, restricted to one or more approval statuses.
 
     When ``allowed_statuses`` is None or empty, falls back to
     ``_DEFAULT_AGENT_PLAYBOOK_STATUSES`` (APPROVED + PENDING). Callers that
     genuinely want REJECTED playbooks must opt in by passing the full list.
+    ``start_time``/``end_time`` bound ``created_at`` (query-derived time
+    windows from reformulation temporal signals; unset when the query names
+    no window). ``tags`` matches playbooks having any requested tag (OR
+    semantics); None or an empty list disables tag filtering.
     """
     with profile_step(
         "search.branch.agent_playbooks",
@@ -785,11 +945,14 @@ def _search_agent_playbooks_via_storage(
             query=query,
             agent_version=agent_version,
             playbook_name=playbook_name,
+            tags=tags,
             status_filter=[None],
             playbook_status_filter=statuses,
             threshold=threshold,
             top_k=top_k,
             search_mode=options.search_mode,
+            start_time=start_time,
+            end_time=end_time,
         )
         results: list[AgentPlaybook] = []
         seen_ids: set[str] = set()
@@ -812,6 +975,9 @@ def _search_profiles_via_storage(
     user_id: str | None,
     embedding: list[float] | None,
     search_mode: SearchMode,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    tags: list[str] | None = None,
 ) -> list[UserProfile]:
     """Search profiles via storage.search_user_profile, returning [] on error or missing user_id.
 
@@ -821,8 +987,13 @@ def _search_profiles_via_storage(
         top_k (int): Maximum results
         threshold (float): Minimum match threshold
         user_id (Optional[str]): User ID filter (required for profile search)
+        tags (Optional[list[str]]): Match profiles having any requested tag
         embedding (Optional[list[float]]): Pre-computed query embedding, or None for text-only search
         search_mode (SearchMode): Search mode (hybrid/vector/fts)
+        start_time (Optional[datetime]): Lower bound on last_modified_timestamp
+            (query-derived time window from reformulation temporal signals;
+            unset when the query names no window)
+        end_time (Optional[datetime]): Upper bound on last_modified_timestamp
 
     Returns:
         list[UserProfile]: Matching profiles, or [] on error/missing user_id
@@ -842,7 +1013,10 @@ def _search_profiles_via_storage(
                     query=query,
                     top_k=top_k,
                     threshold=threshold,
+                    tags=tags,
                     search_mode=search_mode,
+                    start_time=start_time,
+                    end_time=end_time,
                 ),
                 status_filter=[None],
                 query_embedding=embedding,

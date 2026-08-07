@@ -53,11 +53,21 @@ class InteractionsMixin(ReflexioBase):
     def publish_interaction(
         self,
         request: PublishUserInteractionRequest | dict,
+        *,
+        use_publish_limiter: bool = True,
+        publish_limiter_wait_forever: bool = True,
+        defer_learning: bool = False,
     ) -> PublishUserInteractionResponse:
         """Publish user interactions.
 
         Args:
             request (Union[PublishUserInteractionRequest, dict]): The publish user interaction request
+            use_publish_limiter: Whether GenerationService should throttle the
+                post-write learning pipeline.
+            publish_limiter_wait_forever: Whether GenerationService should queue
+                indefinitely for that post-write learning limiter.
+            defer_learning: Whether to enqueue post-persist learning instead of
+                running it inline.
 
         Returns:
             PublishUserInteractionResponse: Response containing success status and message
@@ -87,7 +97,12 @@ class InteractionsMixin(ReflexioBase):
             # Convert dict to PublishUserInteractionRequest if needed
             if isinstance(request, dict):
                 request = PublishUserInteractionRequest(**request)
-            result = generation_service.run(request)
+            result = generation_service.run(
+                request,
+                use_publish_limiter=use_publish_limiter,
+                publish_limiter_wait_forever=publish_limiter_wait_forever,
+                defer_learning=defer_learning,
+            )
             after_profiles = _safe_count(storage.count_all_profiles)
             after_playbooks = _safe_count(storage.count_user_playbooks)
             # Don't concatenate warnings into the message field — they

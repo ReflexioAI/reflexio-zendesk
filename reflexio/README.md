@@ -56,8 +56,9 @@ Description: Python SDK for interacting with Reflexio API remotely
 Remote API client for applications to:
 1. **Publish interactions** - Send user interactions to server for processing
 2. **Search/retrieve data** - Query profiles, interactions, playbooks, evaluations, and context
-3. **Manage profiles/playbooks** - Delete, regenerate, and update status where supported by API endpoints
-4. **Configure** - Set/get organization configuration
+3. **Track deferred learning** - Poll `get_learning_status(request_id)` after `publish_interaction(..., wait_for_response=False)` queues extraction
+4. **Manage profiles/playbooks** - Delete, regenerate, and update status where supported by API endpoints
+5. **Configure** - Set/get organization configuration
 
 #### Architecture Pattern
 Async HTTP client wrapping typed models from `models/api_schema/`. Automatically handles authentication via Bearer tokens.
@@ -101,8 +102,10 @@ Description: FastAPI backend server that processes user interactions to generate
 **Detailed Documentation**: See [`reflexio/server/README.md`](server/README.md) for component details, including the [Prompt Bank](server/prompt/prompt_bank/README.md), [Playbook Service](server/services/playbook/README.md), and [Site Variables](server/site_var/README.md)
 
 ### Main Entry Points
-- **API**: `api.py` - FastAPI routes
-- **Endpoint Helpers**: `api_endpoints/` - Request handlers calling `Reflexio` (reflexio_lib)
+- **API composer**: `api.py` - `create_app()` factory, middleware/capability wiring, and `core_router` aggregation
+- **Domain routes**: `server/routes/` - FastAPI route modules grouped by system, interactions, profiles, playbooks, search, provenance, evaluation, Braintrust, and config
+- **Extension Registry**: `extensions.py` - optional capability/service registration for OSS and enterprise integrations
+- **Endpoint Helpers**: `api_endpoints/` - Shared handler/helper functions and `RequestContext` used by route modules
 - **Core Service**: `services/generation_service.py` - Main orchestrator
 
 ### Purpose
@@ -114,36 +117,41 @@ Receives user interactions from clients and processes them to:
 ### Component Relationships
 ```
 client (Python SDK)
-  -> api.py (FastAPI routes)
-    -> api_endpoints/ (request handlers)
+  -> api.py (create_app + core_router)
+    -> routes/ (domain FastAPI routers)
+    -> api_endpoints/ (shared handlers + RequestContext)
       -> reflexio_lib.Reflexio (main entry)
         -> services/generation_service.py (orchestrator)
           ├─> services/profile/ -> storage (BaseStorage)
           ├─> services/playbook/ (playbook extraction) -> storage (BaseStorage)
+          ├─> services/durable_learning/ -> learning_jobs queue -> deferred extraction
           └─> services/agent_success_evaluation/ -> storage (BaseStorage)
 ```
 
 ### Key Components
 - **`api_endpoints/`**: Request handling, `RequestContext` (bundles storage/config/prompts), auth
+- **`routes/`**: Domain route modules (`system.py`, `interactions.py`, `profiles.py`, `playbooks.py`, `search.py`, `provenance.py`, `evaluation.py`, `braintrust.py`, `config.py`) included into `api.py`'s `core_router`
 - **`db/`**: Auth & config storage only (SQLite) - NOT for profiles/interactions
-- **`llm/`**: Unified LLM client (auto-detects OpenAI/Claude from model name)
+- **`llm/`**: Unified LiteLLM client, provider adapters, local rerank helpers, structured-output repair, and fail-open per-provider concurrency caps
 - **`prompt/`**: Versioned prompt templates in `prompt_bank/`
 - **`services/`**: Core business logic
   - `generation_service.py` - Orchestrator (runs profile/playbook/success services)
-  - `base_generation_service.py` - Abstract base for parallel actor execution
+  - `base_generation_service.py` + `base_generation/` - Abstract base plus mixins for parallel actor execution, batch progress, should-run prechecks, status transitions, and usage billing
   - `profile/` - Profile extraction & updates
   - `playbook/` - Playbook extraction, consolidation, and aggregation
   - `agent_success_evaluation/` - Success evaluation
-  - `reflection/` - Post-horizon reflection extraction
+  - `durable_learning/` - Claim/drain durable `learning_jobs` for deferred extraction when `REFLEXIO_DURABLE_LEARNING_QUEUE` is enabled
   - `extraction/` - Resumable async extraction agent infrastructure
   - `shadow_comparison/` - Per-turn regular vs shadow verdict judge
   - `evaluation_overview/` - Evaluation-page aggregates and hero metrics
   - `playbook_optimizer/` - Scenario-based playbook optimization experiments
   - `braintrust/` - Braintrust eval export/sync support
   - `lineage/` - Resolve current records and schedule tombstone garbage collection for superseded profile/playbook rows
-  - `storage/` - Abstract layer (SQLite prod, LocalJSON test)
+  - `governance/` - Subject-reference contracts and retention/barrier helpers used by storage and lineage
+  - `storage/` - Abstract layer (SQLite prod, LocalJSON test) with governance-aware write validation and durable `learning_jobs` contracts
   - `pre_retrieval/` - Query rewriting and document expansion helpers
   - `configurator/` - YAML config loader
+- **`billing_meter.py`**: OSS usage-event facade for learning/search metering; keep imports function-local at call sites so enterprise emitters remain optional
 - **`site_var/`**: Global settings singleton
 
 ### Architecture Patterns

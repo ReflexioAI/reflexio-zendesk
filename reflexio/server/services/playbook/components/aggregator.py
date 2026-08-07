@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-import hashlib
 import logging
+import math
 import os
 import time
 import uuid
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 if TYPE_CHECKING:
     import numpy as np
 
+from reflexio.models.api_schema.domain.entities import LineageContext
 from reflexio.models.api_schema.service_schemas import (
     AgentPlaybook,
     AgentPlaybookSourceWindow,
@@ -22,8 +25,28 @@ from reflexio.models.config_schema import (
     PlaybookAggregatorConfig,
 )
 from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.error_reporting import capture_anomaly, error_tags
+from reflexio.server.llm._litellm_types import ModelProvenance
 from reflexio.server.llm.litellm_client import LiteLLMClient
+from reflexio.server.services.embedding_text import (
+    embedding_text,
+    resolve_clustering_similarity,
+)
 from reflexio.server.services.operation_state_utils import OperationStateManager
+from reflexio.server.services.playbook.aggregation_prompt_processing import (
+    AggregationPromptProcessingContext,
+    AggregationPromptProcessor,
+)
+from reflexio.server.services.playbook.components import (
+    aggregator_clustering,
+    aggregator_prompt_formatting,
+)
+from reflexio.server.services.playbook.components.aggregator_clustering import (
+    CLUSTERING_ALGORITHM_THRESHOLD,
+)
+from reflexio.server.services.playbook.components.aggregator_postprocessing import (
+    AggregationPostProcessing,
+)
 from reflexio.server.services.playbook.playbook_service_constants import (
     PlaybookServiceConstants,
 )
@@ -33,17 +56,185 @@ from reflexio.server.services.playbook.playbook_service_utils import (
     StructuredPlaybookContent,
     ensure_playbook_content,
 )
-from reflexio.server.services.playbook.user_detail_stripping import UserDetailStripper
 from reflexio.server.services.service_utils import log_model_response
-from reflexio.server.tracing import capture_anomaly, sentry_tags
+from reflexio.server.services.storage.storage_base import AGGREGATE_REASON_PREFIX
+from reflexio.server.services.storage.storage_base.playbook import (
+    PlaybookAggregationClaim,
+    PlaybookAggregationClusterMatch,
+    PlaybookAggregationRebuildSample,
+)
 from reflexio.server.usage_metrics import record_usage_event
 
 logger = logging.getLogger(__name__)
 
-# Threshold for switching between clustering algorithms
-# Below this, use Agglomerative (works better with small datasets)
-# Above this, use HDBSCAN (scales better, handles noise)
-CLUSTERING_ALGORITHM_THRESHOLD = 50
+# Must stay strictly below the smallest server-side row cap of any backend, or a
+# capped page would look like a short final page and silently truncate the read.
+# PostgREST enforces `max_rows = 1000` (see supabase/*/config.toml).
+_AGGREGATION_PLAYBOOK_PAGE_SIZE = 500
+_SIGNED_BIGINT_MAX = (1 << 63) - 1
+_MAX_EXISTING_PLAYBOOKS_PER_PROMPT = 20
+_REPAIR_SOURCE_LIMIT = 100
+_GENERATION_SOURCE_LIMIT = 100
+
+
+def _select_relevant_existing_playbooks(
+    cluster: list[UserPlaybook], existing: list[AgentPlaybook]
+) -> list[AgentPlaybook]:
+    """Bound repeated context with one linear embedding/lexical-ranked pass."""
+    if len(existing) <= _MAX_EXISTING_PLAYBOOKS_PER_PROMPT:
+        return existing
+    embeddings = [item.embedding for item in cluster if item.embedding]
+    dimension = len(embeddings[0]) if embeddings else 0
+    embeddings = [value for value in embeddings if len(value) == dimension]
+    centroid = (
+        [sum(values) / len(embeddings) for values in zip(*embeddings, strict=True)]
+        if embeddings
+        else []
+    )
+    centroid_norm = math.sqrt(sum(value * value for value in centroid))
+    cluster_tokens = {
+        token
+        for item in cluster
+        for token in f"{item.trigger or ''} {item.content or ''}".lower().split()
+    }
+
+    def score(item: AgentPlaybook) -> tuple[float, int]:
+        if centroid_norm and len(item.embedding) == dimension:
+            item_norm = math.sqrt(sum(value * value for value in item.embedding))
+            if item_norm:
+                similarity = sum(
+                    left * right
+                    for left, right in zip(centroid, item.embedding, strict=True)
+                ) / (centroid_norm * item_norm)
+                return similarity, item.agent_playbook_id
+        item_tokens = f"{item.trigger or ''} {item.content}".lower().split()
+        token_set = set(item_tokens)
+        overlap = len(cluster_tokens & token_set) / max(
+            1, min(len(cluster_tokens), len(token_set))
+        )
+        return overlap, item.agent_playbook_id
+
+    ranked = [(score(item), item) for item in existing]
+    ranked.sort(key=lambda pair: (-pair[0][0], pair[0][1]))
+    return [item for _rank, item in ranked[:_MAX_EXISTING_PLAYBOOKS_PER_PROMPT]]
+
+
+def _select_generation_prompt_sources(
+    cluster: list[UserPlaybook], *, is_incremental_refresh: bool
+) -> list[UserPlaybook]:
+    """Bound LLM input while leaving durable cluster membership unchanged."""
+    if len(cluster) <= _GENERATION_SOURCE_LIMIT:
+        return cluster
+    if is_incremental_refresh:
+        return sorted(
+            cluster,
+            key=lambda item: (item.created_at, int(item.user_playbook_id or 0)),
+            reverse=True,
+        )[:_GENERATION_SOURCE_LIMIT]
+
+    embeddings = [item.embedding for item in cluster if item.embedding]
+    dimension = len(embeddings[0]) if embeddings else 0
+    if not dimension or any(len(value) != dimension for value in embeddings):
+        return sorted(
+            cluster,
+            key=lambda item: (item.created_at, int(item.user_playbook_id or 0)),
+            reverse=True,
+        )[:_GENERATION_SOURCE_LIMIT]
+    centroid = [
+        sum(values) / len(embeddings) for values in zip(*embeddings, strict=True)
+    ]
+    centroid_norm = math.sqrt(sum(value * value for value in centroid))
+
+    def score(item: UserPlaybook) -> tuple[float, int]:
+        if not item.embedding or len(item.embedding) != dimension or not centroid_norm:
+            return -1.0, int(item.user_playbook_id or 0)
+        item_norm = math.sqrt(sum(value * value for value in item.embedding))
+        similarity = (
+            sum(
+                left * right
+                for left, right in zip(centroid, item.embedding, strict=True)
+            )
+            / (centroid_norm * item_norm)
+            if item_norm
+            else -1.0
+        )
+        return similarity, int(item.user_playbook_id or 0)
+
+    ranked = [(score(item), item) for item in cluster]
+    ranked.sort(key=lambda pair: (-pair[0][0], pair[0][1]))
+    return [item for _rank, item in ranked[:_GENERATION_SOURCE_LIMIT]]
+
+
+def _read_all_pages[T](
+    fetch_page: Callable[[int, int], list[T]],
+    get_id: Callable[[T], int],
+) -> tuple[list[T], int | None]:
+    """Read exhaustively by descending ID while excluding later inserts."""
+    rows: list[T] = []
+    max_id = _SIGNED_BIGINT_MAX
+    high_watermark: int | None = None
+    while True:
+        page = fetch_page(_AGGREGATION_PLAYBOOK_PAGE_SIZE, max_id)
+        if page and high_watermark is None:
+            high_watermark = get_id(page[0])
+        rows.extend(page)
+        if len(page) < _AGGREGATION_PLAYBOOK_PAGE_SIZE:
+            return rows, high_watermark
+        max_id = get_id(page[-1]) - 1
+
+
+class AggregationEffectCoordinator(Protocol):
+    """Optional managed boundary for one atomic aggregation effect."""
+
+    def prepare(self, playbooks: list[AgentPlaybook]) -> None: ...
+
+    def apply_scope(self) -> AbstractContextManager[None]: ...
+
+    def save_agent_playbook(
+        self,
+        playbook: AgentPlaybook,
+        *,
+        source_ids: list[str],
+        request_id: str,
+        run_mode: str,
+        provenance: ModelProvenance | None,
+    ) -> AgentPlaybook: ...
+
+    def complete(self, result: dict[str, Any]) -> None: ...
+
+
+AggregationGenerationStatus = Literal["generated", "semantic_null", "retryable_failure"]
+
+
+@dataclass(frozen=True)
+class AggregationGenerationOutcome:
+    """Unambiguous result for exactly one selected source cluster."""
+
+    status: AggregationGenerationStatus
+    source_cluster: list[UserPlaybook]
+    playbook: AgentPlaybook | None = None
+    provenance: ModelProvenance | None = None
+
+
+@dataclass(frozen=True)
+class _IncrementalRefreshWork:
+    """One active cluster plus the newly matched delta for this run."""
+
+    cluster_id: str
+    current_agent: AgentPlaybook
+    members: list[UserPlaybook]
+
+
+@dataclass(frozen=True)
+class _RebuildWork:
+    """One invalidated cluster plus its bounded recent-source sample."""
+
+    sample: PlaybookAggregationRebuildSample
+    members: list[UserPlaybook]
+
+
+class _AggregationClusterUnavailableError(RuntimeError):
+    """A cluster changed after its generation inputs were selected."""
 
 
 class PlaybookAggregator:
@@ -52,32 +243,31 @@ class PlaybookAggregator:
         llm_client: LiteLLMClient,
         request_context: RequestContext,
         agent_version: str,
-        user_detail_stripper: UserDetailStripper | None = None,
+        aggregation_prompt_processor: AggregationPromptProcessor | None = None,
+        effect_coordinator: AggregationEffectCoordinator | None = None,
+        aggregation_claim: PlaybookAggregationClaim | None = None,
+        residual_batch_limit: int | None = None,
     ) -> None:
         self.client = llm_client
-        self.storage = request_context.storage
+        storage = request_context.storage
+        if storage is None:
+            raise ValueError("Playbook aggregation requires configured storage")
+        self.storage = storage
         self.configurator = request_context.configurator
         self.request_context = request_context
         self.agent_version = agent_version
-        self.user_detail_stripper = user_detail_stripper
-        prompt_extra_instructions = getattr(
-            user_detail_stripper, "prompt_extra_instructions", None
-        )
-        if not isinstance(prompt_extra_instructions, str):
-            prompt_extra_instructions = None
-        self.aggregation_prompt_extra_instructions = (
-            self._format_prompt_extra_instructions(prompt_extra_instructions)
-        )
+        self.aggregation_prompt_processor = aggregation_prompt_processor
+        self.effect_coordinator = effect_coordinator
+        self.aggregation_claim = aggregation_claim
+        self.residual_batch_limit = residual_batch_limit
+        # Cohesive pre/post-processing component (the enterprise redaction
+        # Protocol seam). Constructed from the SAME injected instance stored
+        # above — do NOT re-resolve the AGGREGATION_PROMPT_PROCESSOR ServiceKey.
+        self._postproc = AggregationPostProcessing(aggregation_prompt_processor)
 
     # ===============================
     # private methods - operation state
     # ===============================
-
-    @staticmethod
-    def _format_prompt_extra_instructions(instructions: str | None) -> str:
-        if not instructions or not instructions.strip():
-            return ""
-        return f"{instructions.strip()}\n"
 
     def _create_state_manager(self) -> OperationStateManager:
         """
@@ -163,7 +353,10 @@ class PlaybookAggregator:
         return new_count >= trigger_count
 
     def _update_operation_state(
-        self, playbook_name: str, user_playbooks: list[UserPlaybook]
+        self,
+        playbook_name: str,
+        user_playbooks: list[UserPlaybook],
+        processed_high_watermark: int | None = None,
     ) -> None:
         """
         Update operation state with the highest user_playbook_id processed.
@@ -171,354 +364,75 @@ class PlaybookAggregator:
         Args:
             playbook_name: Name of the playbook type
             user_playbooks: List of user playbooks that were processed
+            processed_high_watermark: Highest ID captured by the aggregation read.
+                Falls back to the maximum ID in ``user_playbooks`` for existing
+                direct callers.
         """
-        if not user_playbooks:
-            return
-
-        # Find max user_playbook_id
-        max_id = max(playbook.user_playbook_id for playbook in user_playbooks)
+        if processed_high_watermark is None:
+            if not user_playbooks:
+                return
+            processed_high_watermark = max(
+                playbook.user_playbook_id for playbook in user_playbooks
+            )
 
         mgr = self._create_state_manager()
         mgr.update_aggregator_bookmark(
             name=playbook_name,
             version=self.agent_version,
-            last_processed_id=max_id,
+            last_processed_id=processed_high_watermark,
         )
 
-    def _format_cluster_input(self, cluster_playbooks: list[UserPlaybook]) -> str:
-        """
-        Format a cluster of playbooks for the aggregation prompt using per-item format.
+    # ===============================
+    # private methods - aggregation pre/post-processing
+    # ===============================
+    # Bodies live on the AggregationPostProcessing component (self._postproc).
+    # These thin delegators are kept for OSS test call-sites that invoke them by
+    # name (test_playbook_aggregator.py). Internal callers use self._postproc.
 
-        Each playbook is shown as a self-contained unit with content as the
-        primary content, followed by optional structured fields as supplementary metadata.
-
-        Args:
-            cluster_playbooks: List of raw playbooks in this cluster
-
-        Returns:
-            str: Formatted input for the aggregation prompt
-        """
-        blocks = []
-        for idx, fb in enumerate(cluster_playbooks, 1):
-            lines = [f"[{idx}]"]
-            if fb.content:
-                lines.append(f'Content: "{fb.content}"')
-            if fb.trigger:
-                lines.append(f'Trigger: "{fb.trigger}"')
-            if fb.rationale:
-                lines.append(f'Rationale: "{fb.rationale}"')
-            blocks.append("\n".join(lines))
-        return "\n\n".join(blocks) if blocks else "(No playbook items)"
-
-    def _strip_prompt_field(
+    def _postprocess_aggregation_output(
         self,
-        text: str | None,
-        shared_mapping: dict[str, int],
-    ) -> str | None:
-        if text is None or self.user_detail_stripper is None:
-            return text
-        return self.user_detail_stripper.strip_user_details(
-            text, shared_mapping=shared_mapping
-        ).text
+        value: object,
+        processing_context: AggregationPromptProcessingContext | None = None,
+    ) -> tuple[object, int]:
+        return self._postproc._postprocess_aggregation_output(value, processing_context)
 
-    def _strip_user_playbook_for_prompt(
+    def _aggregation_prompt_extra_instructions_for_context(
         self,
-        playbook: UserPlaybook,
-        shared_mapping: dict[str, int],
-    ) -> UserPlaybook:
-        if self.user_detail_stripper is None:
-            return playbook
-        return playbook.model_copy(
-            update={
-                "content": self._strip_prompt_field(playbook.content, shared_mapping)
-                or "",
-                "trigger": self._strip_prompt_field(playbook.trigger, shared_mapping),
-                "rationale": self._strip_prompt_field(
-                    playbook.rationale, shared_mapping
-                ),
-            }
+        processing_context: AggregationPromptProcessingContext | None,
+    ) -> str:
+        return self._postproc._aggregation_prompt_extra_instructions_for_context(
+            processing_context
         )
 
-    def _sanitize_aggregation_output_text(
-        self,
-        text: str | None,
-    ) -> tuple[str | None, int]:
-        if self.user_detail_stripper is None:
-            return text, 0
-        return self.user_detail_stripper.sanitize_aggregation_output_text(text)
-
-    def _sanitize_aggregation_response(
-        self, response: PlaybookAggregationOutput
-    ) -> tuple[PlaybookAggregationOutput, int]:
-        structured = response.playbook
-        if structured is None:
-            return response, 0
-
-        updates: dict[str, str | None] = {}
-        placeholder_count = 0
-        for field_name, value in structured.model_dump().items():
-            if not isinstance(value, str):
-                continue
-            sanitized, field_count = self._sanitize_aggregation_output_text(value)
-            placeholder_count += field_count
-            if sanitized != value:
-                updates[field_name] = sanitized
-
-        if not updates:
-            return response, 0
-        return response.model_copy(
-            update={"playbook": structured.model_copy(update=updates)}
-        ), placeholder_count
-
-    def _sanitize_aggregation_log_value(self, value: object) -> tuple[object, int]:
-        if isinstance(value, str):
-            return self._sanitize_aggregation_output_text(value)
-
-        if isinstance(value, dict):
-            sanitized: dict[object, object] = {}
-            placeholder_count = 0
-            for key, item in value.items():
-                sanitized_key, key_count = self._sanitize_aggregation_log_value(key)
-                sanitized_item, item_count = self._sanitize_aggregation_log_value(item)
-                sanitized[sanitized_key] = sanitized_item
-                placeholder_count += key_count + item_count
-            return sanitized, placeholder_count
-
-        if isinstance(value, list):
-            sanitized_items: list[object] = []
-            placeholder_count = 0
-            for item in value:
-                sanitized_item, item_count = self._sanitize_aggregation_log_value(item)
-                sanitized_items.append(sanitized_item)
-                placeholder_count += item_count
-            return sanitized_items, placeholder_count
-
-        if isinstance(value, tuple):
-            sanitized_items: list[object] = []
-            placeholder_count = 0
-            for item in value:
-                sanitized_item, item_count = self._sanitize_aggregation_log_value(item)
-                sanitized_items.append(sanitized_item)
-                placeholder_count += item_count
-            return tuple(sanitized_items), placeholder_count
-
-        return value, 0
-
-    def _record_placeholder_leakage(self, placeholder_count: int) -> None:
-        if placeholder_count <= 0:
-            return
-        logger.warning(
-            "Replaced %d residual user-detail placeholders in aggregated playbook output",
-            placeholder_count,
-        )
+    def _record_postprocessing_artifacts(self, artifact_count: int) -> None:
+        self._postproc._record_postprocessing_artifacts(artifact_count)
 
     @staticmethod
     def _get_direction_key(fb: UserPlaybook) -> str:
-        """
-        Extract a similarity key from a user playbook for grouping.
-
-        Returns the raw content used for token-overlap comparison. Grouping is
-        purely content-similarity based: under Option B a skill may legitimately
-        hold mixed-orientation rules (do-rules and avoid-rules for different
-        sub-aspects of one task), so whole-content polarity is NOT derived or
-        gated here. Preserving distinct do/avoid rules when similar items are
-        merged is the aggregation prompt's responsibility.
-
-        Args:
-            fb: A user playbook item
-
-        Returns:
-            str: Content used as the similarity key for grouping
-        """
-        return fb.content or ""
+        return aggregator_prompt_formatting.get_direction_key(fb)
 
     @staticmethod
     def _token_overlap(str1: str, str2: str, threshold: float = 0.6) -> bool:
-        """
-        Check if two strings have significant token overlap using asymmetric containment.
-
-        Computes the ratio of shared tokens to the smaller set, so a short string
-        contained in a longer one still counts as a match.
-
-        Args:
-            str1: First string
-            str2: Second string
-            threshold: Minimum overlap ratio
-
-        Returns:
-            bool: True if overlap ratio >= threshold
-        """
-        tokens1 = set(str1.lower().split())
-        tokens2 = set(str2.lower().split())
-        if not tokens1 or not tokens2:
-            return False
-        intersection = len(tokens1 & tokens2)
-        overlap_ratio = max(intersection / len(tokens1), intersection / len(tokens2))
-        return overlap_ratio >= threshold
+        return aggregator_prompt_formatting.token_overlap(str1, str2, threshold)
 
     @staticmethod
     def _group_playbooks_by_direction(
         cluster_playbooks: list[UserPlaybook],
         threshold: float = 0.6,
     ) -> list[list[UserPlaybook]]:
-        """
-        Group playbooks by similarity of their content.
-
-        Uses greedy single-linkage: each playbook is assigned to the first
-        existing group that has any member with sufficient token overlap.
-        Groups are returned sorted by size descending (largest first).
-
-        Grouping is purely content-similarity based and does NOT gate on a
-        derived whole-content polarity. Under Option B a skill may hold
-        mixed-orientation rules (do-rules and avoid-rules for different
-        sub-aspects), and whole-content polarity is undefined for such a skill.
-        Keeping a do-rule and an avoid-rule as distinct rules when similar items
-        are merged into one skill is the aggregation prompt's responsibility,
-        not a mechanical split here.
-
-        Args:
-            cluster_playbooks: List of raw playbooks to group
-            threshold: Token overlap threshold for grouping
-
-        Returns:
-            list[list[UserPlaybook]]: Groups sorted by size descending
-        """
-        groups: list[list[UserPlaybook]] = []
-
-        for fb in cluster_playbooks:
-            key = PlaybookAggregator._get_direction_key(fb)
-            matched = False
-            for group in groups:
-                if any(
-                    PlaybookAggregator._token_overlap(
-                        key,
-                        PlaybookAggregator._get_direction_key(group_fb),
-                        threshold,
-                    )
-                    for group_fb in group
-                ):
-                    group.append(fb)
-                    matched = True
-                    break
-            if not matched:
-                groups.append([fb])
-
-        # Sort by group size descending (largest first)
-        groups.sort(key=len, reverse=True)
-        return groups
+        return aggregator_prompt_formatting.group_playbooks_by_direction(
+            cluster_playbooks, threshold
+        )
 
     def _format_structured_cluster_input(
         self,
         cluster_playbooks: list[UserPlaybook],
         direction_overlap_threshold: float = 0.6,
     ) -> str:
-        """
-        Format a cluster of playbooks for structured aggregation prompt.
-
-        When the cluster forms a single similarity group, uses the flat-list
-        format. When distinct similarity groups are detected (multiple groups),
-        uses a grouped format so the LLM can see which items are similar and
-        preserve distinct rules (e.g. a do-rule and an avoid-rule) as separate
-        rules in the merged skill rather than collapsing them.
-
-        Args:
-            cluster_playbooks: List of raw playbooks in this cluster
-            direction_overlap_threshold: Token overlap threshold for grouping by direction
-
-        Returns:
-            str: Formatted input for the aggregation prompt
-        """
-        groups = self._group_playbooks_by_direction(
-            cluster_playbooks, threshold=direction_overlap_threshold
+        return aggregator_prompt_formatting.format_structured_cluster_input(
+            cluster_playbooks,
+            direction_overlap_threshold=direction_overlap_threshold,
         )
-
-        if len(groups) <= 1:
-            return self._format_flat(cluster_playbooks)
-        return self._format_grouped(groups)
-
-    def _format_flat(self, cluster_playbooks: list[UserPlaybook]) -> str:
-        """
-        Format playbooks as flat bullet lists (original format, used when no conflict).
-
-        Args:
-            cluster_playbooks: List of raw playbooks in this cluster
-
-        Returns:
-            str: Formatted input with separate field lists
-        """
-        triggers = []
-        rationales = []
-
-        for fb in cluster_playbooks:
-            if fb.trigger:
-                triggers.append(fb.trigger)
-            if fb.rationale:
-                rationales.append(fb.rationale)
-
-        lines: list[str] = []
-
-        if triggers:
-            lines.append("TRIGGER conditions (to be consolidated):")
-            lines.extend(f"- {trigger}" for trigger in triggers)
-        else:
-            lines.append("TRIGGER conditions: (none specified)")
-
-        if rationales:
-            lines.append("RATIONALE summaries:")
-            lines.extend(f"- {r}" for r in rationales)
-
-        self._append_freeform_observations(lines, cluster_playbooks)
-
-        return "\n".join(lines)
-
-    def _format_grouped(
-        self,
-        groups: list[list[UserPlaybook]],
-    ) -> str:
-        """
-        Format playbooks in grouped layout (used when conflicting directions are detected).
-
-        Args:
-            groups: AgentPlaybook groups sorted by size descending
-
-        Returns:
-            str: Formatted input with group headers and per-playbook fields
-        """
-        lines: list[str] = [
-            "The following playbook items are grouped by similarity. "
-            "Groups are ordered by size (largest first).",
-            "",
-        ]
-
-        for idx, group in enumerate(groups, start=1):
-            count_label = "playbook" if len(group) == 1 else "playbooks"
-            lines.append(f"Group {idx} ({len(group)} {count_label}):")
-            for fb in group:
-                parts: list[str] = []
-                if fb.trigger:
-                    parts.append(f'Trigger: "{fb.trigger}"')
-                if fb.rationale:
-                    parts.append(f'Rationale: "{fb.rationale}"')
-                if not parts and fb.content:
-                    parts.append(f'AgentPlaybook: "{fb.content}"')
-                if parts:
-                    lines.append(f"  - {parts[0]}")
-                    lines.extend(f"    {p}" for p in parts[1:])
-            lines.append("")
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def _append_freeform_observations(
-        lines: list[str], cluster_playbooks: list[UserPlaybook]
-    ) -> None:
-        """Append freeform observations from cluster playbooks to output lines."""
-        freeform_observations = [
-            fb.content for fb in cluster_playbooks if not fb.trigger and fb.content
-        ]
-        if freeform_observations:
-            lines.append("Freeform observations (from freeform cluster members):")
-            lines.extend(f"- {obs}" for obs in freeform_observations)
 
     # ===============================
     # private methods - cluster change detection
@@ -526,66 +440,830 @@ class PlaybookAggregator:
 
     @staticmethod
     def _compute_cluster_fingerprint(cluster_playbooks: list[UserPlaybook]) -> str:
-        """
-        Compute a fingerprint for a cluster based on its user_playbook_ids.
-        The fingerprint is deterministic and order-independent.
-
-        Args:
-            cluster_playbooks: List of raw playbooks in this cluster
-
-        Returns:
-            str: SHA-256 hash (truncated to 16 hex chars) of sorted user_playbook_ids
-        """
-        sorted_ids = sorted(fb.user_playbook_id for fb in cluster_playbooks)
-        id_str = ",".join(str(id) for id in sorted_ids)
-        return hashlib.sha256(id_str.encode()).hexdigest()[:16]
+        return aggregator_clustering.compute_cluster_fingerprint(cluster_playbooks)
 
     def _determine_cluster_changes(
         self,
         clusters: dict[int, list[UserPlaybook]],
         prev_fingerprints: dict,
     ) -> tuple[dict[int, list[UserPlaybook]], list[int]]:
-        """
-        Compare current cluster fingerprints against stored fingerprints to determine changes.
-
-        Args:
-            clusters: Current clusters (cluster_id -> list of UserPlaybook)
-            prev_fingerprints: Previous fingerprint state
-                (fingerprint_hash -> {"agent_playbook_id": int, "user_playbook_ids": list})
-
-        Returns:
-            tuple of:
-                - changed_clusters: Only clusters needing new LLM calls
-                - playbook_ids_to_archive: Old playbook_ids from changed/disappeared clusters
-        """
-        # Compute fingerprints for current clusters
-        current_fingerprints = {}
-        for cluster_id, cluster_playbooks in clusters.items():
-            fp = self._compute_cluster_fingerprint(cluster_playbooks)
-            current_fingerprints[cluster_id] = fp
-
-        current_fp_set = set(current_fingerprints.values())
-        prev_fp_set = set(prev_fingerprints.keys())
-
-        # Changed clusters: fingerprints that are new (not in previous state)
-        changed_clusters = {}
-        for cluster_id, fp in current_fingerprints.items():
-            if fp not in prev_fp_set:
-                changed_clusters[cluster_id] = clusters[cluster_id]
-
-        # Playbook IDs to archive: from fingerprints that disappeared or changed
-        playbook_ids_to_archive = []
-        for fp, fp_data in prev_fingerprints.items():
-            if fp not in current_fp_set:
-                playbook_id = fp_data.get("agent_playbook_id")
-                if playbook_id is not None:
-                    playbook_ids_to_archive.append(playbook_id)
-
-        return changed_clusters, playbook_ids_to_archive
+        return aggregator_clustering.determine_cluster_changes(
+            clusters, prev_fingerprints
+        )
 
     # ===============================
     # public methods
     # ===============================
+
+    def _partition_incremental_matches(
+        self,
+        user_playbooks: list[UserPlaybook],
+        matches: dict[int, PlaybookAggregationClusterMatch],
+        *,
+        similarity_threshold: float,
+    ) -> tuple[list[_IncrementalRefreshWork], list[UserPlaybook], list[int]]:
+        """Batch matched deltas by cluster and load current agents in one read."""
+        matched_by_cluster: dict[str, list[UserPlaybook]] = {}
+        matched_agent_id_by_cluster: dict[str, int] = {}
+        unmatched_playbooks: list[UserPlaybook] = []
+        for item in user_playbooks:
+            if item.user_playbook_id is None or not item.embedding:
+                continue
+            match = matches.get(int(item.user_playbook_id))
+            if match is None or match.similarity < similarity_threshold:
+                unmatched_playbooks.append(item)
+                continue
+            matched_by_cluster.setdefault(match.cluster_id, []).append(item)
+            prior_agent_id = matched_agent_id_by_cluster.setdefault(
+                match.cluster_id, match.agent_playbook_id
+            )
+            if prior_agent_id != match.agent_playbook_id:
+                raise RuntimeError(
+                    "aggregation cluster matched multiple current agents"
+                )
+
+        current_agents = self.storage.get_agent_playbooks_by_ids(  # type: ignore[attr-defined]
+            sorted(set(matched_agent_id_by_cluster.values())),
+            status_filter=[None],
+            include_embedding=True,
+        )
+        current_agents_by_id = {item.agent_playbook_id: item for item in current_agents}
+        refresh_work: list[_IncrementalRefreshWork] = []
+        unavailable_matched_ids: list[int] = []
+        for cluster_id in sorted(matched_by_cluster):
+            members = matched_by_cluster[cluster_id]
+            current_agent = current_agents_by_id.get(
+                matched_agent_id_by_cluster[cluster_id]
+            )
+            if current_agent is None:
+                unavailable_matched_ids.extend(
+                    int(item.user_playbook_id)
+                    for item in members
+                    if item.user_playbook_id is not None
+                )
+                continue
+            refresh_work.append(
+                _IncrementalRefreshWork(
+                    cluster_id=cluster_id,
+                    current_agent=current_agent,
+                    members=members,
+                )
+            )
+        return refresh_work, unmatched_playbooks, unavailable_matched_ids
+
+    def _partition_rebuilding_members(
+        self, user_playbooks: list[UserPlaybook], *, max_clusters: int
+    ) -> tuple[list[_RebuildWork], list[UserPlaybook], int]:
+        """Load recent repair inputs without loading every cluster member."""
+        rebuild_cluster_by_item = (
+            self.storage.get_playbook_aggregation_rebuild_cluster_ids(  # type: ignore[attr-defined]
+                self.agent_version,
+                [
+                    int(item.user_playbook_id)
+                    for item in user_playbooks
+                    if item.user_playbook_id is not None
+                ],
+            )
+        )
+        rebuilding_residual_count = 0
+        rebuild_cluster_ids: set[str] = set()
+        matchable_playbooks: list[UserPlaybook] = []
+        for item in user_playbooks:
+            rebuild_cluster_id = rebuild_cluster_by_item.get(
+                int(item.user_playbook_id or 0)
+            )
+            if rebuild_cluster_id is None:
+                matchable_playbooks.append(item)
+            else:
+                rebuild_cluster_ids.add(rebuild_cluster_id)
+                rebuilding_residual_count += 1
+        selected_cluster_ids = sorted(rebuild_cluster_ids)[:max_clusters]
+        rebuild_samples = self.storage.get_playbook_aggregation_rebuild_samples(  # type: ignore[attr-defined]
+            self.agent_version,
+            selected_cluster_ids,
+            limit_per_cluster=_REPAIR_SOURCE_LIMIT,
+        )
+        sample_ids = [
+            item_id for sample in rebuild_samples for item_id in sample.member_ids
+        ]
+        sample_playbooks = self.storage.get_user_playbooks_by_ids_any_user(  # type: ignore[call-arg]
+            sample_ids,
+            status_filter=[None],
+            include_embedding=True,
+        )
+        sample_playbooks_by_id = {
+            int(item.user_playbook_id): item
+            for item in sample_playbooks
+            if item.user_playbook_id is not None
+        }
+        rebuild_work = [
+            _RebuildWork(
+                sample=sample,
+                members=[
+                    sample_playbooks_by_id[item_id]
+                    for item_id in sample.member_ids
+                    if item_id in sample_playbooks_by_id
+                ],
+            )
+            for sample in rebuild_samples
+        ]
+        return rebuild_work, matchable_playbooks, rebuilding_residual_count
+
+    def _apply_rebuild_outcomes(
+        self,
+        rebuild_work: list[_RebuildWork],
+        outcomes: list[AggregationGenerationOutcome],
+        save_generated: Callable[
+            [AggregationGenerationOutcome, list[int]], AgentPlaybook
+        ],
+        *,
+        run_id: str,
+    ) -> tuple[list[AgentPlaybook], int, int, int]:
+        """Finalize bounded repair prompts against complete stored membership."""
+        saved_playbooks: list[AgentPlaybook] = []
+        rebuilt_member_count = 0
+        supersessions = 0
+        fence_losses = 0
+        for work, outcome in zip(rebuild_work, outcomes, strict=True):
+            sample = work.sample
+            member_ids = [
+                int(item.user_playbook_id)
+                for item in outcome.source_cluster
+                if item.user_playbook_id is not None
+            ]
+            saved: AgentPlaybook | None = None
+            rebuilt = 0
+            try:
+                with self.storage.commit_scope():  # type: ignore[attr-defined]
+                    self._require_live_aggregation_claim()
+                    if outcome.status == "retryable_failure":
+                        try:
+                            self.storage.defer_playbook_aggregation_cluster_rebuild(  # type: ignore[attr-defined]
+                                cluster_id=sample.cluster_id,
+                                agent_version=self.agent_version,
+                                expected_agent_playbook_id=sample.agent_playbook_id,
+                                reason="llm_retryable_failure",
+                            )
+                        except RuntimeError as exc:
+                            raise _AggregationClusterUnavailableError from exc
+                    elif outcome.status == "semantic_null":
+                        try:
+                            rebuilt = self.storage.discard_playbook_aggregation_cluster_rebuild(  # type: ignore[attr-defined]
+                                cluster_id=sample.cluster_id,
+                                agent_version=self.agent_version,
+                                expected_agent_playbook_id=sample.agent_playbook_id,
+                                reason="semantic_null_rebuild",
+                            )
+                        except RuntimeError as exc:
+                            raise _AggregationClusterUnavailableError from exc
+                        supersessions += self.storage.supersede_agent_playbooks_by_ids(  # type: ignore[attr-defined]
+                            [sample.agent_playbook_id], request_id=run_id
+                        )
+                    else:
+                        saved = save_generated(outcome, member_ids)
+                        if not saved.embedding:
+                            raise RuntimeError(
+                                "rebuilt agent playbook has no centroid embedding"
+                            )
+                        try:
+                            rebuilt = self.storage.complete_playbook_aggregation_cluster_rebuild(  # type: ignore[attr-defined]
+                                cluster_id=sample.cluster_id,
+                                agent_version=self.agent_version,
+                                expected_agent_playbook_id=sample.agent_playbook_id,
+                                replacement_agent_playbook_id=saved.agent_playbook_id,
+                                centroid_embedding=saved.embedding,
+                                embedding_model=self.storage.embedding_model_name,
+                            )
+                        except RuntimeError as exc:
+                            raise _AggregationClusterUnavailableError from exc
+                        supersessions += self.storage.supersede_agent_playbooks_by_ids(  # type: ignore[attr-defined]
+                            [sample.agent_playbook_id], request_id=run_id
+                        )
+                    self._require_live_aggregation_claim()
+            except _AggregationClusterUnavailableError:
+                self._mark_aggregation_members_unavailable(member_ids)
+                fence_losses += 1
+                continue
+
+            rebuilt_member_count += rebuilt
+            if outcome.status == "semantic_null":
+                continue
+            if saved is not None:
+                saved_playbooks.append(saved)
+        return (
+            saved_playbooks,
+            rebuilt_member_count,
+            supersessions,
+            fence_losses,
+        )
+
+    def _mark_aggregation_members_unavailable(self, member_ids: list[int]) -> None:
+        """Return one stale cluster's selected members to durable residual work."""
+        with self.storage.commit_scope():  # type: ignore[attr-defined]
+            self._require_live_aggregation_claim()
+            self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
+                self.agent_version,
+                member_ids,
+                disposition="residual",
+                reason="cluster_agent_unavailable",
+            )
+            self._require_live_aggregation_claim()
+
+    def _apply_refresh_outcome(
+        self,
+        work: _IncrementalRefreshWork,
+        outcome: AggregationGenerationOutcome,
+        save_generated: Callable[
+            [AggregationGenerationOutcome, list[int]], AgentPlaybook
+        ],
+        *,
+        run_id: str,
+    ) -> tuple[AgentPlaybook | None, int, int, int]:
+        """Commit one refresh independently so a stale cluster cannot waste peers."""
+        member_ids = [
+            int(item.user_playbook_id)
+            for item in outcome.source_cluster
+            if item.user_playbook_id is not None
+        ]
+        if outcome.status == "retryable_failure":
+            with self.storage.commit_scope():  # type: ignore[attr-defined]
+                self._require_live_aggregation_claim()
+                self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
+                    self.agent_version,
+                    member_ids,
+                    disposition="residual",
+                    reason="llm_retryable_failure",
+                )
+                self._require_live_aggregation_claim()
+            return None, 0, 0, 0
+
+        saved: AgentPlaybook | None = None
+        supersessions = 0
+        try:
+            with self.storage.commit_scope():  # type: ignore[attr-defined]
+                self._require_live_aggregation_claim()
+                try:
+                    self.storage.attach_playbook_aggregation_items(  # type: ignore[attr-defined]
+                        agent_version=self.agent_version,
+                        attachments=[
+                            (item_id, work.cluster_id) for item_id in member_ids
+                        ],
+                    )
+                except RuntimeError as exc:
+                    raise _AggregationClusterUnavailableError from exc
+                if outcome.status == "generated":
+                    saved = save_generated(outcome, member_ids)
+                    if not saved.embedding:
+                        raise RuntimeError(
+                            "replacement agent playbook has no centroid embedding"
+                        )
+                    try:
+                        self.storage.replace_playbook_aggregation_cluster_agent(  # type: ignore[attr-defined]
+                            cluster_id=work.cluster_id,
+                            agent_version=self.agent_version,
+                            expected_agent_playbook_id=(
+                                work.current_agent.agent_playbook_id
+                            ),
+                            replacement_agent_playbook_id=saved.agent_playbook_id,
+                            centroid_embedding=saved.embedding,
+                            embedding_model=self.storage.embedding_model_name,
+                        )
+                    except RuntimeError as exc:
+                        raise _AggregationClusterUnavailableError from exc
+                    supersessions = self.storage.supersede_agent_playbooks_by_ids(  # type: ignore[attr-defined]
+                        [work.current_agent.agent_playbook_id], request_id=run_id
+                    )
+                self._require_live_aggregation_claim()
+        except _AggregationClusterUnavailableError:
+            self._mark_aggregation_members_unavailable(member_ids)
+            return None, 0, 0, 1
+
+        return saved, len(member_ids), supersessions, 0
+
+    def _run_incremental(
+        self,
+        *,
+        config: PlaybookAggregatorConfig,
+        run_id: str,
+        aggregation_start: float,
+    ) -> dict[str, Any]:
+        """Process one durable, bounded residual batch without touching old clusters."""
+        budget = (
+            aggregator_clustering.max_clustering_playbooks()
+            if self.residual_batch_limit is None
+            else max(0, self.residual_batch_limit)
+        )
+        bootstrap_work, bootstrap_complete = self._adopt_legacy_aggregation_state(
+            budget=budget
+        )
+        budget = max(0, budget - bootstrap_work)
+        if not bootstrap_complete:
+            return {
+                "clusters_found": 0,
+                "user_playbooks_processed": bootstrap_work,
+                "playbooks_generated": 0,
+                "staged": 0,
+                "attachments": 0,
+                "skipped": "legacy cluster adoption pending",
+            }
+        intake_window_limit = aggregator_clustering.max_clustering_playbooks()
+        staged_ids = self.storage.stage_playbook_aggregation_intake(  # type: ignore[attr-defined]
+            self.agent_version,
+            limit=budget,
+            window_limit=intake_window_limit,
+        )
+        residual_ids = self.storage.get_playbook_aggregation_residual_ids(  # type: ignore[attr-defined]
+            self.agent_version, limit=budget
+        )
+        user_playbooks = self.storage.get_user_playbooks_by_ids_any_user(  # type: ignore[call-arg]
+            residual_ids,
+            status_filter=[None],
+            include_embedding=True,
+        )
+        user_playbooks = [
+            item for item in user_playbooks if item.content and item.content.strip()
+        ]
+        rebuild_work, matchable_playbooks, rebuilding_residual_count = (
+            self._partition_rebuilding_members(
+                user_playbooks,
+                max_clusters=max(1, budget // _REPAIR_SOURCE_LIMIT),
+            )
+        )
+        trigger_count = max(2, config.reaggregation_trigger_count)
+
+        # Bound the dedup prompt as well. Existing agent playbooks are context,
+        # not work discovery, and must never turn this path into an org scan.
+        existing_playbooks = self.storage.get_agent_playbooks(  # type: ignore[attr-defined]
+            limit=min(500, budget),
+            agent_version=self.agent_version,
+            status_filter=[None],
+            playbook_status_filter=[PlaybookStatus.APPROVED, PlaybookStatus.PENDING],
+        )
+        similarity_threshold = resolve_clustering_similarity(
+            config.clustering_similarity,
+            model_name=self.storage.embedding_model_name,
+        )
+        missing_embedding_ids: list[int] = []
+        candidates: list[tuple[int, list[float]]] = []
+        for item in matchable_playbooks:
+            if item.user_playbook_id is None:
+                continue
+            item_id = int(item.user_playbook_id)
+            if not item.embedding:
+                missing_embedding_ids.append(item_id)
+                continue
+            candidates.append((item_id, item.embedding))
+        matches = self.storage.find_nearest_playbook_aggregation_clusters(  # type: ignore[attr-defined]
+            self.agent_version,
+            candidates,
+            embedding_model=self.storage.embedding_model_name,
+            limit=budget,
+        )
+        refresh_work, unmatched_playbooks, unavailable_matched_ids = (
+            self._partition_incremental_matches(
+                matchable_playbooks,
+                matches,
+                similarity_threshold=similarity_threshold,
+            )
+        )
+        refresh_clusters = {
+            index: work.members for index, work in enumerate(refresh_work)
+        }
+        refresh_current_agents = {
+            index: work.current_agent for index, work in enumerate(refresh_work)
+        }
+
+        refresh_outcomes = (
+            self._generate_playbook_outcomes_with_source_clusters(
+                refresh_clusters,
+                existing_playbooks,
+                direction_overlap_threshold=config.direction_overlap_threshold,
+                current_agent_playbooks=refresh_current_agents,
+            )
+            if refresh_clusters
+            else []
+        )
+        new_clusters = (
+            self.get_clusters(unmatched_playbooks, config)
+            if len(unmatched_playbooks) >= trigger_count
+            else {}
+        )
+        rebuild_clusters = {
+            index: work.members for index, work in enumerate(rebuild_work)
+        }
+        rebuild_outcomes = (
+            self._generate_playbook_outcomes_with_source_clusters(
+                rebuild_clusters,
+                existing_playbooks,
+                direction_overlap_threshold=config.direction_overlap_threshold,
+                excluded_existing_playbook_ids={
+                    index: {work.sample.agent_playbook_id}
+                    for index, work in enumerate(rebuild_work)
+                },
+            )
+            if rebuild_clusters
+            else []
+        )
+        new_cluster_outcomes = (
+            self._generate_playbook_outcomes_with_source_clusters(
+                new_clusters,
+                existing_playbooks,
+                direction_overlap_threshold=config.direction_overlap_threshold,
+            )
+            if new_clusters
+            else []
+        )
+        retryable_outcomes = [
+            item
+            for item in [*refresh_outcomes, *rebuild_outcomes, *new_cluster_outcomes]
+            if item.status == "retryable_failure"
+        ]
+        saved_playbooks: list[AgentPlaybook] = []
+        generated_playbooks = [
+            item.playbook
+            for item in [*refresh_outcomes, *rebuild_outcomes, *new_cluster_outcomes]
+            if item.status == "generated" and item.playbook is not None
+        ]
+        prepare = getattr(type(self.storage), "prepare_agent_playbooks_for_save", None)
+        if callable(prepare):
+            prepare(self.storage, generated_playbooks)
+
+        def save_generated_outcome(
+            outcome: AggregationGenerationOutcome,
+            member_ids: list[int],
+            *,
+            reason: str,
+        ) -> AgentPlaybook:
+            if outcome.playbook is None:
+                raise RuntimeError("generated outcome is missing its playbook")
+            lineage_contexts = [
+                LineageContext(
+                    op_kind="aggregate",
+                    actor="aggregator",
+                    request_id=run_id,
+                    source_ids=[str(value) for value in member_ids],
+                    reason=f"{AGGREGATE_REASON_PREFIX}{reason}",
+                    model_name=(
+                        outcome.provenance.model_name if outcome.provenance else None
+                    ),
+                    provider=(
+                        outcome.provenance.provider if outcome.provenance else None
+                    ),
+                )
+            ]
+            prepared_save = getattr(
+                type(self.storage), "save_prepared_agent_playbooks", None
+            )
+            if callable(prepared_save):
+                return prepared_save(  # pyright: ignore[reportIndexIssue]
+                    self.storage,
+                    [outcome.playbook],
+                    lineage_contexts=lineage_contexts,
+                )[0]
+            return self.storage.save_agent_playbooks(  # type: ignore[attr-defined]
+                [outcome.playbook], lineage_contexts=lineage_contexts
+            )[0]
+
+        attached_count = 0
+        supersessions = 0
+        cluster_fence_losses = 0
+        with self.storage.commit_scope():  # type: ignore[attr-defined]
+            self._require_live_aggregation_claim()
+            self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
+                self.agent_version,
+                missing_embedding_ids,
+                disposition="residual",
+                reason="embedding_pending",
+            )
+            self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
+                self.agent_version,
+                unavailable_matched_ids,
+                disposition="residual",
+                reason="cluster_agent_unavailable",
+            )
+            self._require_live_aggregation_claim()
+
+        for work, outcome in zip(refresh_work, refresh_outcomes, strict=True):
+            saved, attached, replaced, fence_losses = self._apply_refresh_outcome(
+                work,
+                outcome,
+                lambda generated, member_ids: save_generated_outcome(
+                    generated, member_ids, reason="incremental_refresh"
+                ),
+                run_id=run_id,
+            )
+            attached_count += attached
+            supersessions += replaced
+            cluster_fence_losses += fence_losses
+            if saved is not None:
+                saved_playbooks.append(saved)
+
+        (
+            rebuilt_playbooks,
+            rebuilt_member_count,
+            rebuild_supersessions,
+            rebuild_fence_losses,
+        ) = self._apply_rebuild_outcomes(
+            rebuild_work,
+            rebuild_outcomes,
+            lambda outcome, member_ids: save_generated_outcome(
+                outcome, member_ids, reason="invalidation_rebuild"
+            ),
+            run_id=run_id,
+        )
+        saved_playbooks.extend(rebuilt_playbooks)
+        supersessions += rebuild_supersessions
+        cluster_fence_losses += rebuild_fence_losses
+
+        for outcome in new_cluster_outcomes:
+            members = outcome.source_cluster
+            member_ids = [
+                int(item.user_playbook_id)
+                for item in members
+                if item.user_playbook_id is not None
+            ]
+            with self.storage.commit_scope():  # type: ignore[attr-defined]
+                self._require_live_aggregation_claim()
+                if outcome.status == "retryable_failure":
+                    self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
+                        self.agent_version,
+                        member_ids,
+                        disposition="residual",
+                        reason="llm_retryable_failure",
+                    )
+                elif outcome.status == "semantic_null":
+                    self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
+                        self.agent_version,
+                        member_ids,
+                        disposition="terminal_noop",
+                        reason="semantic_null",
+                    )
+                else:
+                    saved = save_generated_outcome(
+                        outcome, member_ids, reason="incremental"
+                    )
+                    if not saved.embedding:
+                        raise RuntimeError(
+                            "generated agent playbook has no centroid embedding"
+                        )
+                    cluster_id = self._stable_aggregation_cluster_id(
+                        self._compute_cluster_fingerprint(members)
+                    )
+                    self.storage.create_playbook_aggregation_cluster(  # type: ignore[attr-defined]
+                        cluster_id=cluster_id,
+                        agent_version=self.agent_version,
+                        agent_playbook_id=saved.agent_playbook_id,
+                        centroid_embedding=saved.embedding,
+                        member_count=len(member_ids),
+                        embedding_model=self.storage.embedding_model_name,
+                    )
+                    self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
+                        self.agent_version,
+                        member_ids,
+                        disposition="cluster_member",
+                        cluster_id=cluster_id,
+                        reason="generated",
+                    )
+                    saved_playbooks.append(saved)
+                self._require_live_aggregation_claim()
+
+        with self.storage.commit_scope():  # type: ignore[attr-defined]
+            self._require_live_aggregation_claim()
+            orphaned_agent_ids = (
+                self.storage.delete_orphaned_playbook_aggregation_clusters(  # type: ignore[attr-defined]
+                    self.agent_version
+                )
+            )
+            supersessions += self.storage.supersede_agent_playbooks_by_ids(  # type: ignore[attr-defined]
+                sorted(orphaned_agent_ids), request_id=run_id
+            )
+            self._require_live_aggregation_claim()
+
+        stats = {
+            "clusters_found": (
+                len(rebuild_clusters) + len(new_clusters) + len(refresh_clusters)
+            ),
+            "user_playbooks_processed": (
+                len(matchable_playbooks)
+                + sum(len(work.members) for work in rebuild_work)
+            ),
+            "playbooks_generated": len(saved_playbooks),
+            "staged": len(staged_ids),
+            "attachments": attached_count,
+            "rebuilt_members": rebuilt_member_count,
+            "supersessions": supersessions,
+            "retryable_failures": len(retryable_outcomes) + cluster_fence_losses,
+            "cluster_fence_losses": cluster_fence_losses,
+            "selected_rebuild_members": rebuilding_residual_count,
+        }
+        self._enqueue_playbook_optimization(saved_playbooks)
+        record_usage_event(
+            org_id=self.request_context.org_id,
+            event_name="aggregation_succeeded",
+            event_category="aggregation",
+            pipeline="playbook",
+            playbook_name=SINGLETON_USER_PLAYBOOK_NAME,
+            agent_version=self.agent_version,
+            outcome=(
+                "partial_failure"
+                if retryable_outcomes or cluster_fence_losses
+                else "success"
+            ),
+            count_value=len(saved_playbooks),
+            duration_ms=int((time.perf_counter() - aggregation_start) * 1000),
+            metadata=stats,
+        )
+        self._record_learnings_generated(
+            learning_ids=[
+                str(saved.agent_playbook_id)
+                for saved in saved_playbooks
+                if getattr(saved, "agent_playbook_id", None)
+            ],
+            playbook_name=SINGLETON_USER_PLAYBOOK_NAME,
+            request_id=run_id,
+            metadata=stats,
+            total_count=len(saved_playbooks),
+        )
+        return stats
+
+    def _stable_aggregation_cluster_id(self, fingerprint: str) -> str:
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{self.request_context.org_id}:{self.agent_version}:{fingerprint}",
+            )
+        )
+
+    def _resolve_legacy_agent_centroid(
+        self,
+        agent_playbook_id: int,
+        legacy_agent: AgentPlaybook | None,
+        embed: object,
+    ) -> list[float] | None:
+        """Return a canonical legacy-agent embedding or skip one bad fingerprint."""
+        if legacy_agent is None:
+            logger.warning(
+                "Skipping legacy aggregation fingerprint because agent playbook "
+                "%s no longer exists",
+                agent_playbook_id,
+            )
+            return None
+        expected_dimension = int(
+            self.storage.embedding_dimensions  # type: ignore[attr-defined]
+        )
+        if len(legacy_agent.embedding) == expected_dimension:
+            return legacy_agent.embedding
+        try:
+            if not callable(embed):
+                raise RuntimeError("aggregation storage cannot embed agents")
+            centroid = cast(Callable[[str], list[float]], embed)(
+                embedding_text(legacy_agent)
+            )
+        except Exception:  # noqa: BLE001 - skip one corrupt legacy record
+            logger.warning(
+                "Skipping legacy aggregation fingerprint because agent playbook "
+                "%s could not be re-embedded",
+                agent_playbook_id,
+                exc_info=True,
+            )
+            return None
+        if len(centroid) != expected_dimension:
+            logger.warning(
+                "Skipping legacy aggregation fingerprint because agent playbook "
+                "%s produced embedding dimension %s instead of %s",
+                agent_playbook_id,
+                len(centroid),
+                expected_dimension,
+            )
+            return None
+        return centroid
+
+    def _adopt_legacy_aggregation_state(self, *, budget: int) -> tuple[int, bool]:
+        """Rebuild legacy fingerprint centroids in bounded, resumable pages."""
+        status = self.storage.get_playbook_aggregation_bootstrap_status(  # type: ignore[attr-defined]
+            self.agent_version
+        )
+        if status == "complete":
+            return 0, True
+        mgr = self._create_state_manager()
+        fingerprints = mgr.get_cluster_fingerprints(
+            name=SINGLETON_USER_PLAYBOOK_NAME, version=self.agent_version
+        )
+        if not isinstance(fingerprints, dict):
+            fingerprints = {}
+        consumed = 0
+        for fingerprint in sorted(fingerprints):
+            data = fingerprints[fingerprint]
+            if not isinstance(data, dict) or data.get("agent_playbook_id") is None:
+                # A legacy None is ambiguous (semantic null vs. failed output),
+                # so its members remain undisposed and are retried normally.
+                continue
+            try:
+                agent_playbook_id = int(data["agent_playbook_id"])
+                member_ids = sorted(
+                    {
+                        int(value)
+                        for value in data.get("user_playbook_ids", [])
+                        if int(value) > 0
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
+            if not member_ids:
+                # Empty legacy fingerprints have no centroid to adopt and must not
+                # become active clusters that nearest-centroid lookup cannot find.
+                continue
+            legacy_agents = self.storage.get_agent_playbooks_by_ids(  # type: ignore[attr-defined]
+                [agent_playbook_id], include_inactive=True, include_embedding=True
+            )
+            embed = getattr(self.storage, "_get_embedding", None)
+            embed_fn = cast(Callable[[str], list[float]], embed)
+            centroid_embedding = self._resolve_legacy_agent_centroid(
+                agent_playbook_id,
+                legacy_agents[0] if legacy_agents else None,
+                embed,
+            )
+            if centroid_embedding is None:
+                continue
+            cluster_id = self._stable_aggregation_cluster_id(fingerprint)
+            progress = self.storage.get_playbook_aggregation_cluster_rebuild_cursor(  # type: ignore[attr-defined]
+                cluster_id
+            )
+            if progress is not None and progress[1] == "active":
+                continue
+            cursor = progress[0] if progress is not None else 0
+            pending_ids = [value for value in member_ids if value > cursor]
+            remaining = budget - consumed
+            if pending_ids and remaining <= 0:
+                return consumed, False
+            page_ids = pending_ids[:remaining]
+            consumed += len(page_ids)
+            rows = self.storage.get_user_playbooks_by_ids_any_user(  # type: ignore[call-arg]
+                page_ids,
+                status_filter=[None],
+                include_embedding=False,
+            )
+            rows_by_id = {
+                int(item.user_playbook_id): item
+                for item in rows
+                if item.user_playbook_id is not None
+            }
+            member_embeddings: list[tuple[int, list[float]]] = []
+            rebuild_cursor = cursor
+            blocked = False
+            if not callable(embed) and page_ids:
+                raise RuntimeError("aggregation storage cannot re-embed legacy members")
+            for user_playbook_id in page_ids:
+                item = rows_by_id.get(user_playbook_id)
+                if item is None or not item.content or not item.content.strip():
+                    rebuild_cursor = user_playbook_id
+                    continue
+                try:
+                    value = embed_fn(embedding_text(item))
+                except Exception:  # noqa: BLE001 - retry this exact member next run
+                    blocked = True
+                    break
+                if not value:
+                    blocked = True
+                    break
+                member_embeddings.append((user_playbook_id, cast(list[float], value)))
+                rebuild_cursor = user_playbook_id
+            complete = not blocked and rebuild_cursor >= max(member_ids, default=0)
+            if rebuild_cursor > cursor or not member_ids:
+                with self.storage.commit_scope():  # type: ignore[attr-defined]
+                    self._require_live_aggregation_claim()
+                    self.storage.adopt_legacy_playbook_aggregation_cluster_page(  # type: ignore[attr-defined]
+                        cluster_id=cluster_id,
+                        agent_version=self.agent_version,
+                        agent_playbook_id=agent_playbook_id,
+                        centroid_embedding=centroid_embedding,
+                        member_embeddings=member_embeddings,
+                        embedding_model=self.storage.embedding_model_name,
+                        embedding_dimension=int(
+                            self.storage.embedding_dimensions  # type: ignore[attr-defined]
+                        ),
+                        rebuild_cursor=rebuild_cursor,
+                        complete=complete,
+                    )
+                    self._require_live_aggregation_claim()
+            if blocked or not complete:
+                return consumed, False
+
+        with self.storage.commit_scope():  # type: ignore[attr-defined]
+            self._require_live_aggregation_claim()
+            self.storage.set_playbook_aggregation_bootstrap_status(  # type: ignore[attr-defined]
+                self.agent_version, "complete"
+            )
+            self._require_live_aggregation_claim()
+        return consumed, True
+
+    def _require_live_aggregation_claim(self) -> None:
+        if self.aggregation_claim is None:
+            return
+        if not self.storage.validate_playbook_aggregation_claim(  # type: ignore[attr-defined]
+            self.aggregation_claim
+        ):
+            raise RuntimeError("playbook aggregation effect lost its database fence")
 
     def run(self, playbook_aggregator_request: PlaybookAggregatorRequest) -> dict:  # noqa: C901
         """Run playbook aggregation.
@@ -595,12 +1273,31 @@ class PlaybookAggregator:
         """
         aggregation_start = time.perf_counter()
         # Stable id for this aggregation run — groups all lineage events produced below.
-        _run_id = str(uuid.uuid4())
+        _run_id = playbook_aggregator_request.operation_key or str(uuid.uuid4())
         _empty_stats = {
             "clusters_found": 0,
             "user_playbooks_processed": 0,
             "playbooks_generated": 0,
         }
+
+        if (
+            self.effect_coordinator is None
+            and playbook_aggregator_request.operation_key
+            and any(
+                event.op == "aggregate"
+                for event in self.storage.get_lineage_events(  # type: ignore[reportOptionalMemberAccess]
+                    request_id=playbook_aggregator_request.operation_key
+                )
+            )
+        ):
+            logger.info(
+                "Skipping aggregation operation %s because its effects already exist",
+                playbook_aggregator_request.operation_key,
+            )
+            return {
+                **_empty_stats,
+                "skipped": "operation already applied",
+            }
 
         # Singleton aggregation: one playbook kind per org. The name is a fixed
         # constant used only for bookmark/archive scoping and telemetry — it is
@@ -634,6 +1331,19 @@ class PlaybookAggregator:
                 **_empty_stats,
                 "skipped": skip_reason,
             }
+
+        if (
+            not playbook_aggregator_request.rerun
+            and getattr(
+                self.storage, "supports_incremental_playbook_aggregation", False
+            )
+            is True
+        ):
+            return self._run_incremental(
+                config=playbook_aggregator_config,
+                run_id=_run_id,
+                aggregation_start=aggregation_start,
+            )
 
         # Check if we should run aggregation based on new playbooks count
         # For rerun, use all user playbooks (last_processed_id=0) to determine if aggregation is needed
@@ -692,28 +1402,99 @@ class PlaybookAggregator:
             self.agent_version,
         )
         logger.info(
-            "User detail stripping for aggregation: %s",
-            type(self.user_detail_stripper).__name__
-            if self.user_detail_stripper is not None
+            "Aggregation prompt processor: %s",
+            type(self.aggregation_prompt_processor).__name__
+            if self.aggregation_prompt_processor is not None
             else "disabled",
         )
 
         # Get existing APPROVED and PENDING playbooks before archiving (to pass to LLM for deduplication).
         # Singleton aggregation pulls the user's whole set — no name filter.
-        existing_playbooks = self.storage.get_agent_playbooks(  # type: ignore[reportOptionalMemberAccess]
-            status_filter=[None],  # Current playbooks only
-            playbook_status_filter=[PlaybookStatus.APPROVED, PlaybookStatus.PENDING],
+        existing_playbooks, _existing_high_watermark = _read_all_pages(
+            lambda limit, max_id: self.storage.get_agent_playbooks(  # type: ignore[reportOptionalMemberAccess]
+                limit=limit,
+                max_agent_playbook_id=max_id,
+                agent_version=self.agent_version,
+                status_filter=[None],  # Current playbooks only
+                playbook_status_filter=[
+                    PlaybookStatus.APPROVED,
+                    PlaybookStatus.PENDING,
+                ],
+            ),
+            lambda playbook: playbook.agent_playbook_id,
         )
         logger.info(
             "Found %s existing playbooks (approved + pending) to preserve",
             len(existing_playbooks),
         )
 
-        # get all user playbooks and generate clusters
-        user_playbooks = self.storage.get_user_playbooks(  # type: ignore[reportOptionalMemberAccess]
-            agent_version=self.agent_version,
-            include_embedding=True,
-        )
+        # Preflight the corpus size with a COUNT before paging it in. The read
+        # below pulls every current user playbook WITH its embedding, so an
+        # oversized org costs ~1 GB of resident floats before clustering is even
+        # reached -- the cap has to be enforced ahead of the load, not just
+        # inside get_clusters().
+        max_playbooks = aggregator_clustering.max_clustering_playbooks()
+        rerun_invalidation_ids: list[int] = []
+        if playbook_aggregator_request.rerun and self.aggregation_claim is not None:
+            rerun_snapshot = self.storage.capture_playbook_aggregation_rerun_snapshot(  # type: ignore[attr-defined]
+                self.agent_version,
+                limit=max_playbooks + 1,
+            )
+            user_playbooks = list(rerun_snapshot.user_playbooks)
+            user_high_watermark = rerun_snapshot.user_high_watermark
+            rerun_invalidation_ids = list(rerun_snapshot.invalidation_ids)
+            total_user_playbooks = len(user_playbooks)
+        else:
+            total_user_playbooks = self.storage.count_user_playbooks(  # pyright: ignore[reportOptionalMemberAccess]
+                min_user_playbook_id=0,
+                agent_version=self.agent_version,
+                status_filter=[None],
+            )
+        if total_user_playbooks > max_playbooks:
+            logger.error(
+                "Skipping user playbook aggregation for '%s' (agent_version=%s): "
+                "%d current user playbooks exceeds the %s cap of %d",
+                playbook_name,
+                self.agent_version,
+                total_user_playbooks,
+                aggregator_clustering.MAX_CLUSTERING_PLAYBOOKS_ENV,
+                max_playbooks,
+            )
+            record_usage_event(
+                org_id=self.request_context.org_id,
+                event_name="aggregation_gate_evaluated",
+                event_category="aggregation",
+                pipeline="playbook",
+                playbook_name=playbook_name,
+                agent_version=self.agent_version,
+                outcome="failed",
+                count_value=total_user_playbooks,
+                metadata={
+                    "failure_reason": "full_rerun_safety_cap_exceeded",
+                    "user_playbooks": total_user_playbooks,
+                    "max_clustering_playbooks": max_playbooks,
+                },
+            )
+            raise RuntimeError(
+                "full aggregation rerun exceeds the safety cap "
+                f"({total_user_playbooks} > {max_playbooks})"
+            )
+
+        # Non-fenced legacy runs retain ordinary pagination. Fenced reruns use
+        # the pre-compute repeatable-read snapshot materialized above.
+        if not (
+            playbook_aggregator_request.rerun and self.aggregation_claim is not None
+        ):
+            user_playbooks, user_high_watermark = _read_all_pages(
+                lambda limit, max_id: self.storage.get_user_playbooks(  # type: ignore[reportOptionalMemberAccess]
+                    limit=limit,
+                    max_user_playbook_id=max_id,
+                    agent_version=self.agent_version,
+                    status_filter=[None],  # Current playbooks only
+                    include_embedding=True,
+                ),
+                lambda playbook: playbook.user_playbook_id,
+            )
         full_archive_playbook_names = sorted(
             {
                 playbook.playbook_name
@@ -765,8 +1546,25 @@ class PlaybookAggregator:
                         "No cluster changes detected for '%s', skipping LLM calls",
                         playbook_name,
                     )
-                    # Still update bookmark
-                    self._update_operation_state(playbook_name, user_playbooks)
+                    result = {
+                        **_empty_stats,
+                        "skipped": "no cluster changes detected",
+                    }
+                    if self.effect_coordinator is None:
+                        self._update_operation_state(
+                            playbook_name,
+                            user_playbooks,
+                            processed_high_watermark=user_high_watermark,
+                        )
+                    else:
+                        self.effect_coordinator.prepare([])
+                        with self.effect_coordinator.apply_scope():
+                            self._update_operation_state(
+                                playbook_name,
+                                user_playbooks,
+                                processed_high_watermark=user_high_watermark,
+                            )
+                            self.effect_coordinator.complete(result)
                     record_usage_event(
                         org_id=self.request_context.org_id,
                         event_name="aggregation_succeeded",
@@ -781,7 +1579,7 @@ class PlaybookAggregator:
                         ),
                         metadata={"skipped": "no cluster changes detected"},
                     )
-                    return {**_empty_stats, "skipped": "no cluster changes detected"}
+                    return result
 
                 logger.info(
                     "Detected %d changed clusters, %d playbooks to archive",
@@ -789,6 +1587,7 @@ class PlaybookAggregator:
                     len(archived_playbook_ids),
                 )
 
+        effect_scope: AbstractContextManager[None] | None = None
         try:
             # Emit the started event inside the protected block so any failure
             # from here on is paired with an aggregation_failed event.
@@ -808,7 +1607,34 @@ class PlaybookAggregator:
                 existing_playbooks,
                 direction_overlap_threshold=playbook_aggregator_config.direction_overlap_threshold,
             )
-            new_playbooks = [playbook for playbook, _ in generated_pairs]
+            new_playbooks = [playbook for playbook, _, _ in generated_pairs]
+            if self.effect_coordinator is not None:
+                self.effect_coordinator.prepare(new_playbooks)
+                pending_scope = self.effect_coordinator.apply_scope()
+                pending_scope.__enter__()
+                effect_scope = pending_scope
+            elif self.aggregation_claim is not None:
+                prepare = getattr(
+                    type(self.storage), "prepare_agent_playbooks_for_save", None
+                )
+                if callable(prepare):
+                    prepare(self.storage, new_playbooks)
+                pending_scope = self.storage.commit_scope()  # type: ignore[attr-defined]
+                pending_scope.__enter__()
+                effect_scope = pending_scope
+                self._require_live_aggregation_claim()
+            if (
+                playbook_aggregator_request.rerun
+                and self.aggregation_claim is not None
+                and new_playbooks
+            ):
+                self.storage.reset_playbook_aggregation_version(  # type: ignore[attr-defined]
+                    self.agent_version
+                )
+                self.storage.stage_playbook_aggregation_snapshot(  # type: ignore[attr-defined]
+                    self.agent_version,
+                    [item.user_playbook_id for item in user_playbooks],
+                )
 
             previous_fingerprints_for_changed_clusters = {}
             changed_fps_by_previous_fp = {}
@@ -890,19 +1716,46 @@ class PlaybookAggregator:
 
             # Save each playbook + its aggregate event atomically, then assign
             # fingerprints and source-windows for the saved row.
-            for playbook, cluster_playbooks in generated_pairs:
+            for playbook, cluster_playbooks, provenance in generated_pairs:
                 run_mode = "full_archive" if full_archive else "incremental"
                 member_ids = [
                     str(fb.user_playbook_id)
                     for fb in cluster_playbooks
                     if fb.user_playbook_id
                 ]
-                saved_fb = self.storage.save_agent_playbook_with_aggregate_event(  # type: ignore[reportOptionalMemberAccess]
-                    playbook,
-                    source_ids=member_ids,
-                    request_id=_run_id,
-                    run_mode=run_mode,
-                )
+                if self.effect_coordinator is None:
+                    lineage_contexts = [
+                        LineageContext(
+                            op_kind="aggregate",
+                            actor="aggregator",
+                            request_id=_run_id,
+                            source_ids=member_ids,
+                            reason=f"{AGGREGATE_REASON_PREFIX}{run_mode}",
+                            model_name=provenance.model_name if provenance else None,
+                            provider=provenance.provider if provenance else None,
+                        )
+                    ]
+                    prepared_save = getattr(
+                        type(self.storage), "save_prepared_agent_playbooks", None
+                    )
+                    if self.aggregation_claim is not None and callable(prepared_save):
+                        saved_fb = prepared_save(  # pyright: ignore[reportIndexIssue]
+                            self.storage,
+                            [playbook],
+                            lineage_contexts=lineage_contexts,
+                        )[0]
+                    else:
+                        saved_fb = self.storage.save_agent_playbooks(  # type: ignore[reportOptionalMemberAccess]
+                            [playbook], lineage_contexts=lineage_contexts
+                        )[0]
+                else:
+                    saved_fb = self.effect_coordinator.save_agent_playbook(
+                        playbook,
+                        source_ids=member_ids,
+                        request_id=_run_id,
+                        run_mode=run_mode,
+                        provenance=provenance,
+                    )
                 saved_playbook_list.append(saved_fb)
                 if saved_fb and saved_fb.agent_playbook_id:
                     fp_key = self._compute_cluster_fingerprint(cluster_playbooks)
@@ -912,6 +1765,30 @@ class PlaybookAggregator:
                         "agent_playbook_id": saved_fb.agent_playbook_id,
                         "user_playbook_ids": raw_ids,
                     }
+                    if (
+                        playbook_aggregator_request.rerun
+                        and self.aggregation_claim is not None
+                    ):
+                        if not saved_fb.embedding:
+                            raise RuntimeError(
+                                "rerun agent playbook has no centroid embedding"
+                            )
+                        cluster_id = self._stable_aggregation_cluster_id(fp_key)
+                        self.storage.create_playbook_aggregation_cluster(  # type: ignore[attr-defined]
+                            cluster_id=cluster_id,
+                            agent_version=self.agent_version,
+                            agent_playbook_id=saved_fb.agent_playbook_id,
+                            centroid_embedding=saved_fb.embedding,
+                            member_count=len(raw_ids),
+                            embedding_model=self.storage.embedding_model_name,
+                        )
+                        self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
+                            self.agent_version,
+                            raw_ids,
+                            disposition="cluster_member",
+                            cluster_id=cluster_id,
+                            reason="full_rerun",
+                        )
                     for prev_fp in previous_fingerprints_for_changed_clusters.get(
                         fp_key, {}
                     ):
@@ -974,7 +1851,11 @@ class PlaybookAggregator:
             )
 
             # Update operation state with the highest user_playbook_id processed
-            self._update_operation_state(playbook_name, user_playbooks)
+            self._update_operation_state(
+                playbook_name,
+                user_playbooks,
+                processed_high_watermark=user_high_watermark,
+            )
 
             # Remove archived playbooks after successful aggregation. ALWAYS soft-supersede
             # (never hard-delete) so the removal is reconstructable from lineage — mirrors the
@@ -1024,7 +1905,7 @@ class PlaybookAggregator:
                             self.agent_version,
                         )
                 except Exception:
-                    with sentry_tags(
+                    with error_tags(
                         subsystem="playbook_aggregation",
                         op="supersede_agent_playbooks",
                         org_id=self.request_context.org_id,
@@ -1040,14 +1921,45 @@ class PlaybookAggregator:
                         org_id=self.request_context.org_id,
                         request_id=_run_id,
                     )
-
-            self._enqueue_playbook_optimization(saved_playbook_list)
+                    if (
+                        self.effect_coordinator is not None
+                        or self.aggregation_claim is not None
+                    ):
+                        raise
 
             stats = {
                 "clusters_found": len(clusters),
                 "user_playbooks_processed": len(user_playbooks),
                 "playbooks_generated": len(saved_playbook_list),
             }
+            if (
+                playbook_aggregator_request.rerun
+                and self.aggregation_claim is not None
+                and new_playbooks
+                and not self.storage.mark_playbook_aggregation_invalidations_processed(  # type: ignore[attr-defined]
+                    self.aggregation_claim,
+                    rerun_invalidation_ids,
+                )
+            ):
+                raise RuntimeError(
+                    "playbook aggregation rerun lost its invalidation fence"
+                )
+            if self.effect_coordinator is not None:
+                self.effect_coordinator.complete(stats)
+                if effect_scope is None:
+                    raise RuntimeError("aggregation effect scope was not entered")
+                completed_scope = effect_scope
+                effect_scope = None
+                completed_scope.__exit__(None, None, None)
+            elif self.aggregation_claim is not None:
+                self._require_live_aggregation_claim()
+                if effect_scope is None:
+                    raise RuntimeError("aggregation claim scope was not entered")
+                completed_scope = effect_scope
+                effect_scope = None
+                completed_scope.__exit__(None, None, None)
+
+            self._enqueue_playbook_optimization(saved_playbook_list)
             record_usage_event(
                 org_id=self.request_context.org_id,
                 event_name="aggregation_succeeded",
@@ -1060,9 +1972,24 @@ class PlaybookAggregator:
                 duration_ms=int((time.perf_counter() - aggregation_start) * 1000),
                 metadata=stats,
             )
+            self._record_learnings_generated(
+                learning_ids=[
+                    str(saved.agent_playbook_id)
+                    for saved in saved_playbook_list
+                    if getattr(saved, "agent_playbook_id", None)
+                ],
+                playbook_name=playbook_name,
+                request_id=_run_id,
+                metadata=stats,
+                total_count=len(saved_playbook_list),
+            )
             return stats
 
         except Exception as e:
+            if effect_scope is not None:
+                failed_scope = effect_scope
+                effect_scope = None
+                failed_scope.__exit__(type(e), e, e.__traceback__)
             record_usage_event(
                 org_id=self.request_context.org_id,
                 event_name="aggregation_failed",
@@ -1074,23 +2001,84 @@ class PlaybookAggregator:
                 duration_ms=int((time.perf_counter() - aggregation_start) * 1000),
                 error_kind=type(e).__name__,
             )
-            # Restore archived playbooks if any error occurs during aggregation
-            logger.error(
-                "Error during playbook aggregation for '%s': %s. Restoring archived playbooks.",
-                playbook_name,
-                str(e),
-            )
-            if full_archive:
-                for name in full_archive_playbook_names:
-                    self.storage.restore_archived_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
-                        name, agent_version=self.agent_version
+            if self.effect_coordinator is None and self.aggregation_claim is None:
+                logger.error(
+                    "Error during playbook aggregation for '%s': %s. Restoring archived playbooks.",
+                    playbook_name,
+                    str(e),
+                )
+                if full_archive:
+                    for name in full_archive_playbook_names:
+                        self.storage.restore_archived_agent_playbooks_by_playbook_name(  # type: ignore[reportOptionalMemberAccess]
+                            name, agent_version=self.agent_version
+                        )
+                elif archived_playbook_ids:
+                    self.storage.restore_archived_agent_playbooks_by_ids(  # type: ignore[reportOptionalMemberAccess]
+                        archived_playbook_ids
                     )
-            elif archived_playbook_ids:
-                self.storage.restore_archived_agent_playbooks_by_ids(  # type: ignore[reportOptionalMemberAccess]
-                    archived_playbook_ids
+            else:
+                logger.error(
+                    "Error during managed playbook aggregation for '%s': %s. The effect transaction was rolled back.",
+                    playbook_name,
+                    str(e),
                 )
             # Re-raise the exception after restoring
             raise
+
+    def _record_learnings_generated(
+        self,
+        *,
+        learning_ids: list[str],
+        playbook_name: str,
+        request_id: str,
+        metadata: Mapping[str, Any],
+        total_count: int | None = None,
+    ) -> None:
+        """Emit ``learnings_generated`` for a completed aggregation run.
+
+        Prefers one event per learning id (entity-backed) when every saved
+        playbook in this run carries a durable ``agent_playbook_id`` — the
+        common case, since ``save_agent_playbooks``
+        raises rather than returning a partial row. Falls back to the
+        count-based aggregate event when ``learning_ids`` is short of
+        ``total_count`` (a falsy/unset id slipped through), mirroring
+        ``ExtractionResumeWorker._record_finalized_learnings`` — this avoids
+        emitting a colliding ``learn:agent_playbook:0`` key. ``total_count``
+        defaults to ``len(learning_ids)`` so callers that already guarantee a
+        complete id list (e.g. existing tests) are unaffected.
+        """
+        from reflexio.server.billing_meter import (
+            emit_learnings_generated,
+            emit_learnings_generated_records,
+        )
+
+        total = len(learning_ids) if total_count is None else total_count
+        if len(learning_ids) == total:
+            emit_learnings_generated_records(
+                org_id=self.request_context.org_id,
+                configurator=self.configurator,
+                learning_ids=learning_ids,
+                source="aggregation",
+                pipeline="playbook",
+                request_id=request_id,
+                agent_version=self.agent_version,
+                playbook_name=playbook_name,
+                entity_type="agent_playbook",
+                metadata=metadata,
+            )
+            return
+        emit_learnings_generated(
+            org_id=self.request_context.org_id,
+            configurator=self.configurator,
+            count=total,
+            source="aggregation",
+            pipeline="playbook",
+            request_id=request_id,
+            agent_version=self.agent_version,
+            playbook_name=playbook_name,
+            entity_type="agent_playbook",
+            metadata=metadata,
+        )
 
     def get_clusters(
         self,
@@ -1113,23 +2101,38 @@ class PlaybookAggregator:
             )
             return {}
 
-        min_cluster_size = playbook_aggregator_config.min_cluster_size
-        similarity_threshold = playbook_aggregator_config.clustering_similarity
-
         if not user_playbooks:
             logger.info("No user playbooks to cluster")
             return {}
 
+        min_cluster_size = playbook_aggregator_config.min_cluster_size
+        similarity_threshold = resolve_clustering_similarity(
+            playbook_aggregator_config.clustering_similarity,
+            model_name=self.storage.embedding_model_name,
+        )
         # Mock mode: cluster by trigger
         if os.getenv("MOCK_LLM_RESPONSE", "").lower() == "true":
             logger.info("Mock mode: clustering by trigger")
-            return self._cluster_by_trigger_mock(user_playbooks, min_cluster_size)
+            return aggregator_clustering.cluster_by_trigger_mock(
+                user_playbooks, min_cluster_size
+            )
 
         # Extract embeddings from user playbooks
         import numpy as np
-        from sklearn.metrics.pairwise import cosine_distances
 
-        embeddings = np.array([playbook.embedding for playbook in user_playbooks])
+        embedded_playbooks = [
+            playbook for playbook in user_playbooks if playbook.embedding
+        ]
+        skipped_without_embedding = len(user_playbooks) - len(embedded_playbooks)
+        if skipped_without_embedding:
+            logger.info(
+                "Skipping %d user playbooks without an embedding",
+                skipped_without_embedding,
+            )
+        user_playbooks = embedded_playbooks
+        embeddings = np.asarray(
+            [playbook.embedding for playbook in user_playbooks], dtype=np.float64
+        )
 
         if len(embeddings) < min_cluster_size:
             logger.info(
@@ -1139,19 +2142,35 @@ class PlaybookAggregator:
             )
             return {}
 
-        # Compute cosine distance matrix for better text embedding clustering
-        distance_matrix = cosine_distances(embeddings)
+        max_playbooks = aggregator_clustering.max_clustering_playbooks()
+        if len(embeddings) > max_playbooks:
+            # Refuse rather than sampling down: a sampled subset would silently
+            # produce different agent playbooks run-to-run.
+            logger.error(
+                "Refusing to cluster %d user playbooks (cap %d). Raise %s to "
+                "allow it -- runtime grows quadratically, so expect roughly "
+                "(n/20000)^2 * 2 minutes of CPU.",
+                len(embeddings),
+                max_playbooks,
+                aggregator_clustering.MAX_CLUSTERING_PLAYBOOKS_ENV,
+            )
+            return {}
 
         # Choose algorithm based on dataset size
         # Convert similarity threshold to distance threshold (distance = 1 - similarity)
         distance_threshold = 1.0 - similarity_threshold
         if len(embeddings) < CLUSTERING_ALGORITHM_THRESHOLD:
+            # Small input only: the precomputed cosine matrix is O(n^2), which is
+            # negligible below the threshold and catastrophic above it.
+            from sklearn.metrics.pairwise import cosine_distances
+
             cluster_labels = self._cluster_with_agglomerative(
-                distance_matrix, min_cluster_size, distance_threshold
+                cosine_distances(embeddings), min_cluster_size, distance_threshold
             )
         else:
+            # HDBSCAN clusters the raw vectors directly -- no O(n^2) matrix.
             cluster_labels = self._cluster_with_hdbscan(
-                distance_matrix, min_cluster_size, distance_threshold
+                embeddings, min_cluster_size, distance_threshold
             )
 
         # Group playbooks by cluster
@@ -1178,170 +2197,116 @@ class PlaybookAggregator:
 
         return clusters
 
-    def _cluster_by_trigger_mock(
-        self, user_playbooks: list[UserPlaybook], min_cluster_size: int
-    ) -> dict[int, list[UserPlaybook]]:
-        """
-        Simple mock clustering by exact trigger match.
-
-        Args:
-            user_playbooks: List of user playbooks with trigger field
-            min_cluster_size: Minimum number of playbooks per cluster
-
-        Returns:
-            dict[int, list[UserPlaybook]]: Clusters grouped by trigger
-        """
-        # Group by trigger
-        condition_groups: dict[str, list[UserPlaybook]] = {}
-        for fb in user_playbooks:
-            condition = fb.trigger or ""
-            if condition not in condition_groups:
-                condition_groups[condition] = []
-            condition_groups[condition].append(fb)
-
-        # Convert to cluster format, filtering by min_cluster_size
-        clusters: dict[int, list[UserPlaybook]] = {}
-        cluster_id = 0
-        for playbooks_group in condition_groups.values():
-            if len(playbooks_group) >= min_cluster_size:
-                clusters[cluster_id] = playbooks_group
-                cluster_id += 1
-
-        logger.info(
-            "Mock mode: created %d trigger clusters from %d playbooks",
-            len(clusters),
-            len(user_playbooks),
-        )
-        return clusters
-
     def _cluster_with_agglomerative(
-        self,
-        distance_matrix: np.ndarray,
-        min_cluster_size: int,  # noqa: ARG002
-        distance_threshold: float,
-    ) -> np.ndarray:
-        """
-        Cluster using Agglomerative Clustering - best for small datasets.
-
-        Args:
-            distance_matrix: Precomputed cosine distance matrix
-            min_cluster_size: Minimum cluster size (used for logging only,
-                              filtering happens in get_clusters)
-            distance_threshold: Maximum cosine distance to merge clusters (1 - similarity_threshold)
-
-        Returns:
-            np.ndarray: Cluster labels for each point
-        """
-        from sklearn.cluster import AgglomerativeClustering
-
-        logger.info(
-            "Using Agglomerative Clustering for %d playbooks (< %d threshold), distance_threshold=%.2f",
-            len(distance_matrix),
-            CLUSTERING_ALGORITHM_THRESHOLD,
-            distance_threshold,
-        )
-
-        clusterer = AgglomerativeClustering(
-            n_clusters=None,  # type: ignore[reportArgumentType]
-            distance_threshold=distance_threshold,
-            metric="precomputed",
-            linkage="average",
-        )
-
-        return clusterer.fit_predict(distance_matrix)
-
-    def _cluster_with_hdbscan(
         self,
         distance_matrix: np.ndarray,
         min_cluster_size: int,
         distance_threshold: float,
     ) -> np.ndarray:
-        """
-        Cluster using HDBSCAN - best for large datasets with potential noise.
-
-        Args:
-            distance_matrix: Precomputed cosine distance matrix
-            min_cluster_size: Minimum number of points to form a cluster
-            distance_threshold: Maximum cosine distance for cluster merging (1 - similarity_threshold)
-
-        Returns:
-            np.ndarray: Cluster labels for each point (-1 indicates noise)
-        """
-        import hdbscan
-
-        logger.info(
-            "Using HDBSCAN for %d playbooks (>= %d threshold), distance_threshold=%.2f",
-            len(distance_matrix),
-            CLUSTERING_ALGORITHM_THRESHOLD,
-            distance_threshold,
+        return aggregator_clustering.cluster_with_agglomerative(
+            distance_matrix, min_cluster_size, distance_threshold
         )
 
-        clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=min_cluster_size,
-            min_samples=1,
-            metric="precomputed",
-            cluster_selection_epsilon=distance_threshold,
-        )
-
-        return clusterer.fit_predict(distance_matrix)
-
-    def _generate_playbooks_from_clusters(
+    def _cluster_with_hdbscan(
         self,
-        clusters: dict[int, list[UserPlaybook]],
-        existing_approved_playbooks: list[AgentPlaybook],
-        direction_overlap_threshold: float = 0.6,
-    ) -> list[AgentPlaybook]:
-        """
-        Generate playbooks from clusters, considering existing approved playbooks.
-
-        Args:
-            clusters: Dictionary mapping cluster IDs to lists of raw playbooks
-            existing_approved_playbooks: List of existing approved playbooks to avoid duplication
-            direction_overlap_threshold: Token overlap threshold for grouping by direction
-
-        Returns:
-            list[AgentPlaybook]: List of newly generated playbooks (excludes duplicates)
-        """
-        return [
-            playbook
-            for playbook, _ in self._generate_playbooks_with_source_clusters(
-                clusters,
-                existing_approved_playbooks,
-                direction_overlap_threshold=direction_overlap_threshold,
-            )
-        ]
+        embeddings: np.ndarray,
+        min_cluster_size: int,
+        distance_threshold: float,
+    ) -> np.ndarray:
+        return aggregator_clustering.cluster_with_hdbscan(
+            embeddings, min_cluster_size, distance_threshold
+        )
 
     def _generate_playbooks_with_source_clusters(
         self,
         clusters: dict[int, list[UserPlaybook]],
         existing_approved_playbooks: list[AgentPlaybook],
         direction_overlap_threshold: float = 0.6,
-    ) -> list[tuple[AgentPlaybook, list[UserPlaybook]]]:
-        """Generate agent playbooks while preserving their exact source cluster."""
-        new_playbooks: list[tuple[AgentPlaybook, list[UserPlaybook]]] = []
-        approved_playbooks_str = (
-            "\n".join([f"- {fb.content}" for fb in existing_approved_playbooks])
-            if existing_approved_playbooks
-            else "None"
-        )
-        for cluster_playbooks in clusters.values():
-            shared_mapping: dict[str, int] = {}
-            if self.user_detail_stripper is None:
-                prompt_cluster_playbooks = cluster_playbooks
+    ) -> list[tuple[AgentPlaybook, list[UserPlaybook], ModelProvenance | None]]:
+        """Compatibility view containing only generated outcomes."""
+        return [
+            (outcome.playbook, outcome.source_cluster, outcome.provenance)
+            for outcome in self._generate_playbook_outcomes_with_source_clusters(
+                clusters,
+                existing_approved_playbooks,
+                direction_overlap_threshold,
+            )
+            if outcome.status == "generated" and outcome.playbook is not None
+        ]
+
+    def _generate_playbook_outcomes_with_source_clusters(
+        self,
+        clusters: dict[int, list[UserPlaybook]],
+        existing_approved_playbooks: list[AgentPlaybook],
+        direction_overlap_threshold: float = 0.6,
+        current_agent_playbooks: dict[int, AgentPlaybook] | None = None,
+        excluded_existing_playbook_ids: dict[int, set[int]] | None = None,
+    ) -> list[AggregationGenerationOutcome]:
+        """Return one tagged outcome for every selected source cluster."""
+        outcomes: list[AggregationGenerationOutcome] = []
+        for cluster_key, cluster_playbooks in clusters.items():
+            current_agent_playbook = (current_agent_playbooks or {}).get(cluster_key)
+            relevant_existing = _select_relevant_existing_playbooks(
+                cluster_playbooks, existing_approved_playbooks
+            )
+            excluded_ids = (excluded_existing_playbook_ids or {}).get(
+                cluster_key, set()
+            )
+            if excluded_ids:
+                relevant_existing = [
+                    item
+                    for item in relevant_existing
+                    if item.agent_playbook_id not in excluded_ids
+                ]
+            if current_agent_playbook is not None:
+                relevant_existing = [
+                    item
+                    for item in relevant_existing
+                    if item.agent_playbook_id
+                    != current_agent_playbook.agent_playbook_id
+                ]
+            approved_playbooks_str = (
+                "\n".join(f"- {item.content}" for item in relevant_existing)
+                if relevant_existing
+                else "None"
+            )
+            shared_state: dict[str, object] = {}
+            processing_context = AggregationPromptProcessingContext(
+                data={
+                    "agent_version": self.agent_version,
+                    "org_id": self.request_context.org_id,
+                }
+            )
+            selected_prompt_sources = _select_generation_prompt_sources(
+                cluster_playbooks,
+                is_incremental_refresh=current_agent_playbook is not None,
+            )
+            if self.aggregation_prompt_processor is None:
+                prompt_cluster_playbooks = selected_prompt_sources
             else:
                 prompt_cluster_playbooks = [
-                    self._strip_user_playbook_for_prompt(playbook, shared_mapping)
-                    for playbook in cluster_playbooks
+                    self._postproc._preprocess_user_playbook_for_prompt(
+                        playbook, shared_state, processing_context
+                    )
+                    for playbook in selected_prompt_sources
                 ]
 
-            playbook = self._generate_playbook_from_cluster(
+            generated = self._generate_playbook_from_cluster_outcome(
                 prompt_cluster_playbooks,
                 approved_playbooks_str,
                 direction_overlap_threshold=direction_overlap_threshold,
+                processing_context=processing_context,
+                current_agent_playbook=current_agent_playbook,
             )
-            if playbook is not None:
-                new_playbooks.append((playbook, cluster_playbooks))
-        return new_playbooks
+            outcomes.append(
+                AggregationGenerationOutcome(
+                    status=generated.status,
+                    source_cluster=cluster_playbooks,
+                    playbook=generated.playbook,
+                    provenance=generated.provenance,
+                )
+            )
+        return outcomes
 
     def _enqueue_playbook_optimization(
         self, saved_playbooks: Sequence[AgentPlaybook | None]
@@ -1387,7 +2352,27 @@ class PlaybookAggregator:
         cluster_playbooks: list[UserPlaybook],
         existing_approved_playbooks_str: str,
         direction_overlap_threshold: float = 0.6,
-    ) -> AgentPlaybook | None:
+        processing_context: AggregationPromptProcessingContext | None = None,
+    ) -> tuple[AgentPlaybook, ModelProvenance | None] | None:
+        """Compatibility view of the tagged generation result."""
+        outcome = self._generate_playbook_from_cluster_outcome(
+            cluster_playbooks,
+            existing_approved_playbooks_str,
+            direction_overlap_threshold,
+            processing_context,
+        )
+        if outcome.status != "generated" or outcome.playbook is None:
+            return None
+        return outcome.playbook, outcome.provenance
+
+    def _generate_playbook_from_cluster_outcome(
+        self,
+        cluster_playbooks: list[UserPlaybook],
+        existing_approved_playbooks_str: str,
+        direction_overlap_threshold: float = 0.6,
+        processing_context: AggregationPromptProcessingContext | None = None,
+        current_agent_playbook: AgentPlaybook | None = None,
+    ) -> AggregationGenerationOutcome:
         """
         Generate a playbook from a cluster using structured JSON output.
 
@@ -1397,10 +2382,10 @@ class PlaybookAggregator:
             direction_overlap_threshold: Token overlap threshold for grouping by direction
 
         Returns:
-            AgentPlaybook | None: Generated playbook, or None if no new playbook needed
+            Generated playbook and its provenance, or None if no new playbook is needed
         """
         if not cluster_playbooks:
-            return None
+            return AggregationGenerationOutcome("retryable_failure", [])
 
         if os.getenv("MOCK_LLM_RESPONSE", "").lower() == "true":
             # Extract structured fields directly from cluster
@@ -1412,10 +2397,19 @@ class PlaybookAggregator:
             first_content = cluster_playbooks[0].content
             if not first_content:
                 logger.info("No valid content in cluster, skipping")
-                return None
+                return AggregationGenerationOutcome(
+                    "retryable_failure", cluster_playbooks
+                )
 
-            # Build content directly as a freeform summary
+            # Build content directly as a freeform summary. Incremental refreshes
+            # retain the current canonical rule and add the newly matched delta.
             content_text = f"When {trigger}, {first_content}."
+            if current_agent_playbook is not None:
+                content_text = (
+                    f"{current_agent_playbook.content.rstrip()}\n"
+                    f"- {first_content.rstrip('.')}"
+                )
+                trigger = current_agent_playbook.trigger or trigger
 
             response = PlaybookAggregationOutput(
                 playbook=StructuredPlaybookContent(
@@ -1423,18 +2417,38 @@ class PlaybookAggregator:
                     trigger=trigger,
                 )
             )
-            response, placeholder_count = self._sanitize_aggregation_response(response)
-            self._record_placeholder_leakage(placeholder_count)
-            playbook = self._process_aggregation_response(response, cluster_playbooks)
-            if playbook is None:
-                return None
-            return playbook.model_copy(update={"playbook_metadata": "mock_generated"})
+            response, artifact_count = self._postproc._postprocess_aggregation_response(
+                response,
+                processing_context,
+            )
+            self._postproc._record_postprocessing_artifacts(artifact_count)
+            processed = self._process_aggregation_response_outcome(
+                response, cluster_playbooks
+            )
+            if processed.status != "generated" or processed.playbook is None:
+                return processed
+            return AggregationGenerationOutcome(
+                "generated",
+                cluster_playbooks,
+                processed.playbook.model_copy(
+                    update={"playbook_metadata": "mock_generated"}
+                ),
+            )
 
         # Format raw playbooks for prompt using structured format
         raw_playbooks_str = self._format_structured_cluster_input(
             cluster_playbooks,
             direction_overlap_threshold=direction_overlap_threshold,
         )
+        if current_agent_playbook is not None:
+            raw_playbooks_str = (
+                "CURRENT CANONICAL PLAYBOOK TO UPDATE:\n"
+                f"Trigger: {current_agent_playbook.trigger or '(none)'}\n"
+                f"Content: {current_agent_playbook.content}\n"
+                f"Rationale: {current_agent_playbook.rationale or '(none)'}\n\n"
+                "NEWLY MATCHED RAW PLAYBOOKS:\n"
+                f"{raw_playbooks_str}"
+            )
 
         messages = [
             {
@@ -1444,29 +2458,39 @@ class PlaybookAggregator:
                     {
                         "user_playbooks": raw_playbooks_str,
                         "existing_approved_playbooks": existing_approved_playbooks_str,
-                        "aggregation_prompt_extra_instructions": self.aggregation_prompt_extra_instructions,
+                        "aggregation_prompt_extra_instructions": self._postproc._aggregation_prompt_extra_instructions_for_context(
+                            processing_context
+                        ),
                     },
                 ),
             }
         ]
 
         try:
-            response = self.client.generate_chat_response(
+            completion = self.client.generate_chat_response_with_provenance(
                 messages=messages,
                 model=self.client.config.model,
                 response_format=PlaybookAggregationOutput,
                 parse_structured_output=True,
             )
+            response = completion.value
+            model_provenance = completion.provenance
             if isinstance(response, PlaybookAggregationOutput):
-                response, placeholder_count = self._sanitize_aggregation_response(
-                    response
+                response, artifact_count = (
+                    self._postproc._postprocess_aggregation_response(
+                        response,
+                        processing_context,
+                    )
                 )
-                self._record_placeholder_leakage(placeholder_count)
+                self._postproc._record_postprocessing_artifacts(artifact_count)
             else:
-                response, placeholder_count = self._sanitize_aggregation_log_value(
-                    response
+                response, artifact_count = (
+                    self._postproc._postprocess_aggregation_output(
+                        response,
+                        processing_context,
+                    )
                 )
-                self._record_placeholder_leakage(placeholder_count)
+                self._postproc._record_postprocessing_artifacts(artifact_count)
             log_model_response(logger, "Aggregation structured response", response)
 
             if not isinstance(response, PlaybookAggregationOutput):
@@ -1474,23 +2498,46 @@ class PlaybookAggregator:
                     "LLM response was not parsed as PlaybookAggregationOutput (got %s), returning None.",
                     type(response).__name__,
                 )
-                return None
+                return AggregationGenerationOutcome(
+                    "retryable_failure", cluster_playbooks
+                )
 
-            return self._process_aggregation_response(response, cluster_playbooks)
-        except Exception as exc:
-            sanitized_error, placeholder_count = self._sanitize_aggregation_log_value(
-                str(exc)
+            processed = self._process_aggregation_response_outcome(
+                response, cluster_playbooks
             )
-            self._record_placeholder_leakage(placeholder_count)
+            return AggregationGenerationOutcome(
+                processed.status,
+                cluster_playbooks,
+                processed.playbook,
+                model_provenance if processed.status == "generated" else None,
+            )
+        except Exception as exc:
+            processed_error, artifact_count = (
+                self._postproc._postprocess_aggregation_output(
+                    str(exc),
+                    processing_context,
+                )
+            )
+            self._postproc._record_postprocessing_artifacts(artifact_count)
             logger.error(
                 "AgentPlaybook aggregation failed due to %s, returning None.",
-                sanitized_error,
+                processed_error,
             )
-            return None
+            return AggregationGenerationOutcome("retryable_failure", cluster_playbooks)
 
     def _process_aggregation_response(
         self, response: PlaybookAggregationOutput, cluster_playbooks: list[UserPlaybook]
     ) -> AgentPlaybook | None:
+        """Compatibility view of the tagged response classification."""
+        return self._process_aggregation_response_outcome(
+            response, cluster_playbooks
+        ).playbook
+
+    def _process_aggregation_response_outcome(
+        self,
+        response: PlaybookAggregationOutput,
+        cluster_playbooks: list[UserPlaybook],
+    ) -> AggregationGenerationOutcome:
         """
         Process structured response from LLM into AgentPlaybook.
 
@@ -1498,40 +2545,43 @@ class PlaybookAggregator:
             response: Parsed PlaybookAggregationOutput from LLM
             cluster_playbooks: Cluster playbooks used only for non-user metadata
                 such as playbook name and agent version. Callers may pass
-                prompt-sanitized copies here, so this method must not read
+                prompt-preprocessed copies here, so this method must not read
                 user-authored fields from them.
 
         Returns:
             AgentPlaybook or None if no playbook should be generated
         """
         if not response:
-            return None
-        response, _placeholder_count = self._sanitize_aggregation_response(response)
+            return AggregationGenerationOutcome("retryable_failure", cluster_playbooks)
 
         structured = response.playbook
         if structured is None:
             logger.info("LLM returned null playbook (duplicate of existing)")
-            return None
+            return AggregationGenerationOutcome("semantic_null", cluster_playbooks)
 
         # content is always the LLM's freeform summary;
         # fall back to formatted structured fields for backward compatibility
         playbook_content = ensure_playbook_content(structured.content, structured)
         if not playbook_content.strip():
             logger.info("Aggregated playbook has no valid content, skipping")
-            return None
+            return AggregationGenerationOutcome("retryable_failure", cluster_playbooks)
         logger.info(
             "Aggregated playbook content (freeform): %.200s",
             playbook_content,
         )
 
-        return AgentPlaybook(
-            playbook_name=cluster_playbooks[0].playbook_name,
-            agent_version=cluster_playbooks[0].agent_version,
-            content=playbook_content,
-            trigger=structured.trigger,
-            rationale=structured.rationale,
-            playbook_status=PlaybookStatus.PENDING,
-            playbook_metadata="",
+        return AggregationGenerationOutcome(
+            "generated",
+            cluster_playbooks,
+            AgentPlaybook(
+                playbook_name=cluster_playbooks[0].playbook_name,
+                agent_version=cluster_playbooks[0].agent_version,
+                content=playbook_content,
+                trigger=structured.trigger,
+                rationale=structured.rationale,
+                playbook_status=PlaybookStatus.PENDING,
+                playbook_metadata="",
+            ),
         )
 
     def _get_playbook_aggregator_config(self) -> PlaybookAggregatorConfig | None:

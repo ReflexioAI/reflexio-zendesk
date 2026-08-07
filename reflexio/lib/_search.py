@@ -6,6 +6,8 @@ from reflexio.models.api_schema.retriever_schema import (
     GetAgentSuccessEvaluationResultsResponse,
     GetRequestsRequest,
     GetRequestsResponse,
+    GetRetrievedLearningEvaluationResultsRequest,
+    GetRetrievedLearningEvaluationResultsResponse,
     RequestData,
     Session,
     UnifiedSearchRequest,
@@ -41,9 +43,27 @@ class SearchMixin(ReflexioBase):
             request = GetAgentSuccessEvaluationResultsRequest(**request)
 
         try:
-            results = self._get_storage().get_agent_success_evaluation_results(
-                limit=request.limit or 100, agent_version=request.agent_version
-            )
+            if request.start_time or request.end_time:
+                results = (
+                    self._get_storage().get_agent_success_evaluation_results_in_window(
+                        from_ts=(
+                            int(request.start_time.timestamp())
+                            if request.start_time
+                            else 0
+                        ),
+                        to_ts=(
+                            int(request.end_time.timestamp())
+                            if request.end_time
+                            else 2**31 - 1
+                        ),
+                        limit=request.limit or 100,
+                        agent_version=request.agent_version,
+                    )
+                )
+            else:
+                results = self._get_storage().get_agent_success_evaluation_results(
+                    limit=request.limit or 100, agent_version=request.agent_version
+                )
             return GetAgentSuccessEvaluationResultsResponse(
                 success=True,
                 agent_success_evaluation_results=results,
@@ -52,6 +72,50 @@ class SearchMixin(ReflexioBase):
         except Exception as e:
             return GetAgentSuccessEvaluationResultsResponse(
                 success=False, agent_success_evaluation_results=[], msg=str(e)
+            )
+
+    def get_retrieved_learning_evaluation_results(
+        self,
+        request: GetRetrievedLearningEvaluationResultsRequest | dict,
+    ) -> GetRetrievedLearningEvaluationResultsResponse:
+        """Get per-learning retrieved-learning evaluation verdicts.
+
+        Args:
+            request (GetRetrievedLearningEvaluationResultsRequest | dict): The
+                read request (optional user/session/interaction-time filters + limit).
+
+        Returns:
+            GetRetrievedLearningEvaluationResultsResponse: Matching verdicts
+            ordered by target interaction time for time-filtered reads and by
+            result creation time otherwise.
+        """
+        if not self._is_storage_configured():
+            return GetRetrievedLearningEvaluationResultsResponse(
+                success=True, results=[], msg=STORAGE_NOT_CONFIGURED_MSG
+            )
+        if isinstance(request, dict):
+            request = GetRetrievedLearningEvaluationResultsRequest(**request)
+        try:
+            results = self._get_storage().get_retrieved_learning_evaluation_results(
+                user_id=request.user_id,
+                session_id=request.session_id,
+                from_ts=(
+                    int(request.start_time.timestamp()) if request.start_time else None
+                ),
+                to_ts=int(request.end_time.timestamp()) if request.end_time else None,
+                limit=request.limit,
+            )
+            return GetRetrievedLearningEvaluationResultsResponse(
+                success=True,
+                results=results,
+                msg=f"Found {len(results)} retrieved-learning evaluation result(s)",
+            )
+        except Exception:
+            _LOGGER.exception("Failed to read retrieved-learning evaluation results")
+            return GetRetrievedLearningEvaluationResultsResponse(
+                success=False,
+                results=[],
+                msg="Failed to read retrieved-learning evaluation results",
             )
 
     def get_requests(
@@ -79,6 +143,7 @@ class SearchMixin(ReflexioBase):
                 user_id=request.user_id,
                 request_id=request.request_id,
                 session_id=request.session_id,
+                source=request.source,
                 start_time=(
                     int(request.start_time.timestamp()) if request.start_time else None
                 ),
@@ -104,10 +169,11 @@ class SearchMixin(ReflexioBase):
                     Session(session_id=group_name, requests=request_data_list)
                 )
 
-            # Determine has_more: count total requests returned across all groups
+            # Pagination is session-based (top_k counts sessions): there may be
+            # more pages when this page filled the session limit.
             total_returned = sum(len(s.requests) for s in sessions)
             effective_limit = request.top_k or 100
-            has_more = total_returned >= effective_limit
+            has_more = len(sessions) >= effective_limit
 
             return GetRequestsResponse(
                 success=True,

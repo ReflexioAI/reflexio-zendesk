@@ -53,6 +53,7 @@ def to_interaction_view(interaction: Interaction) -> InteractionView:
         shadow_content=interaction.shadow_content,
         expert_content=interaction.expert_content,
         tools_used=interaction.tools_used,
+        retrieved_learnings=interaction.retrieved_learnings,
     )
 
 
@@ -159,6 +160,7 @@ def to_evaluation_result_view(
         number_of_correction_per_session=result.number_of_correction_per_session,
         user_turns_to_resolution=result.user_turns_to_resolution,
         is_escalated=result.is_escalated,
+        tags=result.tags,
     )
 
 

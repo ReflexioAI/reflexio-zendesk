@@ -11,6 +11,10 @@ Covers:
 7. Version-based auto-invalidation: stale entries are evicted on next get
 """
 
+import importlib
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -19,9 +23,12 @@ import pytest
 from reflexio.server.cache.reflexio_cache import (
     clear_reflexio_cache,
     get_cache_stats,
+    get_cached_request_context,
     get_reflexio,
     invalidate_reflexio_cache,
 )
+from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
+from reflexio.server.services.storage.sqlite_storage._base import SQLiteStorageBase
 from reflexio.server.tracing import configure_tracer
 
 # =============================================================================
@@ -173,6 +180,33 @@ class TestGetReflexio:
             "has_cached_version": True,
         }
         assert tracer.started[5][1] == {"cache_state": "hit"}
+
+    @patch("reflexio.server.cache.reflexio_cache.Reflexio")
+    def test_concurrent_cache_miss_constructs_once_per_key(
+        self, mock_reflexio_cls: MagicMock
+    ):
+        """Concurrent misses for one org share one construction path."""
+        first_constructor_entered = threading.Event()
+        release_constructor = threading.Event()
+        constructed = _stub_reflexio(("db", 1))
+
+        def construct(**_kwargs):
+            first_constructor_entered.set()
+            assert release_constructor.wait(timeout=2)
+            return constructed
+
+        mock_reflexio_cls.side_effect = construct
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(get_reflexio, "org-1")
+            assert first_constructor_entered.wait(timeout=2)
+            second = executor.submit(get_reflexio, "org-1")
+            release_constructor.set()
+
+            assert first.result(timeout=2) is constructed
+            assert second.result(timeout=2) is constructed
+
+        mock_reflexio_cls.assert_called_once_with(org_id="org-1", storage_base_dir=None)
 
 
 # =============================================================================
@@ -442,3 +476,194 @@ class TestVersionBasedInvalidation:
         c = get_reflexio("org-1")
         assert c is third
         assert mock_reflexio_cls.call_count == 3
+
+
+# =============================================================================
+# Env-tunable cache max size
+# =============================================================================
+
+
+def test_cache_max_size_env_override(monkeypatch: pytest.MonkeyPatch):
+    """REFLEXIO_CACHE_MAX_SIZE is read from the environment at import time."""
+    import reflexio.server.cache.reflexio_cache as cache_mod
+
+    monkeypatch.setenv("REFLEXIO_CACHE_MAX_SIZE", "400")
+    try:
+        cache_mod = importlib.reload(cache_mod)
+        assert cache_mod.REFLEXIO_CACHE_MAX_SIZE == 400
+        assert cache_mod.get_cache_stats()["max_size"] == 400
+    finally:
+        # Restore the module-global cache to its default sizing so the
+        # resized cache doesn't leak into other tests.
+        monkeypatch.delenv("REFLEXIO_CACHE_MAX_SIZE", raising=False)
+        importlib.reload(cache_mod)
+
+
+def test_cache_max_size_defaults_to_512(monkeypatch: pytest.MonkeyPatch):
+    """Without the env var set, the max size falls back to 512.
+
+    512 = 100 (outbox scheduler page) + 100 (incremental aggregation
+    page) + request-path headroom. Below the schedulers' combined
+    working set, fleet sweeps would continuously evict warm
+    request-path entries.
+    """
+    import reflexio.server.cache.reflexio_cache as cache_mod
+
+    monkeypatch.delenv("REFLEXIO_CACHE_MAX_SIZE", raising=False)
+    cache_mod = importlib.reload(cache_mod)
+    assert cache_mod.REFLEXIO_CACHE_MAX_SIZE == 512
+
+
+# =============================================================================
+# get_cached_request_context Tests
+# =============================================================================
+
+
+class TestGetCachedRequestContext:
+    """Tests for the scheduler-facing delegating accessor."""
+
+    @patch("reflexio.server.cache.reflexio_cache.Reflexio")
+    def test_returns_same_context_on_hit(self, mock_reflexio_cls: MagicMock):
+        """Repeated calls return the identical RequestContext without reconstruction."""
+        instance = _stub_reflexio(("db", 1))
+        mock_reflexio_cls.return_value = instance
+
+        first = get_cached_request_context("org-1")
+        second = get_cached_request_context("org-1")
+
+        assert first is instance.request_context
+        assert first is second
+        mock_reflexio_cls.assert_called_once_with(org_id="org-1", storage_base_dir=None)
+
+    @patch("reflexio.server.cache.reflexio_cache.Reflexio")
+    def test_shares_cache_entry_with_get_reflexio(self, mock_reflexio_cls: MagicMock):
+        """The accessor and get_reflexio hit the same entry — one construction total."""
+        instance = _stub_reflexio(("db", 1))
+        mock_reflexio_cls.return_value = instance
+
+        reflexio = get_reflexio("org-1")
+        context = get_cached_request_context("org-1")
+
+        assert context is reflexio.request_context
+        mock_reflexio_cls.assert_called_once()
+
+    @patch("reflexio.server.cache.reflexio_cache.Reflexio")
+    def test_evicts_on_version_change(self, mock_reflexio_cls: MagicMock):
+        """A config-version bump yields a fresh context on the next call."""
+        first = _stub_reflexio(("db", 1))
+        second = _stub_reflexio(("db", 2))
+        mock_reflexio_cls.side_effect = [first, second]
+
+        a = get_cached_request_context("org-1")
+        first.current_config_version.return_value = ("db", 2)
+
+        b = get_cached_request_context("org-1")
+        assert a is not b
+        assert b is second.request_context
+        assert mock_reflexio_cls.call_count == 2
+
+    @patch("reflexio.server.cache.reflexio_cache.Reflexio")
+    def test_explicit_invalidation_forces_reconstruction(
+        self, mock_reflexio_cls: MagicMock
+    ):
+        """invalidate_reflexio_cache also covers contexts handed to schedulers."""
+        first = _stub_reflexio(("db", 1))
+        second = _stub_reflexio(("db", 1))
+        mock_reflexio_cls.side_effect = [first, second]
+
+        a = get_cached_request_context("org-1")
+        invalidate_reflexio_cache("org-1")
+        b = get_cached_request_context("org-1")
+
+        assert a is not b
+        assert mock_reflexio_cls.call_count == 2
+
+    @patch("reflexio.server.cache.reflexio_cache.Reflexio")
+    def test_passes_storage_base_dir(self, mock_reflexio_cls: MagicMock):
+        """storage_base_dir is forwarded to the underlying get_reflexio key."""
+        instance = _stub_reflexio(("db", 1))
+        mock_reflexio_cls.return_value = instance
+
+        context = get_cached_request_context("org-1", storage_base_dir="/custom/dir")
+
+        assert context is instance.request_context
+        mock_reflexio_cls.assert_called_once_with(
+            org_id="org-1", storage_base_dir="/custom/dir"
+        )
+
+    @patch("reflexio.server.cache.reflexio_cache.Reflexio")
+    def test_concurrent_calls_construct_once(self, mock_reflexio_cls: MagicMock):
+        """Four threads racing on one cold key share a single construction."""
+        constructed = _stub_reflexio(("db", 1))
+        first_constructor_entered = threading.Event()
+        release_constructor = threading.Event()
+
+        def construct(**_kwargs):
+            first_constructor_entered.set()
+            assert release_constructor.wait(timeout=2)
+            return constructed
+
+        mock_reflexio_cls.side_effect = construct
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(get_cached_request_context, "org-1") for _ in range(4)
+            ]
+            assert first_constructor_entered.wait(timeout=2)
+            release_constructor.set()
+            results = [future.result(timeout=2) for future in futures]
+
+        assert all(result is constructed.request_context for result in results)
+        mock_reflexio_cls.assert_called_once_with(org_id="org-1", storage_base_dir=None)
+
+    def test_different_orgs_serialize_shared_sqlite_initialization(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cold cache misses sharing one SQLite file cannot migrate concurrently."""
+        import reflexio.server.cache.reflexio_cache as cache_mod
+
+        storage_base_dir = str(tmp_path)
+        org_ids: list[str] = []
+        cache_locks: set[int] = set()
+        for index in range(256):
+            org_id = f"org-{index}"
+            lock = cache_mod._get_construction_lock((org_id, storage_base_dir))
+            if id(lock) not in cache_locks:
+                org_ids.append(org_id)
+                cache_locks.add(id(lock))
+            if len(org_ids) == 4:
+                break
+        assert len(org_ids) == 4
+
+        active = 0
+        max_active = 0
+        counter_lock = threading.Lock()
+
+        def slow_migrate(_self: SQLiteStorageBase) -> bool:
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with counter_lock:
+                active -= 1
+            return True
+
+        monkeypatch.setattr(SQLiteStorageBase, "migrate", slow_migrate)
+        start = threading.Barrier(len(org_ids))
+
+        def construct(org_id: str):
+            start.wait(timeout=2)
+            return get_cached_request_context(org_id, storage_base_dir)
+
+        with ThreadPoolExecutor(max_workers=len(org_ids)) as executor:
+            contexts = list(executor.map(construct, org_ids))
+
+        try:
+            assert max_active == 1
+            assert len({id(context.storage) for context in contexts}) == len(org_ids)
+        finally:
+            for context in contexts:
+                storage = context.storage
+                assert isinstance(storage, SQLiteStorage)
+                storage.conn.close()

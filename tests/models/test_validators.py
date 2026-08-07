@@ -494,6 +494,24 @@ class TestNumericConstraints:
                 sampling_rate=1.5,
             )
 
+    @pytest.mark.parametrize("rate", [-0.1, 1.1])
+    def test_evaluation_only_sampling_rate_range(self, rate: float):
+        """evaluation_only_sampling_rate must be 0.0-1.0 when set."""
+        with pytest.raises(ValidationError):
+            AgentSuccessConfig(
+                success_definition_prompt="Check success",
+                evaluation_only_sampling_rate=rate,
+            )
+
+    @pytest.mark.parametrize("rate", [0.0, 1.0])
+    def test_evaluation_only_sampling_rate_accepts_bounds(self, rate: float):
+        config = AgentSuccessConfig(
+            success_definition_prompt="Check success",
+            evaluation_only_sampling_rate=rate,
+        )
+
+        assert config.evaluation_only_sampling_rate == rate
+
     def test_period_stats_non_negative(self):
         """PeriodStats counts must be >= 0."""
         with pytest.raises(ValidationError):
@@ -523,6 +541,11 @@ class TestNumericConstraints:
         """TimeSeriesDataPoint.timestamp must be > 0."""
         with pytest.raises(ValidationError):
             TimeSeriesDataPoint(timestamp=0, value=5)
+
+    def test_timeseries_count_non_negative(self):
+        """TimeSeriesDataPoint.count must be >= 0 when provided."""
+        with pytest.raises(ValidationError):
+            TimeSeriesDataPoint(timestamp=1000, value=5, count=-1)
 
     def test_playbook_aggregator_config_constraints(self):
         """PlaybookAggregatorConfig thresholds must be >= 1."""
@@ -1131,13 +1154,6 @@ class TestBackwardCompatibility:
         assert config.direction_overlap_threshold == 0.6
 
     def test_aggregator_config_clustering_similarity_default(self):
-        """PlaybookAggregatorConfig: clustering_similarity defaults to 0.3.
-
-        0.3 is a compromise that works for both cloud embeddings (OpenAI
-        text-embedding-3-*, Gemini) and the local zero-padded MiniLM-L6-v2
-        embedder. The previous default of 0.5 was tight enough that local
-        embeddings (which have lower spread due to 384->512 zero-padding)
-        produced 0 clusters even for thematically-related content.
-        """
+        """Omitted similarity is resolved from the active embedding model."""
         config = PlaybookAggregatorConfig()
-        assert config.clustering_similarity == 0.3
+        assert config.clustering_similarity is None

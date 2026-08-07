@@ -15,11 +15,14 @@ Flags mirror the subset of ``uvicorn`` CLI options that
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import uvicorn
 
 from reflexio.server.uvicorn_logging import UVICORN_LOG_CONFIG
+
+_KEEP_ALIVE_SECONDS = 30
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -100,6 +103,9 @@ def main(argv: list[str] | None = None) -> None:
         )
         raise SystemExit(2)
 
+    # Record the configured worker count for per-worker startup diagnostics.
+    os.environ["REFLEXIO_SERVER_WORKERS"] = str(1 if args.reload else args.workers)
+
     if args.reload:
         uvicorn.run(
             args.app,
@@ -107,6 +113,7 @@ def main(argv: list[str] | None = None) -> None:
             port=args.port,
             reload=True,
             reload_includes=args.reload_include or None,
+            timeout_keep_alive=_KEEP_ALIVE_SECONDS,
             log_config=UVICORN_LOG_CONFIG,
         )
         return
@@ -124,6 +131,7 @@ def main(argv: list[str] | None = None) -> None:
         limit_max_requests=limit_max_requests,
         limit_max_requests_jitter=args.max_requests_jitter,
         timeout_graceful_shutdown=args.graceful_shutdown_sec,
+        timeout_keep_alive=_KEEP_ALIVE_SECONDS,
         log_config=UVICORN_LOG_CONFIG,
     )
 

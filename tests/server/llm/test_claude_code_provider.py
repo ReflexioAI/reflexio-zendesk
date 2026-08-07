@@ -29,6 +29,14 @@ def _stream_json(result_text: str) -> str:
     )
 
 
+def _stream_json_with_model(result_text: str, model: str) -> str:
+    return (
+        json.dumps({"type": "assistant", "message": {"model": model}})
+        + "\n"
+        + _stream_json(result_text)
+    )
+
+
 @pytest.fixture(autouse=True)
 def _reset_module_state() -> None:
     """Each test starts with fresh registration and warn-once flags."""
@@ -169,12 +177,18 @@ class TestSplitSystemAndDialogue:
 
 class TestClaudeCodeLLMCompletion:
     def _mock_cli(
-        self, monkeypatch: pytest.MonkeyPatch, result_text: str = "ok"
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        result_text: str = "ok",
+        served_model: str | None = None,
     ) -> MagicMock:
         """Mock subprocess.run to return a stream-json NDJSON body with one result event."""
-        mock_run = MagicMock(
-            return_value=_fake_completed_process(_stream_json(result_text))
+        stream = (
+            _stream_json_with_model(result_text, served_model)
+            if served_model
+            else _stream_json(result_text)
         )
+        mock_run = MagicMock(return_value=_fake_completed_process(stream))
         monkeypatch.setattr(ccp.subprocess, "run", mock_run)
         monkeypatch.setattr(ccp, "_resolve_cli_path", lambda: "/usr/local/bin/claude")
         return mock_run
@@ -182,7 +196,11 @@ class TestClaudeCodeLLMCompletion:
     def test_basic_completion_shapes_model_response(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        self._mock_cli(monkeypatch, result_text="hello world")
+        self._mock_cli(
+            monkeypatch,
+            result_text="hello world",
+            served_model="claude-sonnet-5-20260701",
+        )
         llm = ClaudeCodeLLM()
 
         response = llm.completion(
@@ -192,10 +210,73 @@ class TestClaudeCodeLLMCompletion:
 
         assert response.choices[0].message.content == "hello world"  # type: ignore[union-attr]
         assert response.model == "claude-code/default"
+        assert (
+            response._hidden_params["reflexio_served_model"]
+            == "claude-sonnet-5-20260701"
+        )
+        assert response._hidden_params["reflexio_provider"] == "claude-code"
+        assert response._hidden_params["reflexio_cli_binary"] == "claude"
         # stream-json does not surface usage tokens at terminal event.
         assert response.usage.prompt_tokens == 0  # type: ignore[attr-defined]
         assert response.usage.completion_tokens == 0  # type: ignore[attr-defined]
         assert response.usage.total_tokens == 0  # type: ignore[attr-defined]
+
+    def test_completion_forwards_terminal_route_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stream = (
+            '{"type":"result","result":"hello","model":"MiniMax-M3",'
+            '"provider":"minimax"}\n'
+        )
+        monkeypatch.setattr(
+            ccp.subprocess,
+            "run",
+            MagicMock(return_value=_fake_completed_process(stream)),
+        )
+        monkeypatch.setattr(ccp, "_resolve_cli_path", lambda: "/usr/local/bin/claude")
+
+        response = ClaudeCodeLLM().completion(
+            model="claude-code/default",
+            messages=[{"role": "user", "content": "ping"}],
+        )
+
+        assert response.model == "claude-code/default"
+        assert response._hidden_params["reflexio_served_model"] == "MiniMax-M3"
+        assert response._hidden_params["reflexio_served_provider"] == "minimax"
+
+    def test_tool_call_response_keeps_served_model_and_binary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mock_cli(
+            monkeypatch,
+            result_text='{"tool":"finish","args":{"answer":"done"}}',
+            served_model="claude-sonnet-5-20260701",
+        )
+
+        response = ClaudeCodeLLM().completion(
+            model="claude-code/default",
+            messages=[{"role": "user", "content": "finish"}],
+            optional_params={
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "finish",
+                            "description": "Finish",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ]
+            },
+        )
+
+        assert response.model == "claude-code/default"
+        assert (
+            response._hidden_params["reflexio_served_model"]
+            == "claude-sonnet-5-20260701"
+        )
+        assert response._hidden_params["reflexio_provider"] == "claude-code"
+        assert response._hidden_params["reflexio_cli_binary"] == "claude"
 
     def test_uses_stream_json_output_format(
         self, monkeypatch: pytest.MonkeyPatch
@@ -212,22 +293,30 @@ class TestClaudeCodeLLMCompletion:
         cmd = mock_run.call_args.args[0]
         fmt_idx = cmd.index("--output-format")
         assert cmd[fmt_idx + 1] == "stream-json"
+        model_idx = cmd.index("--model")
+        assert cmd[model_idx + 1] == "claude-sonnet-5"
         # stream-json requires --verbose to emit events.
         assert "--verbose" in cmd
 
     def test_sets_max_retries_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """CLAUDE_CODE_MAX_RETRIES=3 must be passed in the subprocess env."""
+        """CLI subprocess env and stdin encoding are pinned for Windows safety."""
         mock_run = self._mock_cli(monkeypatch)
+        monkeypatch.setattr(ccp, "_is_windows", lambda: True)
         llm = ClaudeCodeLLM()
 
         llm.completion(
             model="claude-code/default",
-            messages=[{"role": "user", "content": "hi"}],
+            messages=[{"role": "user", "content": "Use an em dash — in the prompt."}],
         )
 
-        env = mock_run.call_args.kwargs["env"]
+        kwargs = mock_run.call_args.kwargs
+        env = kwargs["env"]
         assert env["CLAUDE_CODE_MAX_RETRIES"] == "3"
         assert env["CLAUDE_SMART_INTERNAL"] == "1"
+        assert kwargs["text"] is True
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
+        assert kwargs["input"] == "User: Use an em dash — in the prompt."
 
     def test_system_message_goes_to_append_system_prompt_flag(
         self, monkeypatch: pytest.MonkeyPatch
@@ -249,6 +338,29 @@ class TestClaudeCodeLLMCompletion:
         assert cmd[flag_idx + 1] == "Be terse."
         # User turn goes through stdin, not argv.
         assert mock_run.call_args.kwargs["input"] == "User: hello"
+        assert mock_run.call_args.kwargs["errors"] == "strict"
+
+    def test_large_windows_system_prompt_moves_to_stdin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_run = self._mock_cli(monkeypatch)
+        monkeypatch.setattr(ccp, "_is_windows", lambda: True)
+        llm = ClaudeCodeLLM()
+        long_system_prompt = "Use JSON only. " + ("schema-field " * 900)
+
+        llm.completion(
+            model="claude-code/default",
+            messages=[
+                {"role": "system", "content": long_system_prompt},
+                {"role": "user", "content": "Extract playbooks."},
+            ],
+        )
+
+        cmd = mock_run.call_args.args[0]
+        assert "--append-system-prompt" not in cmd
+        assert mock_run.call_args.kwargs["input"] == (
+            f"{long_system_prompt}\n\nUser: Extract playbooks."
+        )
 
     def test_no_system_message_omits_flag(
         self, monkeypatch: pytest.MonkeyPatch
@@ -333,6 +445,38 @@ class TestClaudeCodeLLMCompletion:
         flag_idx = cmd.index("--append-system-prompt")
         assert '"x"' in cmd[flag_idx + 1]
 
+    def test_large_windows_response_format_schema_moves_to_claude_stdin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_run = self._mock_cli(monkeypatch, result_text="{}")
+        monkeypatch.setattr(ccp, "_is_windows", lambda: True)
+        llm = ClaudeCodeLLM()
+        properties = {
+            f"field_{idx}": {"type": "string", "description": "required output"}
+            for idx in range(120)
+        }
+
+        llm.completion(
+            model="claude-code/default",
+            messages=[{"role": "user", "content": "Extract"}],
+            optional_params={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "schema": {"type": "object", "properties": properties}
+                    },
+                }
+            },
+        )
+
+        cmd = mock_run.call_args.args[0]
+        stdin = mock_run.call_args.kwargs["input"]
+        assert "--append-system-prompt" not in cmd
+        assert "You MUST respond with a single JSON object" in stdin
+        assert '"field_119"' in stdin
+        assert "\n\nUser: Extract" in stdin
+        assert "## Task" not in stdin
+
     def test_unsupported_params_warn_once(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -377,6 +521,33 @@ class TestClaudeCodeLLMCompletion:
                 model="claude-code/default",
                 messages=[{"role": "user", "content": "hi"}],
             )
+
+    def test_non_zero_exit_includes_stdout_diagnostic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            ccp.subprocess,
+            "run",
+            MagicMock(
+                return_value=_fake_completed_process(
+                    stdout=_stream_json("oauth token has expired"),
+                    stderr="",
+                    returncode=1,
+                )
+            ),
+        )
+        monkeypatch.setattr(ccp, "_resolve_cli_path", lambda: "/usr/local/bin/claude")
+        llm = ClaudeCodeLLM()
+
+        with pytest.raises(ClaudeCodeCLIError) as exc:
+            llm.completion(
+                model="claude-code/default",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        message = str(exc.value)
+        assert "stdout='oauth token has expired'" in message
+        assert "stderr=''" in message
 
     def test_timeout_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -446,6 +617,7 @@ class TestClaudeCodeLLMCompletion:
 
         mock_run = MagicMock(side_effect=fake_run)
         monkeypatch.setenv("CLAUDE_SMART_HOST", "codex")
+        monkeypatch.setattr(ccp, "_is_windows", lambda: True)
         monkeypatch.setattr(ccp.subprocess, "run", mock_run)
         monkeypatch.setattr(ccp, "_resolve_cli_path", lambda: "/usr/local/bin/codex")
 
@@ -453,7 +625,7 @@ class TestClaudeCodeLLMCompletion:
             model="claude-code/default",
             messages=[
                 {"role": "system", "content": "Be terse."},
-                {"role": "user", "content": "ping"},
+                {"role": "user", "content": "ping — now"},
             ],
         )
 
@@ -461,9 +633,85 @@ class TestClaudeCodeLLMCompletion:
         assert cmd[:2] == ["/usr/local/bin/codex", "exec"]
         assert "-p" not in cmd
         assert "--append-system-prompt" not in cmd
-        assert mock_run.call_args.kwargs["input"] == "Be terse.\n\n## Task\nUser: ping"
-        assert mock_run.call_args.kwargs["env"]["CLAUDE_SMART_HOST"] == "codex"
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs["text"] is True
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
+        assert kwargs["input"] == "Be terse.\n\n## Task\nUser: ping — now"
+        assert kwargs["env"]["CLAUDE_SMART_HOST"] == "codex"
         assert response.choices[0].message.content == "codex reply"  # type: ignore[union-attr]
+        assert response.model == "claude-code/default"
+        assert response._hidden_params["reflexio_provider"] == "claude-code"
+        assert response._hidden_params["reflexio_cli_binary"] == "codex"
+
+    def test_windows_extensionless_cli_override_prefers_adjacent_cmd(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        bridge = tmp_path / "opencode-claude-compat"
+        bridge_cmd = tmp_path / "opencode-claude-compat.cmd"
+        bridge_cmd.write_text("@echo off\n")
+        bridge_cmd.chmod(0o755)
+
+        monkeypatch.setattr(ccp, "_is_windows", lambda: True)
+        monkeypatch.setenv(ccp.ENV_ENABLE, "1")
+        monkeypatch.setenv(ccp._ENV_CLI_PATH, str(bridge))
+
+        assert ccp._resolve_cli_path() == str(bridge_cmd)  # noqa: SLF001
+        assert is_claude_code_available()
+
+    @pytest.mark.parametrize("suffix", [".exe", ".bat"])
+    def test_windows_extensionless_cli_override_tries_common_shims(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, suffix: str
+    ) -> None:
+        bridge = tmp_path / "claude"
+        bridge_shim = tmp_path / f"claude{suffix}"
+        bridge_shim.write_text("shim\n")
+        bridge_shim.chmod(0o755)
+
+        monkeypatch.setattr(ccp, "_is_windows", lambda: True)
+        monkeypatch.setenv(ccp.ENV_ENABLE, "1")
+        monkeypatch.setenv(ccp._ENV_CLI_PATH, str(bridge))
+
+        assert ccp._resolve_cli_path() == str(bridge_shim)  # noqa: SLF001
+
+    def test_windows_extensionless_cli_override_skips_powershell_shim(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        bridge = tmp_path / "claude"
+        bridge_ps1 = tmp_path / "claude.ps1"
+        bridge_cmd = tmp_path / "claude.cmd"
+        bridge_ps1.write_text("Write-Output shim\n")
+        bridge_cmd.write_text("@echo off\n")
+        bridge_ps1.chmod(0o755)
+        bridge_cmd.chmod(0o755)
+
+        monkeypatch.setattr(ccp, "_is_windows", lambda: True)
+        monkeypatch.setenv(ccp.ENV_ENABLE, "1")
+        monkeypatch.setenv(ccp._ENV_CLI_PATH, str(bridge))
+        monkeypatch.setenv("PATHEXT", "PS1;.CMD")
+
+        assert ccp._resolve_cli_path() == str(bridge_cmd)  # noqa: SLF001
+
+    def test_windows_extensionless_cli_override_executes_adjacent_cmd(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        bridge = tmp_path / "opencode-claude-compat"
+        bridge_cmd = tmp_path / "opencode-claude-compat.cmd"
+        bridge_cmd.write_text("@echo off\n")
+        bridge_cmd.chmod(0o755)
+        mock_run = MagicMock(return_value=_fake_completed_process(_stream_json("ok")))
+
+        monkeypatch.setattr(ccp, "_is_windows", lambda: True)
+        monkeypatch.setenv(ccp._ENV_CLI_PATH, str(bridge))
+        monkeypatch.setattr(ccp.subprocess, "run", mock_run)
+
+        ClaudeCodeLLM().completion(
+            model="claude-code/default",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd[0] == str(bridge_cmd)
 
     def test_codex_host_uses_compat_wrapper_with_claude_flags(
         self, monkeypatch: pytest.MonkeyPatch

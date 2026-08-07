@@ -86,42 +86,11 @@ def test_apply_skips_archive_when_incumbent_not_current():
         assert new_id == -1
 
 
-def test_apply_expect_current_false_archives():
-    """With expect_current=False, new playbook is inserted and incumbent is archived."""
-    from reflexio.server.services.playbook.playbook_edit_apply import (
-        apply_playbook_edit,
-    )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        s = _storage(tmp)
-        with patch.object(SQLiteStorage, "_get_embedding", return_value=[0.0] * 512):
-            old = _playbook(content="old")
-            s.save_user_playbooks([old])
-            old_id = old.user_playbook_id
-            assert old_id > 0
-
-            new = _playbook(content="new")
-            new_id = apply_playbook_edit(
-                s,
-                incumbent_id=old_id,
-                new_playbook=new,
-                source="offline_optimizer",
-                request_id="run-abc",
-            )
-        assert new_id > 0
-
-        # Only new_id should be CURRENT (status=None); old_id should be archived
-        all_pbs = s.get_user_playbooks(user_id="u1")
-        current_ids = {p.user_playbook_id for p in all_pbs if p.status is None}
-        assert new_id in current_ids
-        assert old_id not in current_ids
-
-
-def test_apply_expect_current_false_returns_minus1_and_no_orphan():
+def test_apply_returns_minus1_and_leaves_no_orphan_on_lost_race():
     """When incumbent is already archived, supersede_record returns False.
 
-    The new code deletes the just-inserted successor so no orphan CURRENT row
-    remains — the -1 return value indicates the lost race, not an orphan.
+    The transaction rolls back the provisional successor and its create event,
+    so the -1 return value indicates the lost race, not an orphan.
     """
     from reflexio.server.services.playbook.playbook_edit_apply import (
         apply_playbook_edit,
@@ -137,6 +106,9 @@ def test_apply_expect_current_false_returns_minus1_and_no_orphan():
 
             # Archive first so supersede_record will return False
             s.archive_user_playbook_by_id(user_id="u1", user_playbook_id=old_id)
+            event_ids_before = {
+                event.event_id for event in s.get_lineage_events(org_id="org_apply_1")
+            }
 
             new = _playbook(content="new")
             new_id = apply_playbook_edit(
@@ -146,13 +118,16 @@ def test_apply_expect_current_false_returns_minus1_and_no_orphan():
                 source="offline_optimizer",
                 request_id="run-abc",
             )
-        # supersede_record returned False → -1, successor cleaned up (no orphan)
+        # supersede_record returned False → -1, transaction rolled back.
         assert new_id == -1
 
         # No orphan: the inserted successor was deleted
         all_pbs = s.get_user_playbooks(user_id="u1")
         current_ids = {p.user_playbook_id for p in all_pbs if p.status is None}
         assert len(current_ids) == 0
+        assert {
+            event.event_id for event in s.get_lineage_events(org_id="org_apply_1")
+        } == event_ids_before
 
 
 def test_apply_raises_on_empty_request_id_before_write():
@@ -220,7 +195,7 @@ def test_apply_raises_on_empty_or_none_request_id(bad_request_id):
 def test_apply_lineage_event_carries_operation_run_id():
     """apply_playbook_edit records the operation-run request_id on the revise event.
 
-    The lineage event must carry the operation request_id (the reflection run id),
+    The lineage event must carry the operation request_id,
     NOT the incumbent's birth request_id.  This enables correct run-correlation.
     """
     from reflexio.server.services.playbook.playbook_edit_apply import (
@@ -235,13 +210,13 @@ def test_apply_lineage_event_carries_operation_run_id():
             old_id = old.user_playbook_id
             assert old_id > 0
 
-            operation_run_id = "reflection_run_xyz"
+            operation_run_id = "optimizer_run_xyz"
             new = _playbook(content="new")
             new_id = apply_playbook_edit(
                 s,
                 incumbent_id=old_id,
                 new_playbook=new,
-                source="reflection",
+                source="offline_optimizer",
                 request_id=operation_run_id,
             )
         assert new_id > 0
@@ -249,9 +224,9 @@ def test_apply_lineage_event_carries_operation_run_id():
         events = s.get_lineage_events(
             entity_type="user_playbook", entity_id=str(new_id)
         )
-        assert len(events) == 1
-        assert events[0].op == "revise"
-        assert events[0].request_id == operation_run_id, (
+        assert [event.op for event in events] == ["create", "revise"]
+        revise_event = events[1]
+        assert revise_event.request_id == operation_run_id, (
             f"lineage event must carry the operation run id {operation_run_id!r}, "
             f"not the incumbent's birth request_id {old.request_id!r}"
         )

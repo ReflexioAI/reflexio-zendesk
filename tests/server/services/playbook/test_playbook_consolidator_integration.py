@@ -30,6 +30,7 @@ import pytest
 
 from reflexio.models.api_schema.service_schemas import UserPlaybook
 from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.llm._litellm_types import CompletionResult, ModelProvenance
 from reflexio.server.llm.litellm_client import LiteLLMClient, LiteLLMConfig
 from reflexio.server.services.playbook.components.consolidator import (
     DifferentiateDecision,
@@ -81,7 +82,18 @@ def request_context(sqlite_storage, temp_storage_dir, worker_id):
 @pytest.fixture
 def mock_llm_client():
     """Mock LiteLLM client. ``generate_chat_response`` is set per-test."""
-    return MagicMock(spec=LiteLLMClient)
+    client = MagicMock(spec=LiteLLMClient)
+
+    def _generate_with_provenance(*args, **kwargs):
+        value = client.generate_chat_response(*args, **kwargs)
+        if isinstance(value, CompletionResult):
+            return value
+        return CompletionResult(value, ModelProvenance())
+
+    client.generate_chat_response_with_provenance.side_effect = (
+        _generate_with_provenance
+    )
+    return client
 
 
 @pytest.fixture
@@ -208,7 +220,7 @@ def _run_consolidator(
     ``merge_records`` is covered by
     ``test_consolidation_lineage_integration.py``.
 
-    Patches ``_retrieve_existing_playbooks`` so the LLM-mock decisions can
+    Patches ``retrieve_existing_playbooks`` so the LLM-mock decisions can
     reference EXISTING-N ids by position without depending on the search
     backend's ranking.
 
@@ -229,7 +241,7 @@ def _run_consolidator(
     with (
         patch.object(
             consolidator,
-            "_retrieve_existing_playbooks",
+            "retrieve_existing_playbooks",
             return_value=existing_playbooks,
         ),
         patch.dict("os.environ", {"MOCK_LLM_RESPONSE": "false"}),
@@ -913,9 +925,9 @@ def _make_completion_response(content: str) -> MagicMock:
     resp.usage.prompt_tokens_details = None
     resp.usage.cache_creation_input_tokens = None
     resp.usage.cache_read_input_tokens = None
-    # ``_emit_fallback_observability`` reads ``_hidden_params`` and falls back
-    # to ``response.model``; leave both unset so it short-circuits without
-    # tripping the Sentry path.
+    # Fallback observability is now loop-driven (``_emit_fallback_signal`` keyed
+    # on the walk's rung index), so ``_hidden_params`` / ``model`` are no longer
+    # read; leave them harmlessly set for shape parity with real responses.
     resp._hidden_params = {}
     resp.model = None
     return resp
@@ -944,42 +956,41 @@ def _build_real_client_consolidator(
 
     Returns:
         PlaybookConsolidator: Consolidator whose ``client`` is a real
-            ``LiteLLMClient``; ``model_name`` is fixed to ``"gpt-test"`` via
-            the same ``SiteVarManager`` patch used by the file's shared
-            fixture so the apply path is comparable.
+            ``LiteLLMClient`` and whose request model matches the supplied
+            config so structured-output fallback compatibility is exercised
+            against the intended primary model.
     """
     client = LiteLLMClient(config)
     with patch(
         "reflexio.server.services.deduplication_utils.SiteVarManager"
     ) as mock_svm:
         mock_svm.return_value.get_site_var.return_value = {
-            "default_generation_model_name": "gpt-test"
+            "default_generation_model_name": config.model
         }
         return PlaybookConsolidator(request_context=request_context, llm_client=client)
 
 
 class TestConsolidatorNativeFallbackEndToEnd:
-    """End-to-end: ``_consolidation_decisions`` forwards the fallback list into ``litellm.completion``.
+    """End-to-end: ``_consolidation_decisions`` runs through the reflexio-owned
+    per-rung fallback walk.
 
     The consolidator was the original production incident site (structured
-    output parse path on top of native fallback; same-model retry of a hung
+    output parse path on top of the fallback ladder; same-model retry of a hung
     primary is disabled — PYTHON-FASTAPI-62), so this is the highest-fidelity
-    exercise of the plumbing. Pinning both the "env var on => fallback
-    configured" and "env var unset => no fallback" branches at this level
-    prevents regressions where the plumbing works in isolation but breaks once
-    a structured-output wrapper sits on top.
+    exercise of the plumbing. Pinning both the "env var on => fallback rung
+    reachable" and "env var unset => no fallback" branches at this level prevents
+    regressions where the plumbing works in isolation but breaks once a
+    structured-output wrapper sits on top. The invariant: ``num_retries=0`` on
+    every rung and NO ``fallbacks`` kwarg ever handed to litellm.
     """
 
-    def test_consolidator_calls_litellm_with_fallback_configured(
-        self, request_context, monkeypatch
-    ):
+    def test_consolidator_advances_to_fallback_rung(self, request_context, monkeypatch):
         """Production-style: ``REFLEXIO_LLM_FALLBACK_MODELS`` set globally.
 
-        Asserts the consolidator's call into ``litellm.completion`` carries
-        ``num_retries=0`` (forced on the completion path so a hung primary
-        can't be same-model-retried before the fallback — PYTHON-FASTAPI-62)
-        and ``fallbacks=["gpt-5.4-mini"]`` end-to-end — proving native fallback
-        delegation survives the structured-output parse wrapper.
+        When the primary fails, the owned walk advances to the configured
+        fallback rung and parses its response — proving the ladder survives the
+        structured-output/validator wrapper. Every rung carries ``num_retries=0``
+        and none carries a ``fallbacks`` kwarg (PYTHON-FASTAPI-62).
         """
         monkeypatch.setenv("REFLEXIO_LLM_FALLBACK_MODELS", "gpt-5.4-mini")
         # LiteLLMConfig.fallback_models is a default_factory that reads
@@ -992,10 +1003,19 @@ class TestConsolidatorNativeFallbackEndToEnd:
             config=LiteLLMConfig(model="minimax/MiniMax-M3"),
         )
 
-        captured: dict[str, Any] = {}
+        from litellm.exceptions import APIConnectionError
+
+        calls: list[dict[str, Any]] = []
 
         def _fake(**params: Any) -> MagicMock:
-            captured.update(params)
+            # Fail the FIRST rung (the consolidator resolves its own primary via
+            # site vars, so match on call order rather than a hard-coded name),
+            # then serve the configured fallback rung.
+            calls.append(params)
+            if len(calls) == 1:
+                raise APIConnectionError(
+                    message="primary down", llm_provider="x", model="m"
+                )
             return _make_completion_response('{"decisions": []}')
 
         monkeypatch.setattr("litellm.completion", _fake)
@@ -1008,21 +1028,22 @@ class TestConsolidatorNativeFallbackEndToEnd:
         assert isinstance(result, PlaybookConsolidationOutput)
         assert result.decisions == []
 
-        # Linchpin: fallbacks forwarded; num_retries forced to 0 so a hung
-        # primary can't be same-model-retried before reaching the fallback
-        # (PYTHON-FASTAPI-62).
-        assert captured.get("num_retries") == 0
-        assert captured.get("fallbacks") == ["gpt-5.4-mini"]
+        # The walk advanced primary -> fallback (2 rungs); num_retries forced to 0
+        # on each and no ``fallbacks`` kwarg delegated to litellm (PYTHON-FASTAPI-62).
+        assert len(calls) == 2
+        assert calls[1]["model"] == "gpt-5.4-mini"
+        assert all(c.get("num_retries") == 0 for c in calls)
+        assert all("fallbacks" not in c for c in calls)
 
     def test_consolidator_uses_no_fallback_when_env_unset(
         self, request_context, monkeypatch
     ):
-        """Local / OSS safety contract: no env var => no fallback configured.
+        """Local / OSS safety contract: no env var => no fallback rung.
 
         With ``REFLEXIO_LLM_FALLBACK_MODELS`` unset and no explicit
-        construction-arg, ``litellm.completion`` MUST NOT receive a
-        ``fallbacks`` kwarg. This preserves the "never silently route to an
-        unintended provider" guarantee for local reflexio and the
+        construction-arg, ``litellm.completion`` MUST NOT receive a ``fallbacks``
+        kwarg and the primary serves alone. This preserves the "never silently
+        route to an unintended provider" guarantee for local reflexio and the
         claude-smart integration documented in ``LiteLLMConfig``.
         """
         monkeypatch.delenv("REFLEXIO_LLM_FALLBACK_MODELS", raising=False)
@@ -1046,6 +1067,6 @@ class TestConsolidatorNativeFallbackEndToEnd:
         assert isinstance(result, PlaybookConsolidationOutput)
         assert result.decisions == []
         # ``num_retries`` is forced to 0 on the completion path; ``fallbacks``
-        # must be absent so litellm has no fallback chain to traverse.
+        # must be absent — the walk owns advancement, not litellm.
         assert captured.get("num_retries") == 0
         assert "fallbacks" not in captured

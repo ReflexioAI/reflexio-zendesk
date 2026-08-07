@@ -10,7 +10,9 @@ from reflexio.models.api_schema.domain.entities import UserPlaybook
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.models.api_schema.service_schemas import (
     Interaction,
+    ManualPlaybookGenerationRequest,
     Request,
+    RerunPlaybookGenerationRequest,
 )
 from reflexio.models.config_schema import (
     Config,
@@ -19,6 +21,7 @@ from reflexio.models.config_schema import (
     StorageConfigSQLite,
 )
 from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.llm._litellm_types import ModelProvenance
 from reflexio.server.llm.litellm_client import LiteLLMClient, LiteLLMConfig
 from reflexio.server.services.playbook.playbook_service_utils import (
     PlaybookGenerationRequest,
@@ -27,7 +30,6 @@ from reflexio.server.services.playbook.service import (
     PlaybookGenerationService,
     PlaybookGenerationServiceConfig,
 )
-from reflexio.server.services.playbook.user_detail_stripping import PassthroughStripper
 
 
 def create_request_interaction_data_model(
@@ -77,114 +79,118 @@ def _service_for_inline_aggregation(configurator: Any) -> PlaybookGenerationServ
     return service
 
 
-def test_inline_aggregation_default_path_does_not_inject_stripper():
+def test_inline_aggregation_default_path_schedules_durably():
     configurator = MagicMock()
     configurator.get_config.return_value = _aggregation_enabled_config()
     service = _service_for_inline_aggregation(configurator)
-    created_kwargs: list[dict[str, Any]] = []
-
-    class FakeAggregator:
-        def __init__(self, **kwargs: Any) -> None:
-            created_kwargs.append(kwargs)
-
-        def run(self, _request: Any) -> dict[str, int]:
-            return {"playbooks_generated": 0}
-
-    with (
-        patch(
-            "reflexio.server.services.playbook.service.PlaybookAggregator",
-            FakeAggregator,
-        ),
-        patch(
-            "reflexio.server.services.playbook.service.run_with_operation_limit",
-            side_effect=lambda **kwargs: kwargs["fn"](),
-        ),
-        patch(
-            "reflexio.server.services.playbook.user_detail_stripping.create_aggregation_user_detail_stripper",
-            return_value=None,
-        ) as mock_create_stripper,
+    with patch(
+        "reflexio.server.services.playbook.aggregation_trigger."
+        "ensure_local_playbook_aggregation_scheduler"
     ):
         service._trigger_playbook_aggregation()
 
-    assert len(created_kwargs) == 1
-    assert "user_detail_stripper" not in created_kwargs[0]
-    mock_create_stripper.assert_called_once_with(configurator)
+    _storage(service).schedule_playbook_aggregation.assert_called_once_with("v1")
 
 
-def test_inline_aggregation_injects_configured_stripper():
-    stripper = PassthroughStripper()
+def test_post_persist_scheduler_failures_are_best_effort(caplog):
+    configurator = MagicMock()
+    configurator.get_config.return_value = _aggregation_enabled_config()
+    service = _service_for_inline_aggregation(configurator)
+    plan = MagicMock()
+    plan.new_playbooks = [MagicMock()]
+    plan.output_pending_status = False
+    plan.skip_aggregation = False
+    service._enqueue_user_playbook_optimization = MagicMock(
+        side_effect=RuntimeError("optimization unavailable")
+    )
+    service._trigger_playbook_aggregation = MagicMock(
+        side_effect=RuntimeError("aggregation unavailable")
+    )
 
-    class ConfiguratorWithStripper:
-        def get_config(self) -> Config:
-            return _aggregation_enabled_config()
+    service._dispatch_playbook_schedulers(plan)
 
-    service = _service_for_inline_aggregation(ConfiguratorWithStripper())
-    created_kwargs: list[dict[str, Any]] = []
-
-    class FakeAggregator:
-        def __init__(self, **kwargs: Any) -> None:
-            created_kwargs.append(kwargs)
-
-        def run(self, _request: Any) -> dict[str, int]:
-            return {"playbooks_generated": 0}
-
-    with (
-        patch(
-            "reflexio.server.services.playbook.service.PlaybookAggregator",
-            FakeAggregator,
-        ),
-        patch(
-            "reflexio.server.services.playbook.service.run_with_operation_limit",
-            side_effect=lambda **kwargs: kwargs["fn"](),
-        ),
-        patch(
-            "reflexio.server.services.playbook.user_detail_stripping.create_aggregation_user_detail_stripper",
-            return_value=stripper,
-        ),
-    ):
-        service._trigger_playbook_aggregation()
-
-    assert len(created_kwargs) == 1
-    assert created_kwargs[0]["user_detail_stripper"] is stripper
+    service._enqueue_user_playbook_optimization.assert_called_once_with(
+        plan.new_playbooks
+    )
+    service._trigger_playbook_aggregation.assert_called_once_with()
+    assert "optimization unavailable" in caplog.text
+    assert "aggregation unavailable" in caplog.text
 
 
-def test_inline_aggregation_does_not_thread_stripper_prompt_text_separately():
-    stripper = PassthroughStripper()
-    stripper.prompt_extra_instructions = "Extra aggregation instruction."
+def test_maybe_trigger_user_playbook_aggregation_durably_schedules():
+    from reflexio.server.services.playbook.aggregation_trigger import (
+        maybe_trigger_user_playbook_aggregation,
+    )
 
-    class ConfiguratorWithExtraInstructions:
-        def get_config(self) -> Config:
-            return _aggregation_enabled_config()
+    configurator = MagicMock()
+    configurator.get_config.return_value = _aggregation_enabled_config()
+    ctx = MagicMock()
+    ctx.configurator = configurator
+    ctx.org_id = "test-org"
+    ctx.storage = MagicMock()
+    llm_client = MagicMock()
 
-    service = _service_for_inline_aggregation(ConfiguratorWithExtraInstructions())
-    created_kwargs: list[dict[str, Any]] = []
+    with patch(
+        "reflexio.server.services.playbook.aggregation_trigger."
+        "ensure_local_playbook_aggregation_scheduler"
+    ) as ensure_scheduler:
+        result = maybe_trigger_user_playbook_aggregation(
+            request_context=ctx,
+            llm_client=llm_client,
+            agent_version="v1",
+            reason="unit_test",
+        )
 
-    class FakeAggregator:
-        def __init__(self, **kwargs: Any) -> None:
-            created_kwargs.append(kwargs)
+    assert result.status == "scheduled"
+    assert result.reason == "unit_test"
+    assert result.agent_version == "v1"
+    ctx.storage.schedule_playbook_aggregation.assert_called_once_with("v1")
+    ensure_scheduler.assert_called_once_with(ctx)
 
-        def run(self, _request: Any) -> dict[str, int]:
-            return {"playbooks_generated": 0}
 
-    with (
-        patch(
-            "reflexio.server.services.playbook.service.PlaybookAggregator",
-            FakeAggregator,
-        ),
-        patch(
-            "reflexio.server.services.playbook.service.run_with_operation_limit",
-            side_effect=lambda **kwargs: kwargs["fn"](),
-        ),
-        patch(
-            "reflexio.server.services.playbook.user_detail_stripping.create_aggregation_user_detail_stripper",
-            return_value=stripper,
-        ),
-    ):
-        service._trigger_playbook_aggregation()
+def test_maybe_trigger_user_playbook_aggregation_reports_no_config():
+    from reflexio.server.services.playbook.aggregation_trigger import (
+        maybe_trigger_user_playbook_aggregation,
+    )
 
-    assert len(created_kwargs) == 1
-    assert created_kwargs[0]["user_detail_stripper"] is stripper
-    assert "aggregation_prompt_extra_instructions" not in created_kwargs[0]
+    configurator = MagicMock()
+    configurator.get_config.return_value = Config(
+        storage_config=StorageConfigSQLite(),
+        user_playbook_extractor_config=None,
+    )
+    ctx = MagicMock(configurator=configurator, org_id="test-org")
+
+    result = maybe_trigger_user_playbook_aggregation(
+        request_context=ctx,
+        llm_client=MagicMock(),
+        agent_version="v1",
+        reason="missing_config",
+    )
+
+    assert result.status == "skipped_no_config"
+    assert result.reason == "missing_config"
+    assert result.agent_version == "v1"
+
+
+def test_maybe_trigger_user_playbook_aggregation_reports_schedule_failure():
+    from reflexio.server.services.playbook.aggregation_trigger import (
+        maybe_trigger_user_playbook_aggregation,
+    )
+
+    configurator = MagicMock()
+    configurator.get_config.return_value = _aggregation_enabled_config()
+    ctx = MagicMock(configurator=configurator, org_id="test-org")
+    ctx.storage.schedule_playbook_aggregation.side_effect = RuntimeError("boom")
+
+    result = maybe_trigger_user_playbook_aggregation(
+        request_context=ctx,
+        llm_client=MagicMock(),
+        agent_version="v1",
+        reason="post_commit",
+    )
+
+    assert result.status == "failed"
+    assert result.error_type == "RuntimeError"
 
 
 @pytest.fixture
@@ -417,7 +423,7 @@ def test_error_handling(mock_chat_completion):
             auto_run=False,
         )
 
-        # Mock storage.save_user_playbooks to raise an exception
+        # Mock the lineage-aware save to raise an exception
         with patch.object(
             _storage(playbook_generation_service),
             "save_user_playbooks",
@@ -470,18 +476,29 @@ def test_finalize_drops_empty_and_same_batch_duplicates_with_dedup_flag_off():
 
         with (
             patch(
-                "reflexio.server.site_var.feature_flags.is_deduplicator_enabled",
-                return_value=False,
-            ),
+                "reflexio.server.services.playbook.components.consolidator.PlaybookConsolidator",
+            ) as mock_dedup_cls,
             patch.object(
-                _storage(playbook_generation_service), "save_user_playbooks"
+                _storage(playbook_generation_service),
+                "save_user_playbooks",
             ) as save_user_playbooks,
             patch.object(
                 playbook_generation_service, "_enqueue_user_playbook_optimization"
             ),
         ):
+            mock_dedup_cls.return_value.deduplicate.side_effect = (
+                lambda results, *_args, **_kwargs: (
+                    [p for r in results for p in r],
+                    [],
+                    [],
+                )
+            )
             playbook_generation_service._finalize_extracted_items(
-                [first, duplicate, blank]
+                [first, duplicate, blank],
+                model_provenance=ModelProvenance(
+                    model_name="served-model",
+                    provider="provider",
+                ),
             )
 
         save_user_playbooks.assert_called_once()
@@ -489,6 +506,384 @@ def test_finalize_drops_empty_and_same_batch_duplicates_with_dedup_flag_off():
         assert saved_playbooks == [first]
         assert first.status is None
         assert first.source == "test_source"
+        context = save_user_playbooks.call_args.kwargs["lineage_contexts"][0]
+        assert context.op_kind == "create"
+        assert context.model_name == "served-model"
+
+
+def test_finalize_without_provenance_emits_create_with_null_model_fields():
+    """Opaque routes still write create lineage; model fields stay null."""
+    from reflexio.models.api_schema.domain.entities import LineageContext
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = PlaybookGenerationService(
+            llm_client=LiteLLMClient(LiteLLMConfig(model="gpt-4o-mini")),
+            request_context=RequestContext(org_id="0", storage_base_dir=temp_dir),
+        )
+        service.service_config = PlaybookGenerationServiceConfig(
+            request_id="legacy-request",
+            agent_version="1.0",
+            user_id="test-user",
+            source="test",
+        )
+        playbook = UserPlaybook(
+            agent_version="1.0",
+            request_id="legacy-request",
+            content="Preserve the old output.",
+            trigger="When resuming a legacy run",
+        )
+
+        with (
+            patch(
+                "reflexio.server.services.playbook.components.consolidator.PlaybookConsolidator",
+            ) as mock_dedup_cls,
+            patch.object(_storage(service), "save_user_playbooks") as save,
+            patch.object(service, "_enqueue_user_playbook_optimization"),
+        ):
+            mock_dedup_cls.return_value.deduplicate.return_value = (
+                [playbook],
+                [],
+                [],
+            )
+            mock_dedup_cls.return_value.model_provenance = None
+            mock_dedup_cls.return_value.consolidated_output_indices = set()
+            service._finalize_extracted_items([playbook], model_provenance=None)
+
+        contexts = save.call_args.kwargs["lineage_contexts"]
+        assert len(contexts) == 1
+        assert contexts[0] == LineageContext(
+            op_kind="create",
+            actor="extractor",
+            request_id="legacy-request",
+            model_name=None,
+            provider=None,
+        )
+
+
+def test_synchronous_finalize_rolls_back_creation_when_lineage_fails():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = PlaybookGenerationService(
+            llm_client=LiteLLMClient(LiteLLMConfig(model="gpt-4o-mini")),
+            request_context=RequestContext(org_id="0", storage_base_dir=temp_dir),
+        )
+        service.service_config = PlaybookGenerationServiceConfig(
+            request_id="atomic-request",
+            agent_version="1.0",
+            user_id="atomic-user",
+            source="test",
+        )
+        playbook = UserPlaybook(
+            agent_version="1.0",
+            request_id="atomic-request",
+            content="Keep creation and lineage atomic.",
+            trigger="When synchronous finalization retries",
+        )
+
+        with (
+            patch(
+                "reflexio.server.services.playbook.components.consolidator.PlaybookConsolidator",
+            ) as consolidator_class,
+            patch.object(
+                service,
+                "_apply_consolidation_lineage",
+                side_effect=RuntimeError("lineage failed"),
+            ),
+        ):
+            consolidator_class.return_value.deduplicate.return_value = (
+                [playbook],
+                [],
+                [],
+            )
+            consolidator_class.return_value.model_provenance = None
+            consolidator_class.return_value.consolidated_output_indices = set()
+            with pytest.raises(RuntimeError, match="lineage failed"):
+                service._finalize_extracted_items([playbook])
+
+        assert (
+            _storage(service)
+            .conn.execute(
+                "SELECT count(*) FROM user_playbooks WHERE user_id = 'atomic-user'"
+            )
+            .fetchone()[0]
+            == 0
+        )
+
+
+def test_resolve_write_plan_honors_reject_all_consolidation():
+    """An intentionally empty consolidation result must not restore candidates."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = PlaybookGenerationService(
+            llm_client=LiteLLMClient(LiteLLMConfig(model="gpt-4o-mini")),
+            request_context=RequestContext(org_id="0", storage_base_dir=temp_dir),
+        )
+        service.service_config = PlaybookGenerationServiceConfig(
+            request_id="test_request_id",
+            agent_version="1.0",
+            user_id="test_user",
+            source="test_source",
+        )
+        candidate = UserPlaybook(
+            agent_version="1.0",
+            request_id="test_request_id",
+            content="A candidate already covered by an existing playbook.",
+            trigger="When handling the same task",
+        )
+
+        with (
+            patch(
+                "reflexio.server.services.playbook.components.consolidator.PlaybookConsolidator",
+            ) as consolidator_class,
+            patch.object(
+                _storage(service), "precompute_user_playbook_embeddings"
+            ) as precompute,
+        ):
+            consolidator_class.return_value.deduplicate.return_value = ([], [], [])
+            plan = service._resolve_write_plan([[candidate]])
+
+        assert plan is None
+        precompute.assert_not_called()
+
+
+def test_resolve_write_plan_reviews_grounded_normal_candidates_before_consolidation():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = PlaybookGenerationService(
+            llm_client=LiteLLMClient(LiteLLMConfig(model="gpt-4o-mini")),
+            request_context=RequestContext(org_id="0", storage_base_dir=temp_dir),
+        )
+        service.service_config = PlaybookGenerationServiceConfig(
+            request_id="test_request_id",
+            agent_version="1.0",
+            user_id="test_user",
+            source="test_source",
+            auto_run=False,
+            review_tool_result_context=(
+                "Resolved extraction tool results: AWS ECS Fargate."
+            ),
+        )
+        playbook_config = PlaybookConfig(
+            extractor_name="test_playbook",
+            extraction_definition_prompt="Review grounded lessons",
+        )
+        service.configurator.set_config_by_name(
+            "user_playbook_extractor_config", playbook_config
+        )
+        request = Request(
+            request_id="source_request",
+            user_id="test_user",
+            source="test_source",
+            agent_version="1.0",
+            session_id="session_1",
+        )
+        interaction = Interaction(
+            interaction_id=44,
+            user_id="test_user",
+            request_id="source_request",
+            content="Use the answer I already supplied.",
+            role="user",
+            created_at=44,
+        )
+        _storage(service).add_request(request)
+        _storage(service).add_user_interaction("test_user", interaction)
+        candidate = UserPlaybook(
+            agent_version="1.0",
+            request_id="test_request_id",
+            user_id="test_user",
+            content="Use the supplied answer.",
+            trigger="When the user supplies the requested answer",
+            rationale="The user explicitly corrected the repeated question.",
+            source_interaction_ids=[44],
+            source_span="Use the answer I already supplied.",
+            reader_angle="correction",
+        )
+        reviewed = candidate.model_copy(
+            update={"content": "Treat the supplied answer as binding."}
+        )
+
+        with (
+            patch(
+                "reflexio.server.services.playbook.components.consolidator.PlaybookConsolidator",
+            ) as consolidator_class,
+            patch(
+                "reflexio.server.services.playbook.components.reviewer.PlaybookCandidateReviewer",
+            ) as reviewer_class,
+            patch.object(_storage(service), "precompute_user_playbook_embeddings"),
+            patch.dict("os.environ", {"MOCK_LLM_RESPONSE": "false"}),
+        ):
+            consolidator = consolidator_class.return_value
+            consolidator.retrieve_existing_playbooks.return_value = []
+            consolidator.deduplicate.side_effect = lambda results, *_args, **_kwargs: (
+                [item for result in results for item in result],
+                [],
+                [],
+            )
+            reviewer = reviewer_class.return_value
+            reviewer.is_enabled.return_value = True
+            reviewer.review.return_value = [reviewed]
+
+            plan = service._resolve_write_plan([[candidate]])
+
+        assert plan is not None
+        assert plan.new_playbooks == [reviewed]
+        reviewer.review.assert_called_once()
+        assert "AWS ECS Fargate" in reviewer.review.call_args.kwargs["tool_context"]
+        consolidator.deduplicate.assert_called_once()
+        assert consolidator.deduplicate.call_args.args[0] == [[reviewed]]
+
+
+def test_review_interaction_window_raises_when_source_filter_excludes_window():
+    service = PlaybookGenerationService(
+        llm_client=MagicMock(), request_context=MagicMock()
+    )
+    service.service_config = PlaybookGenerationServiceConfig(
+        request_id="request",
+        agent_version="v1",
+    )
+    playbook_config = PlaybookConfig(
+        extractor_name="test_playbook",
+        extraction_definition_prompt="Review grounded lessons",
+    )
+    extractor = MagicMock()
+    extractor._get_interactions.return_value = None
+
+    with (
+        patch.object(service, "_create_extractor", return_value=extractor),
+        pytest.raises(RuntimeError, match="source filter excluded"),
+    ):
+        service._review_interaction_window(playbook_config)
+
+
+def test_review_interaction_window_returns_honest_empty_window():
+    service = PlaybookGenerationService(
+        llm_client=MagicMock(), request_context=MagicMock()
+    )
+    service.service_config = PlaybookGenerationServiceConfig(
+        request_id="request",
+        agent_version="v1",
+    )
+    playbook_config = PlaybookConfig(
+        extractor_name="test_playbook",
+        extraction_definition_prompt="Review grounded lessons",
+    )
+    extractor = MagicMock()
+    extractor._get_interactions.return_value = []
+
+    with patch.object(service, "_create_extractor", return_value=extractor):
+        assert service._review_interaction_window(playbook_config) == []
+
+
+def test_automatic_review_reloads_the_configured_extraction_window():
+    request_context = MagicMock()
+    service = PlaybookGenerationService(
+        llm_client=MagicMock(), request_context=request_context
+    )
+    service.service_config = PlaybookGenerationServiceConfig(
+        request_id="request",
+        agent_version="v1",
+        user_id="user-1",
+        source="chat",
+    )
+    playbook_config = PlaybookConfig(
+        extractor_name="test_playbook",
+        extraction_definition_prompt="Review grounded lessons",
+        request_sources_enabled=["chat"],
+        window_size_override=3,
+    )
+    expected_window = [MagicMock(spec=RequestInteractionDataModel)]
+    extractor = MagicMock()
+    extractor._get_interactions.return_value = expected_window
+
+    with patch.object(
+        service, "_create_extractor", return_value=extractor
+    ) as create_extractor:
+        assert service._review_interaction_window(playbook_config) == expected_window
+
+    create_extractor.assert_called_once_with(playbook_config, service.service_config)
+    extractor._get_interactions.assert_called_once_with()
+    request_context.storage.get_interactions_by_ids.assert_not_called()
+
+
+def test_loading_a_new_generation_request_clears_the_review_window_cache():
+    service = PlaybookGenerationService(
+        llm_client=MagicMock(), request_context=MagicMock()
+    )
+    service._review_window_cache = [MagicMock(spec=RequestInteractionDataModel)]
+
+    config = service._load_generation_service_config(
+        PlaybookGenerationRequest(
+            request_id="request-2",
+            agent_version="v1",
+            user_id="user-2",
+        )
+    )
+
+    assert config.request_id == "request-2"
+    assert service._review_window_cache is None
+
+
+def test_resolve_write_plan_fails_closed_for_strict_candidate_without_evidence():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = PlaybookGenerationService(
+            llm_client=LiteLLMClient(LiteLLMConfig(model="gpt-4o-mini")),
+            request_context=RequestContext(org_id="0", storage_base_dir=temp_dir),
+        )
+        service.service_config = PlaybookGenerationServiceConfig(
+            request_id="test_request_id",
+            agent_version="1.0",
+            user_id="test_user",
+            source="test_source",
+            auto_run=False,
+        )
+        service.configurator.set_config_by_name(
+            "user_playbook_extractor_config",
+            PlaybookConfig(
+                extractor_name="test_playbook",
+                extraction_definition_prompt="Review grounded lessons",
+            ),
+        )
+        request = Request(
+            request_id="source_request",
+            user_id="test_user",
+            source="test_source",
+            agent_version="1.0",
+            session_id="session_1",
+        )
+        interaction = Interaction(
+            interaction_id=45,
+            user_id="test_user",
+            request_id="source_request",
+            content="Use the answer I already supplied.",
+            role="user",
+            created_at=45,
+        )
+        _storage(service).add_request(request)
+        _storage(service).add_user_interaction("test_user", interaction)
+        candidate = UserPlaybook(
+            agent_version="1.0",
+            request_id="test_request_id",
+            user_id="test_user",
+            content="Use the supplied answer.",
+            trigger="When the user supplies the requested answer",
+            rationale="The user explicitly corrected the repeated question.",
+            source_interaction_ids=[45],
+            source_span=None,
+            reader_angle="correction",
+        )
+
+        with (
+            patch(
+                "reflexio.server.services.playbook.components.consolidator.PlaybookConsolidator",
+            ),
+            patch(
+                "reflexio.server.services.playbook.components.reviewer.PlaybookCandidateReviewer",
+            ) as reviewer_class,
+            patch.dict("os.environ", {"MOCK_LLM_RESPONSE": "false"}),
+        ):
+            reviewer_class.return_value.is_enabled.return_value = True
+            with pytest.raises(
+                RuntimeError,
+                match="missing validated evidence metadata: C1",
+            ):
+                service._resolve_write_plan([[candidate]])
 
 
 def test_run_manual_regular_no_window_size(mock_chat_completion):
@@ -988,6 +1383,40 @@ def test_get_rerun_user_ids_returns_empty_when_no_matches():
         result = service._get_rerun_user_ids(request)
 
         assert result == []
+
+
+def test_create_run_request_for_item_uses_per_user_operation_request_ids():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = PlaybookGenerationService(
+            llm_client=LiteLLMClient(LiteLLMConfig(model="gpt-4o-mini")),
+            request_context=RequestContext(org_id="0", storage_base_dir=temp_dir),
+        )
+        request = ManualPlaybookGenerationRequest(agent_version="v1", source="api")
+
+        first = service._create_run_request_for_item("user_1", request)
+        second = service._create_run_request_for_item("user_2", request)
+
+    assert first.request_id.startswith("manual_")
+    assert second.request_id.startswith("manual_")
+    assert first.request_id != second.request_id
+
+
+def test_create_run_request_for_item_uses_distinct_rerun_operation_request_ids():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = PlaybookGenerationService(
+            llm_client=LiteLLMClient(LiteLLMConfig(model="gpt-4o-mini")),
+            request_context=RequestContext(org_id="0", storage_base_dir=temp_dir),
+        )
+        request = RerunPlaybookGenerationRequest(agent_version="v1", source="api")
+
+        first = service._create_run_request_for_item("user_1", request)
+        second = service._create_run_request_for_item("user_2", request)
+
+    assert first.request_id.startswith("rerun_playbook_")
+    assert second.request_id.startswith("rerun_playbook_")
+    assert first.request_id != second.request_id
+    assert first.auto_run is False
+    assert second.auto_run is False
 
 
 def test_collect_scoped_interactions_for_precheck_uses_extractor_scope():

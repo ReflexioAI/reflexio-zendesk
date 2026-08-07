@@ -5,13 +5,16 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
-from ..config_schema import SearchMode
+from ..config_schema import RetrievalExperimentRecord, SearchMode
+from ..structured_output import StrictStructuredOutput
+from .domain import CitationKind
 from .service_schemas import (
     AgentPlaybook,
     AgentSuccessEvaluationResult,
     Interaction,
     PlaybookStatus,
     Request,
+    RetrievedLearningEvaluationResult,
     Status,
     UserPlaybook,
     UserProfile,
@@ -38,6 +41,7 @@ class SearchInteractionRequest(BaseModel):
     end_time: datetime | None = None
     top_k: int | None = Field(default=None, gt=0)
     most_recent_k: int | None = Field(default=None, gt=0)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     search_mode: SearchMode = SearchMode.HYBRID
 
     @model_validator(mode="after")
@@ -65,7 +69,7 @@ class SearchUserProfileRequest(BaseModel):
         None  # Deprecated compatibility field; accepted but ignored.
     )
     tags: list[str] | None = None
-    threshold: float | None = Field(default=0.4, ge=0.0, le=1.0)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     enable_reformulation: bool | None = False
     search_mode: SearchMode = SearchMode.HYBRID
 
@@ -93,7 +97,7 @@ class RerankUserProfilesRequest(BaseModel):
 
     Use after ``search_user_profiles`` (or any other source of candidate ids)
     when initial results are noisy. The server fetches each candidate's full
-    content, scores ``(query, content)`` pairs with a CPU cross-encoder, and
+    content, scores ``(query, content)`` pairs with a cross-encoder, and
     returns the top_k profiles sorted by descending score.
 
     Args:
@@ -187,9 +191,13 @@ class GetInteractionsResponse(BaseModel):
 
 class GetUserProfilesRequest(BaseModel):
     user_id: NonEmptyStr
+    profile_id: str | None = None
+    query: str | None = None
     start_time: datetime | None = None
     end_time: datetime | None = None
     top_k: int | None = Field(default=30, gt=0)
+    source: str | None = None
+    profile_time_to_live: str | None = None
     status_filter: list[Status | None] | None = None
     tags: list[str] | None = None
 
@@ -222,11 +230,22 @@ class SetConfigResponse(BaseModel):
 
 class GetUserPlaybooksRequest(BaseModel):
     limit: int | None = Field(default=100, gt=0)
+    user_playbook_id: int | None = Field(default=None, gt=0)
     user_id: str | None = None
+    request_id: str | None = None
+    query: str | None = None
     playbook_name: str | None = None
     agent_version: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
     status_filter: list[Status | None] | None = None
     tags: list[str] | None = None
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
 
 
 class GetUserPlaybooksResponse(BaseModel):
@@ -237,8 +256,12 @@ class GetUserPlaybooksResponse(BaseModel):
 
 class GetAgentPlaybooksRequest(BaseModel):
     limit: int | None = Field(default=100, gt=0)
+    agent_playbook_id: int | None = Field(default=None, gt=0)
+    query: str | None = None
     playbook_name: str | None = None
     agent_version: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
     status_filter: list[Status | None] | None = None
     playbook_status_filter: PlaybookStatus | None = None
     tags: list[str] | None = None
@@ -246,6 +269,12 @@ class GetAgentPlaybooksRequest(BaseModel):
     # Optional; consumed by _meter_applied_learnings in server/api.py.
     request_id: str | None = None
     session_id: str | None = None
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
 
 
 class GetAgentPlaybooksResponse(BaseModel):
@@ -290,7 +319,8 @@ class SearchUserPlaybookRequest(BaseModel):
         end_time (datetime, optional): End time for created_at filter
         status_filter (list[Optional[Status]], optional): Filter by status (None for CURRENT, PENDING, ARCHIVED)
         top_k (int, optional): Maximum number of results to return. Defaults to 10
-        threshold (float, optional): Similarity threshold for vector search. Defaults to 0.4
+        threshold (float, optional): Similarity threshold for vector search.
+            When omitted, the embedding model's default is used.
     """
 
     query: str | None = None
@@ -302,7 +332,7 @@ class SearchUserPlaybookRequest(BaseModel):
     status_filter: list[Status | None] | None = None
     tags: list[str] | None = None
     top_k: int | None = Field(default=10, gt=0)
-    threshold: float | None = Field(default=0.4, ge=0.0, le=1.0)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     enable_reformulation: bool | None = False
     search_mode: SearchMode = SearchMode.HYBRID
     # Caller correlation IDs for billing attribution on the Application line.
@@ -336,6 +366,9 @@ class SearchAgentPlaybookRequest(BaseModel):
 
     Args:
         query (str, optional): Query for semantic/text search
+        user_id (str, optional): User receiving the retrieved playbooks. This
+            does not filter agent playbooks; it is used for retrieval-experiment
+            assignment when an experiment is active.
         agent_version (str, optional): Filter by agent version
         playbook_name (str, optional): Filter by playbook name
         start_time (datetime, optional): Start time for created_at filter
@@ -348,10 +381,12 @@ class SearchAgentPlaybookRequest(BaseModel):
             a single storage query without per-status fan-out. Defaults to
             None (no status predicate).
         top_k (int, optional): Maximum number of results to return. Defaults to 10
-        threshold (float, optional): Similarity threshold for vector search. Defaults to 0.4
+        threshold (float, optional): Similarity threshold for vector search.
+            When omitted, the embedding model's default is used.
     """
 
     query: str | None = None
+    user_id: NonEmptyStr | None = None
     agent_version: str | None = None
     playbook_name: str | None = None
     start_time: datetime | None = None
@@ -360,7 +395,7 @@ class SearchAgentPlaybookRequest(BaseModel):
     playbook_status_filter: PlaybookStatus | list[PlaybookStatus] | None = None
     tags: list[str] | None = None
     top_k: int | None = Field(default=10, gt=0)
-    threshold: float | None = Field(default=0.4, ge=0.0, le=1.0)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     enable_reformulation: bool | None = False
     search_mode: SearchMode = SearchMode.HYBRID
     # Caller correlation IDs for billing attribution on the Application line.
@@ -392,6 +427,14 @@ class SearchAgentPlaybookResponse(BaseModel):
 class GetAgentSuccessEvaluationResultsRequest(BaseModel):
     limit: int | None = Field(default=100, gt=0)
     agent_version: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
 
 
 class GetAgentSuccessEvaluationResultsResponse(BaseModel):
@@ -400,14 +443,53 @@ class GetAgentSuccessEvaluationResultsResponse(BaseModel):
     msg: str | None = None
 
 
+class GetRetrievedLearningEvaluationResultsRequest(BaseModel):
+    """Read per-learning retrieved-learning evaluation verdicts.
+
+    Attributes:
+        user_id (str | None): Filter by session owner.
+        session_id (str | None): Filter by session.
+        start_time (datetime | None): Filter by target interaction timestamp.
+        end_time (datetime | None): Filter by target interaction timestamp.
+        limit (int): Maximum rows. Time-filtered reads group newest target
+            interactions first; otherwise rows use created_at DESC.
+    """
+
+    user_id: str | None = None
+    session_id: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    limit: int = Field(default=100, ge=1, le=1_000)
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class GetRetrievedLearningEvaluationResultsResponse(BaseModel):
+    success: bool
+    results: list[RetrievedLearningEvaluationResult] = Field(default_factory=list)
+    msg: str | None = None
+
+
 class GetRequestsRequest(BaseModel):
     user_id: str | None = None
     request_id: str | None = None
     session_id: str | None = None
+    source: str | None = None
     start_time: datetime | None = None
     end_time: datetime | None = None
-    top_k: int | None = Field(default=30, gt=0)
-    offset: int | None = Field(default=0, ge=0)
+    top_k: int | None = Field(
+        default=30,
+        gt=0,
+        description="Maximum number of sessions to return. Pagination is "
+        "per-session: every returned session includes all of its requests.",
+    )
+    offset: int | None = Field(
+        default=0, ge=0, description="Number of sessions to skip for pagination."
+    )
 
     @model_validator(mode="after")
     def check_time_range(self) -> Self:
@@ -497,7 +579,8 @@ class TimeSeriesDataPoint(BaseModel):
     """A single data point in a time series."""
 
     timestamp: int = Field(gt=0)  # Unix timestamp
-    value: int = Field(ge=0)  # Count or metric value
+    value: float = Field(ge=0)  # Count or metric value
+    count: int | None = Field(default=None, ge=0)  # Optional weight for rate metrics
 
 
 class PeriodStats(BaseModel):
@@ -551,8 +634,10 @@ class PlaybookApplicationStat(BaseModel):
         real_id (str): Stable id of the cited item — ``user_playbook_id``,
             ``agent_playbook_id``, or ``profile_id`` (always serialized as a
             string).
-        kind (str): ``"playbook"`` or ``"profile"`` — the citation kind, as
-            recorded on ``Interaction.citations``.
+        kind (CitationKind): Citation kind recorded on
+            ``Interaction.citations``. ``"playbook"`` is the legacy
+            compatibility value; ``"user_playbook"`` is the explicit
+            direct-tuner target.
         title (str): Human-readable label for the rule. Empty string when
             the underlying row has been deleted but old citations remain.
         applied_count (int): Number of interactions in the window whose
@@ -567,7 +652,7 @@ class PlaybookApplicationStat(BaseModel):
     """
 
     real_id: str
-    kind: Literal["playbook", "profile"]
+    kind: CitationKind
     title: str = ""
     applied_count: int = Field(ge=0)
     last_applied_at: int | None = None
@@ -617,15 +702,36 @@ class ConversationTurn(BaseModel):
     content: NonEmptyStr
 
 
-class ReformulationResult(BaseModel):
+class ReformulationResult(StrictStructuredOutput):
     """Output of the query reformulation pipeline.
+
+    Besides the rewritten query, carries the query's TEMPORAL SIGNALS so the
+    search pipeline can be time-sensitive without any additional LLM call
+    (the reformulation call already runs before retrieval when
+    ``enable_reformulation`` is set). Time windows are relative day offsets
+    (never absolute dates) so results don't rot with calendar time.
 
     Args:
         standalone_query (str): Clean, normalized natural language query with
             conversation context resolved, abbreviations expanded, grammar fixed.
+        start_days_ago (float, optional): Older bound of a query time window
+            ("in the last 7 days" → 7).
+        end_days_ago (float, optional): Newer bound ("before this month" →
+            ~30, with no start bound).
+        recency_dominant (bool): The query asks for the CURRENT/LATEST value —
+            final ordering becomes timestamp-based.
+        wants_current (bool): Present-tense question about a mutable
+            fact/policy — near-duplicate competing facts collapse to the
+            freshest, while relevance ordering is otherwise preserved.
+            (Superseded/TTL-expired rows never reach results: storage search
+            excludes tombstone statuses and expired profiles at SQL level.)
     """
 
     standalone_query: str
+    start_days_ago: float | None = Field(default=None, ge=0)
+    end_days_ago: float | None = Field(default=None, ge=0)
+    recency_dominant: bool = False
+    wants_current: bool = False
 
 
 # ===============================
@@ -634,6 +740,53 @@ class ReformulationResult(BaseModel):
 
 
 UnifiedSearchEntityType = Literal["profiles", "user_playbooks", "agent_playbooks"]
+RetrievalExperimentArm = Literal["treatment", "holdout"]
+
+
+class RetrievalExperimentAssignment(BaseModel):
+    """Experiment attribution returned by learning-search endpoints."""
+
+    experiment_id: str
+    arm: RetrievalExperimentArm
+
+
+class StartRetrievalExperimentRequest(BaseModel):
+    experiment_id: NonEmptyStr = Field(max_length=128)
+    holdout_percentage: float = Field(gt=0, lt=100)
+
+
+class StopRetrievalExperimentRequest(BaseModel):
+    experiment_id: NonEmptyStr = Field(max_length=128)
+
+
+class RetrievalExperimentListResponse(BaseModel):
+    active_experiment: RetrievalExperimentRecord | None = None
+    experiments: list[RetrievalExperimentRecord] = Field(default_factory=list)
+
+
+class RetrievalExperimentArmMetrics(BaseModel):
+    arm: RetrievalExperimentArm
+    assigned_user_count: int = 0
+    published_session_count: int = 0
+    evaluated_user_count: int = 0
+    evaluated_session_count: int = 0
+    success_rate: float | None = None
+    average_corrections: float | None = None
+    average_turns_to_resolution: float | None = None
+    escalation_rate: float | None = None
+    average_output_tokens: float | None = None
+    output_token_session_count: int = 0
+
+
+class RetrievalExperimentResultsResponse(BaseModel):
+    experiment: RetrievalExperimentRecord
+    treatment: RetrievalExperimentArmMetrics
+    holdout: RetrievalExperimentArmMetrics
+    success_rate_lift_percentage_points: float | None = None
+    relative_success_lift: float | None = None
+    confidence_interval_95_percentage_points: tuple[float, float] | None = None
+    evaluated_session_coverage: float | None = None
+    unattributed_evaluated_session_count: int = 0
 
 
 class UnifiedSearchRequest(BaseModel):
@@ -642,10 +795,12 @@ class UnifiedSearchRequest(BaseModel):
     Args:
         query (str): Search query text
         top_k (int, optional): Maximum results per entity type. Defaults to 5
-        threshold (float, optional): Similarity threshold for vector search. Defaults to 0.3
+        threshold (float, optional): Similarity threshold for vector search.
+            When omitted, the embedding model's default is used.
         agent_version (str, optional): Filter by agent version (agent_playbooks, user_playbooks)
         playbook_name (str, optional): Filter by playbook name (agent_playbooks, user_playbooks)
         user_id (str, optional): Filter by user ID (profiles, user_playbooks)
+        tags (list[str], optional): Match entities having any requested tag.
         entity_types (list[str], optional): Entity types to search. When omitted,
             searches profiles, user_playbooks, and agent_playbooks.
         agent_playbook_status_filter (list[PlaybookStatus], optional): Approval
@@ -658,10 +813,11 @@ class UnifiedSearchRequest(BaseModel):
 
     query: NonEmptyStr
     top_k: int | None = Field(default=5, gt=0)
-    threshold: float | None = Field(default=0.3, ge=0.0, le=1.0)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     agent_version: str | None = None
     playbook_name: str | None = None
     user_id: str | None = None
+    tags: list[str] | None = None
     entity_types: list[UnifiedSearchEntityType] | None = None
     agent_playbook_status_filter: list[PlaybookStatus] | None = None
     conversation_history: list[ConversationTurn] | None = None
@@ -670,6 +826,9 @@ class UnifiedSearchRequest(BaseModel):
     search_mode: SearchMode = SearchMode.HYBRID
     # Caller correlation IDs for billing attribution on the Application line.
     # Optional; consumed by _meter_applied_learnings in server/api.py.
+    # ``session_id`` additionally enables session-scoped result dedup: items
+    # already served to the same (org, session) are skipped and the next-best
+    # matches backfilled (see server/services/retrieval/session_dedup.py).
     request_id: str | None = None
     session_id: str | None = None
     interaction_id: int | None = Field(default=None, gt=0)
@@ -687,6 +846,14 @@ class UnifiedSearchResponse(BaseModel):
         msg (str, optional): Additional message
         agent_answer (str, optional): LLM-synthesised answer populated by the agentic backend;
             None for classic backend.
+        degraded (bool): True when the search silently fell back from the
+            requested vector/hybrid mode to full-text search because query
+            embedding generation failed. Results are still returned (via FTS),
+            but relevance may be lower than a healthy vector/hybrid run.
+            Defaults to False.
+        search_mode_effective (str, optional): The search mode actually used
+            when it differs from the requested mode — currently ``"fts"`` on
+            the degrade path. None when the requested mode was honored.
     """
 
     success: bool
@@ -698,6 +865,9 @@ class UnifiedSearchResponse(BaseModel):
     agent_answer: str | None = None
     agent_trace: str | None = None
     rehydrated_text: str | None = None
+    degraded: bool = False
+    search_mode_effective: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None
 
 
 # ===============================
@@ -735,6 +905,7 @@ class SearchProfilesViewResponse(BaseModel):
     success: bool
     user_profiles: list[ProfileView]
     msg: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None
 
 
 class GetEvaluationResultsViewResponse(BaseModel):
@@ -786,6 +957,7 @@ class UnifiedSearchViewResponse(BaseModel):
     msg: str | None = None
     agent_trace: str | None = None
     rehydrated_text: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None
 
 
 class GetUserPlaybooksViewResponse(BaseModel):
@@ -810,6 +982,7 @@ class SearchUserPlaybooksViewResponse(BaseModel):
     success: bool
     user_playbooks: list[UserPlaybookView]
     msg: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None
 
 
 class SearchAgentPlaybooksViewResponse(BaseModel):
@@ -818,3 +991,4 @@ class SearchAgentPlaybooksViewResponse(BaseModel):
     success: bool
     agent_playbooks: list[AgentPlaybookView]
     msg: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None

@@ -22,6 +22,7 @@ from reflexio.models.api_schema.service_schemas import (
     AgentPlaybook,
     AgentPlaybookSourceWindow,
     AgentSuccessEvaluationResult,
+    LineageContext,
     PlaybookOptimizationCandidate,
     PlaybookOptimizationEvaluation,
     PlaybookOptimizationEvent,
@@ -32,6 +33,11 @@ from reflexio.models.api_schema.service_schemas import (
     UserPlaybook,
 )
 from reflexio.models.config_schema import SearchOptions
+from reflexio.server.services.embedding_text import (
+    embedding_text,
+    resolve_retrieval_threshold,
+)
+from reflexio.server.services.storage.lifecycle_filters import validate_include_inactive
 from reflexio.server.services.storage.postgres_storage._opensearch import (
     status_filter_terms,
 )
@@ -218,48 +224,104 @@ class PlaybookMixin(SchemaScopedClient):
     # ==============================
 
     @handle_exceptions
-    def save_user_playbooks(self, user_playbooks: list[UserPlaybook]) -> None:
-        for user_playbook in user_playbooks:
-            is_new = not user_playbook.user_playbook_id
-            embedding_text = user_playbook.trigger or user_playbook.content
-            if embedding_text:
+    def precompute_user_playbook_embeddings(
+        self, playbooks: list[UserPlaybook]
+    ) -> None:
+        for user_playbook in playbooks:
+            text = embedding_text(user_playbook)
+            if text:
                 if self._should_expand_documents():
                     with ThreadPoolExecutor(max_workers=2) as executor:
-                        emb_future = executor.submit(
-                            self._get_embedding, embedding_text
-                        )
-                        exp_future = executor.submit(
-                            self._expand_document, embedding_text
-                        )
+                        emb_future = executor.submit(self._get_embedding, text)
+                        exp_future = executor.submit(self._expand_document, text)
                         user_playbook.embedding = emb_future.result(timeout=15)
                         user_playbook.expanded_terms = exp_future.result(timeout=15)
                 else:
-                    user_playbook.embedding = self._get_embedding(embedding_text)
-            response = (
-                self._table("user_playbooks")
-                .upsert(user_playbook_to_data(user_playbook))
-                .execute()
-            )
-            if response.data and isinstance(response.data, list):
-                row = cast(dict[str, Any], response.data[0])
-                user_playbook.user_playbook_id = row.get(
-                    "user_playbook_id", user_playbook.user_playbook_id
+                    user_playbook.embedding = self._get_embedding(text)
+                    user_playbook.expanded_terms = None
+            else:
+                user_playbook.embedding = []
+                user_playbook.expanded_terms = None
+
+    @handle_exceptions
+    def save_user_playbooks(
+        self,
+        user_playbooks: list[UserPlaybook],
+        *,
+        skip_embedding: bool = False,
+        lineage_contexts: list[LineageContext] | None = None,
+    ) -> None:
+        if lineage_contexts is not None and len(lineage_contexts) != len(
+            user_playbooks
+        ):
+            raise ValueError("lineage_contexts must match user_playbooks length")
+        if any(context.op_kind != "create" for context in lineage_contexts or []):
+            raise ValueError("user playbook lineage_contexts must use op_kind='create'")
+        if not skip_embedding:
+            self.precompute_user_playbook_embeddings(user_playbooks)
+        with self.commit_scope():
+            for index, user_playbook in enumerate(user_playbooks):
+                is_new = not user_playbook.user_playbook_id
+                subject_ref = self._subject_ref_for_user_id(
+                    str(user_playbook.user_id or "")
                 )
-            if self._opensearch:
-                self._opensearch.index_rows("user_playbooks", _rows(response))
-            self._record_playbook_event(
-                event_name=(
-                    "user_playbook_created" if is_new else "user_playbook_updated"
-                ),
-                outcome="created" if is_new else "updated",
-                entity_type="user_playbook",
-                entity_id=(str(user_playbook.user_playbook_id) if not is_new else None),
-                user_id=user_playbook.user_id,
-                request_id=user_playbook.request_id,
-                playbook_name=user_playbook.playbook_name,
-                source=user_playbook.source,
-                agent_version=user_playbook.agent_version,
-            )
+                self._assert_subject_writable_locked(subject_ref)
+                data = user_playbook_to_data(user_playbook)
+                data["governance_subject_ref"] = subject_ref
+                response = self._table("user_playbooks").upsert(data).execute()
+                if response.data and isinstance(response.data, list):
+                    row = cast(dict[str, Any], response.data[0])
+                    user_playbook.user_playbook_id = row.get(
+                        "user_playbook_id", user_playbook.user_playbook_id
+                    )
+                context = (
+                    lineage_contexts[index]
+                    if lineage_contexts is not None
+                    else LineageContext(
+                        op_kind="create",
+                        actor="playbook_extractor",
+                        request_id=user_playbook.request_id,
+                    )
+                )
+                self._fetch_all(
+                    sql.SQL(
+                        """INSERT INTO {} (
+                               org_id, entity_type, entity_id, op, prov_relation,
+                               source_ids, actor, request_id, reason, created_at,
+                               model_name, provider
+                           ) VALUES (%s, 'user_playbook', %s, 'create',
+                                     'wasGeneratedBy', %s::jsonb, %s, %s, %s,
+                                     %s, %s, %s)
+                           ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
+                           DO NOTHING RETURNING 1"""
+                    ).format(self._table_identifier("lineage_event")),
+                    [
+                        self.org_id,
+                        str(user_playbook.user_playbook_id),
+                        json.dumps(context.source_ids),
+                        context.actor,
+                        context.request_id or user_playbook.request_id,
+                        context.reason,
+                        int(datetime.now(UTC).timestamp()),
+                        context.model_name,
+                        context.provider,
+                    ],
+                )
+                if self._opensearch:
+                    self._opensearch.index_rows("user_playbooks", _rows(response))
+                self._record_playbook_event(
+                    event_name=(
+                        "user_playbook_created" if is_new else "user_playbook_updated"
+                    ),
+                    outcome="created" if is_new else "updated",
+                    entity_type="user_playbook",
+                    entity_id=str(user_playbook.user_playbook_id),
+                    user_id=user_playbook.user_id,
+                    request_id=user_playbook.request_id,
+                    playbook_name=user_playbook.playbook_name,
+                    source=user_playbook.source,
+                    agent_version=user_playbook.agent_version,
+                )
 
     @handle_exceptions
     def get_user_playbooks(
@@ -274,6 +336,10 @@ class PlaybookMixin(SchemaScopedClient):
         include_embedding: bool = False,
         tags: list[str] | None = None,
         offset: int = 0,
+        user_playbook_id: int | None = None,
+        request_id: str | None = None,
+        query: str | None = None,
+        max_user_playbook_id: int | None = None,
     ) -> list[UserPlaybook]:
         """
         Get user playbooks from storage.
@@ -298,41 +364,63 @@ class PlaybookMixin(SchemaScopedClient):
             if include_embedding
             else _USER_PLAYBOOK_COLUMNS
         )
-        query = (
-            self._table("user_playbooks")
-            .select(columns)
-            .order("created_at", desc=True)
-            .limit(limit)
-            .offset(offset)
-        )
+        db_query = self._table("user_playbooks").select(columns)
+
+        if user_playbook_id is not None:
+            db_query = db_query.eq("user_playbook_id", user_playbook_id)
+        if max_user_playbook_id is not None:
+            db_query = db_query.lte("user_playbook_id", max_user_playbook_id)
+        if request_id is not None:
+            db_query = db_query.eq("request_id", request_id)
+        if query:
+            db_query = db_query.search_text(
+                [
+                    "content",
+                    "trigger",
+                    "rationale",
+                    "request_id",
+                    "playbook_name",
+                    "user_id",
+                ],
+                query,
+            )
 
         # Add user_id filter if specified
         if user_id is not None:
-            query = query.eq("user_id", user_id)
+            db_query = db_query.eq("user_id", user_id)
 
         # Add playbook_name filter if specified (skip if None or empty string)
         if playbook_name:
-            query = query.eq("playbook_name", playbook_name)
+            db_query = db_query.eq("playbook_name", playbook_name)
 
         # Add agent_version filter if specified
         if agent_version is not None:
-            query = query.eq("agent_version", agent_version)
+            db_query = db_query.eq("agent_version", agent_version)
 
         # Add time range filters if specified
         if start_time is not None:
             start_time_iso = datetime.fromtimestamp(start_time, tz=UTC).isoformat()
-            query = query.gte("created_at", start_time_iso)
+            db_query = db_query.gte("created_at", start_time_iso)
         if end_time is not None:
             end_time_iso = datetime.fromtimestamp(end_time, tz=UTC).isoformat()
-            query = query.lte("created_at", end_time_iso)
+            db_query = db_query.lte("created_at", end_time_iso)
 
         # Add status filter if specified
         if status_filter is not None:
-            query = _apply_status_filter_to_query(query, status_filter)
+            db_query = _apply_status_filter_to_query(db_query, status_filter)
         if tags:
-            query = query.contains("tags", tags)
+            db_query = db_query.contains("tags", tags)
 
-        response = query.execute()
+        if max_user_playbook_id is not None:
+            db_query = db_query.order("user_playbook_id", desc=True).limit(limit)
+        else:
+            db_query = (
+                db_query.order("created_at", desc=True)
+                .order("user_playbook_id", desc=True)
+                .limit(limit)
+                .offset(offset)
+            )
+        response = db_query.execute()
         return [
             self._row_to_user_playbook(item, include_embedding=include_embedding)
             for item in _rows(response)
@@ -521,15 +609,20 @@ class PlaybookMixin(SchemaScopedClient):
         user_id: str,
         user_playbook_ids: list[int],
         status_filter: list[Status | None] | None = None,
+        *,
+        include_inactive: bool = False,
     ) -> list[UserPlaybook]:
         """Fetch selected user playbooks for a user by id.
 
         See base class ``BaseStorage.get_user_playbooks_by_ids`` for the
         full contract; this is the Supabase-backed implementation.
         """
+        validate_include_inactive(
+            include_inactive=include_inactive, status_filter=status_filter
+        )
         if not user_playbook_ids:
             return []
-        if status_filter is None:
+        if status_filter is None and not include_inactive:
             status_filter = [None]
 
         query = (
@@ -538,7 +631,8 @@ class PlaybookMixin(SchemaScopedClient):
             .eq("user_id", user_id)
             .in_("user_playbook_id", user_playbook_ids)
         )
-        query = _apply_status_filter_to_query(query, status_filter)
+        if not include_inactive:
+            query = _apply_status_filter_to_query(query, status_filter or [None])
 
         response = query.execute()
         return [self._row_to_user_playbook(item) for item in _rows(response)]
@@ -564,19 +658,27 @@ class PlaybookMixin(SchemaScopedClient):
         self,
         user_playbook_ids: list[int],
         status_filter: list[Status | None] | None = None,
+        *,
+        include_embedding: bool = False,
     ) -> list[UserPlaybook]:
         if not user_playbook_ids:
             return []
         query = (
             self._table("user_playbooks")
-            .select(_USER_PLAYBOOK_COLUMNS)
+            .select(
+                _USER_PLAYBOOK_COLUMNS_WITH_EMBEDDING
+                if include_embedding
+                else _USER_PLAYBOOK_COLUMNS
+            )
             .in_("user_playbook_id", user_playbook_ids)
         )
         if status_filter is not None:
             query = _apply_status_filter_to_query(query, status_filter)
         response = query.execute()
         by_id = {
-            int(item["user_playbook_id"]): self._row_to_user_playbook(item)
+            int(item["user_playbook_id"]): self._row_to_user_playbook(
+                item, include_embedding=include_embedding
+            )
             for item in _rows(response)
         }
         return [by_id[upid] for upid in user_playbook_ids if upid in by_id]
@@ -753,7 +855,9 @@ class PlaybookMixin(SchemaScopedClient):
         start_time = int(request.start_time.timestamp()) if request.start_time else None
         end_time = int(request.end_time.timestamp()) if request.end_time else None
         status_filter = request.status_filter
-        match_threshold = request.threshold or 0.5
+        match_threshold = resolve_retrieval_threshold(
+            request.threshold, model_name=self.embedding_model_name
+        )
         match_count = request.top_k or 10
         query_embedding = options.query_embedding if options else None
 
@@ -790,7 +894,8 @@ class PlaybookMixin(SchemaScopedClient):
                 ids = self._opensearch.search_ids(
                     entity="user_playbooks",
                     query_text=query,
-                    query_embedding=query_embedding or self._get_embedding(query),
+                    query_embedding=query_embedding
+                    or self._get_embedding(query, purpose="query"),
                     search_mode=effective_mode,
                     top_k=match_count,
                     threshold=match_threshold,
@@ -803,7 +908,8 @@ class PlaybookMixin(SchemaScopedClient):
             response = self._rpc(
                 "hybrid_match_user_playbooks",
                 {
-                    "p_query_embedding": query_embedding or self._get_embedding(query),
+                    "p_query_embedding": query_embedding
+                    or self._get_embedding(query, purpose="query"),
                     "p_query_text": query,
                     "p_match_threshold": match_threshold,
                     "p_match_count": match_count
@@ -882,7 +988,10 @@ class PlaybookMixin(SchemaScopedClient):
 
     @handle_exceptions
     def save_agent_playbooks(
-        self, agent_playbooks: list[AgentPlaybook]
+        self,
+        agent_playbooks: list[AgentPlaybook],
+        *,
+        lineage_contexts: list[LineageContext] | None = None,
     ) -> list[AgentPlaybook]:
         """
         Save agent playbooks with embeddings.
@@ -893,46 +1002,96 @@ class PlaybookMixin(SchemaScopedClient):
         Returns:
             list[AgentPlaybook]: Saved agent playbooks with agent_playbook_id populated from storage
         """
-        saved_playbooks = []
+        if lineage_contexts is not None and len(lineage_contexts) != len(
+            agent_playbooks
+        ):
+            raise ValueError("lineage_contexts must match agent_playbooks length")
+        if any(
+            context.op_kind not in {"create", "aggregate"}
+            for context in lineage_contexts or []
+        ):
+            raise ValueError(
+                "agent playbook lineage context must use op_kind='create' or 'aggregate'"
+            )
+        if any(
+            context.op_kind == "aggregate"
+            and not (context.request_id and context.request_id.strip())
+            for context in lineage_contexts or []
+        ):
+            raise ValueError("agent playbook aggregate lineage requires request_id")
+
+        contexts = lineage_contexts or [
+            LineageContext(op_kind="create") for _ in agent_playbooks
+        ]
         for agent_playbook in agent_playbooks:
-            is_new = not agent_playbook.agent_playbook_id
-            embedding_text = agent_playbook.trigger or agent_playbook.content
-            if self._should_expand_documents():
+            text = embedding_text(agent_playbook)
+            if text and self._should_expand_documents():
                 with ThreadPoolExecutor(max_workers=2) as executor:
-                    emb_future = executor.submit(self._get_embedding, embedding_text)
-                    exp_future = executor.submit(self._expand_document, embedding_text)
+                    emb_future = executor.submit(self._get_embedding, text)
+                    exp_future = executor.submit(self._expand_document, text)
                     agent_playbook.embedding = emb_future.result(timeout=15)
                     agent_playbook.expanded_terms = exp_future.result(timeout=15)
+            elif text:
+                agent_playbook.embedding = self._get_embedding(text)
+                agent_playbook.expanded_terms = None
             else:
-                agent_playbook.embedding = self._get_embedding(embedding_text)
-            response = (
-                self._table("agent_playbooks")
-                .upsert(agent_playbook_to_data(agent_playbook))
-                .execute()
-            )
-            if response.data and isinstance(response.data, list):
-                row = cast(dict[str, Any], response.data[0])
-                agent_playbook.agent_playbook_id = row.get(
-                    "agent_playbook_id", agent_playbook.agent_playbook_id
+                agent_playbook.embedding = []
+                agent_playbook.expanded_terms = None
+
+        with self.commit_scope():
+            for agent_playbook, context in zip(agent_playbooks, contexts, strict=True):
+                is_new = not agent_playbook.agent_playbook_id
+                response = (
+                    self._table("agent_playbooks")
+                    .upsert(agent_playbook_to_data(agent_playbook))
+                    .execute()
                 )
-            if self._opensearch:
-                self._opensearch.index_rows("agent_playbooks", _rows(response))
-            saved_playbooks.append(agent_playbook)
-            self._record_playbook_event(
-                event_name=(
-                    "agent_playbook_created" if is_new else "agent_playbook_updated"
-                ),
-                outcome="created" if is_new else "updated",
-                entity_type="agent_playbook",
-                entity_id=(
-                    str(agent_playbook.agent_playbook_id)
-                    if agent_playbook.agent_playbook_id
-                    else None
-                ),
-                playbook_name=agent_playbook.playbook_name,
-                agent_version=agent_playbook.agent_version,
-            )
-        return saved_playbooks
+                if response.data and isinstance(response.data, list):
+                    row = cast(dict[str, Any], response.data[0])
+                    agent_playbook.agent_playbook_id = row.get(
+                        "agent_playbook_id", agent_playbook.agent_playbook_id
+                    )
+                entity_id = str(agent_playbook.agent_playbook_id)
+                self._fetch_all(
+                    sql.SQL(
+                        """INSERT INTO {} (
+                               org_id, entity_type, entity_id, op, prov_relation,
+                               source_ids, actor, request_id, reason, created_at,
+                               model_name, provider
+                           ) VALUES (%s, 'agent_playbook', %s, %s, %s,
+                                     %s::jsonb, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
+                           DO NOTHING RETURNING 1"""
+                    ).format(self._table_identifier("lineage_event")),
+                    [
+                        self.org_id,
+                        entity_id,
+                        context.op_kind,
+                        "wasDerivedFrom"
+                        if context.op_kind == "aggregate"
+                        else "wasGeneratedBy",
+                        json.dumps(context.source_ids),
+                        context.actor,
+                        context.request_id or f"create_{entity_id}",
+                        context.reason,
+                        int(datetime.now(UTC).timestamp()),
+                        context.model_name,
+                        context.provider,
+                    ],
+                )
+                if self._opensearch:
+                    self._opensearch.index_rows("agent_playbooks", _rows(response))
+                self._record_playbook_event(
+                    event_name=(
+                        "agent_playbook_created" if is_new else "agent_playbook_updated"
+                    ),
+                    outcome="created" if is_new else "updated",
+                    entity_type="agent_playbook",
+                    entity_id=entity_id,
+                    playbook_name=agent_playbook.playbook_name,
+                    agent_version=agent_playbook.agent_version,
+                )
+        return agent_playbooks
 
     @handle_exceptions
     def get_agent_playbooks(
@@ -943,6 +1102,12 @@ class PlaybookMixin(SchemaScopedClient):
         status_filter: list[Status | None] | None = None,
         playbook_status_filter: list[PlaybookStatus] | None = None,
         tags: list[str] | None = None,
+        agent_playbook_id: int | None = None,
+        query: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        offset: int = 0,
+        max_agent_playbook_id: int | None = None,
     ) -> list[AgentPlaybook]:
         """
         Get agent playbooks from storage.
@@ -958,19 +1123,34 @@ class PlaybookMixin(SchemaScopedClient):
         Returns:
             list[AgentPlaybook]: List of agent playbook objects
         """
-        query = (
-            self._table("agent_playbooks")
-            .select(_AGENT_PLAYBOOK_COLUMNS)
-            .order("created_at", desc=True)
-            .limit(limit)
-        )
+        db_query = self._table("agent_playbooks").select(_AGENT_PLAYBOOK_COLUMNS)
+
+        if agent_playbook_id is not None:
+            db_query = db_query.eq("agent_playbook_id", agent_playbook_id)
+        if max_agent_playbook_id is not None:
+            db_query = db_query.lte("agent_playbook_id", max_agent_playbook_id)
+        if query:
+            db_query = db_query.search_text(
+                [
+                    "content",
+                    "trigger",
+                    "rationale",
+                    "playbook_name",
+                    "playbook_metadata",
+                ],
+                query,
+            )
+        if start_time is not None:
+            db_query = db_query.gte("created_at", _timestamp_to_iso(start_time))
+        if end_time is not None:
+            db_query = db_query.lte("created_at", _timestamp_to_iso(end_time))
 
         # Add playbook_name filter if specified (skip if None or empty string)
         if playbook_name:
-            query = query.eq("playbook_name", playbook_name)
+            db_query = db_query.eq("playbook_name", playbook_name)
 
         if agent_version is not None:
-            query = query.eq("agent_version", agent_version)
+            db_query = db_query.eq("agent_version", agent_version)
 
         # Apply status filter (for Status: CURRENT, ARCHIVED, PENDING, etc.)
         if status_filter is not None:
@@ -984,16 +1164,16 @@ class PlaybookMixin(SchemaScopedClient):
                 elif isinstance(s, str):
                     status_strings.append(s)
             if has_none and status_strings:
-                query = query.or_(
+                db_query = db_query.or_(
                     f"status.is.null,status.in.({','.join(status_strings)})"
                 )
             elif has_none:
-                query = query.is_("status", "null")
+                db_query = db_query.is_("status", "null")
             elif status_strings:
-                query = query.in_("status", status_strings)
+                db_query = db_query.in_("status", status_strings)
         else:
             # Default behavior: exclude archived (keep current agent playbooks)
-            query = query.is_("status", "null")
+            db_query = db_query.is_("status", "null")
 
         # Apply playbook_status filter (for PlaybookStatus: PENDING, APPROVED, REJECTED)
         # Only apply if specified; when None or empty, return all playbook statuses
@@ -1002,11 +1182,20 @@ class PlaybookMixin(SchemaScopedClient):
                 s.value if isinstance(s, PlaybookStatus) else s
                 for s in playbook_status_filter
             ]
-            query = query.in_("playbook_status", status_values)
+            db_query = db_query.in_("playbook_status", status_values)
         if tags:
-            query = query.contains("tags", tags)
+            db_query = db_query.contains("tags", tags)
 
-        response = query.execute()
+        if max_agent_playbook_id is not None:
+            db_query = db_query.order("agent_playbook_id", desc=True).limit(limit)
+        else:
+            db_query = (
+                db_query.order("created_at", desc=True)
+                .order("agent_playbook_id", desc=True)
+                .limit(limit)
+                .offset(offset)
+            )
+        response = db_query.execute()
         return [self._row_to_agent_playbook(item) for item in _rows(response)]
 
     @handle_exceptions
@@ -1024,6 +1213,62 @@ class PlaybookMixin(SchemaScopedClient):
         response = query.execute()
         rows = _rows(response)
         return self._row_to_agent_playbook(rows[0]) if rows else None
+
+    @handle_exceptions
+    def get_agent_playbooks_by_ids(
+        self,
+        agent_playbook_ids: list[int],
+        *,
+        status_filter: list[Status | None] | None = None,
+        playbook_status_filter: list[PlaybookStatus] | None = None,
+        include_inactive: bool = False,
+        include_embedding: bool = False,
+    ) -> list[AgentPlaybook]:
+        validate_include_inactive(
+            include_inactive=include_inactive,
+            status_filter=status_filter,
+            playbook_status_filter=playbook_status_filter,
+        )
+        if not agent_playbook_ids:
+            return []
+        clauses: list[sql.Composable] = [sql.SQL("agent_playbook_id = ANY(%s)")]
+        params: list[Any] = [list(dict.fromkeys(agent_playbook_ids))]
+        if not include_inactive:
+            effective_status = [None] if status_filter is None else status_filter
+            status_values = [
+                status.value
+                for status in effective_status
+                if status is not None and status.value is not None
+            ]
+            if None in effective_status and status_values:
+                clauses.append(sql.SQL("(status IS NULL OR status = ANY(%s))"))
+                params.append(status_values)
+            elif None in effective_status:
+                clauses.append(sql.SQL("status IS NULL"))
+            elif status_values:
+                clauses.append(sql.SQL("status = ANY(%s)"))
+                params.append(status_values)
+            if playbook_status_filter:
+                clauses.append(sql.SQL("playbook_status = ANY(%s)"))
+                params.append([status.value for status in playbook_status_filter])
+        columns = sql.SQL(_AGENT_PLAYBOOK_COLUMNS)
+        if include_embedding:
+            columns += sql.SQL(", embedding::text AS embedding")
+        rows = self._fetch_all(
+            sql.SQL("SELECT {} FROM {} WHERE {}").format(
+                columns,
+                self._table_identifier("agent_playbooks"),
+                sql.SQL(" AND ").join(clauses),
+            ),
+            params,
+        )
+        result = [self._row_to_agent_playbook(row) for row in rows]
+        if include_embedding:
+            for playbook, row in zip(result, rows, strict=True):
+                playbook.embedding = _parse_user_playbook_embedding(
+                    row.get("embedding")
+                )
+        return result
 
     @handle_exceptions
     def delete_all_agent_playbooks(self) -> None:
@@ -1157,6 +1402,7 @@ class PlaybookMixin(SchemaScopedClient):
         rationale: str | None = None,
         blocking_issue: BlockingIssue | None = None,
         playbook_status: PlaybookStatus | None = None,
+        tags: list[str] | None = None,
     ) -> None:
         """Update editable fields of an agent playbook. Only non-None fields are updated.
 
@@ -1195,6 +1441,8 @@ class PlaybookMixin(SchemaScopedClient):
             updates["blocking_issue"] = blocking_issue.model_dump()
         if playbook_status is not None:
             updates["playbook_status"] = playbook_status.value
+        if tags is not None:
+            updates["tags"] = tags
         if updates:
             response = (
                 self._table("agent_playbooks")
@@ -1222,6 +1470,7 @@ class PlaybookMixin(SchemaScopedClient):
         trigger: str | None = None,
         rationale: str | None = None,
         blocking_issue: BlockingIssue | None = None,
+        tags: list[str] | None = None,
     ) -> None:
         """Update editable fields of a user playbook. Only non-None fields are updated.
 
@@ -1257,6 +1506,8 @@ class PlaybookMixin(SchemaScopedClient):
             updates["rationale"] = rationale
         if blocking_issue is not None:
             updates["blocking_issue"] = blocking_issue.model_dump()
+        if tags is not None:
+            updates["tags"] = tags
         if updates:
             response = (
                 self._table("user_playbooks")
@@ -1402,8 +1653,7 @@ class PlaybookMixin(SchemaScopedClient):
                 "UPDATE {} SET status = %s, retired_at = %s "
                 "WHERE {} = ANY(%s) "
                 "AND (status IS NULL OR status NOT IN (%s, %s))"
-            )
-            .format(self._table_identifier(table), sql.Identifier(pk))
+            ).format(self._table_identifier(table), sql.Identifier(pk))
             + approved_guard
             + sql.SQL(" RETURNING {}").format(sql.Identifier(pk)),
             params,
@@ -1436,12 +1686,7 @@ class PlaybookMixin(SchemaScopedClient):
                 ],
             )
         if changed_ids and self._opensearch:
-            response = (
-                self._table(table)
-                .select("*")
-                .in_(pk, changed_ids)
-                .execute()
-            )
+            response = self._table(table).select("*").in_(pk, changed_ids).execute()
             self._opensearch.index_rows(table, _rows(response))
         return len(changed_ids)
 
@@ -1537,7 +1782,9 @@ class PlaybookMixin(SchemaScopedClient):
         end_time = int(request.end_time.timestamp()) if request.end_time else None
         status_filter = request.status_filter
         playbook_status_filter = request.playbook_status_filter
-        match_threshold = request.threshold or 0.5
+        match_threshold = resolve_retrieval_threshold(
+            request.threshold, model_name=self.embedding_model_name
+        )
         match_count = request.top_k or 10
         query_embedding = options.query_embedding if options else None
 
@@ -1582,7 +1829,8 @@ class PlaybookMixin(SchemaScopedClient):
                 ids = self._opensearch.search_ids(
                     entity="agent_playbooks",
                     query_text=query,
-                    query_embedding=query_embedding or self._get_embedding(query),
+                    query_embedding=query_embedding
+                    or self._get_embedding(query, purpose="query"),
                     search_mode=effective_mode,
                     top_k=match_count,
                     threshold=match_threshold,
@@ -1603,7 +1851,8 @@ class PlaybookMixin(SchemaScopedClient):
             response = self._rpc(
                 "hybrid_match_agent_playbooks",
                 {
-                    "p_query_embedding": query_embedding or self._get_embedding(query),
+                    "p_query_embedding": query_embedding
+                    or self._get_embedding(query, purpose="query"),
                     "p_query_text": query,
                     "p_match_threshold": match_threshold,
                     "p_match_count": match_count
@@ -1717,7 +1966,9 @@ class PlaybookMixin(SchemaScopedClient):
     ) -> dict[int, list[int]]:
         if not agent_playbook_ids:
             return {}
-        unique_ids = list(dict.fromkeys(int(agent_id) for agent_id in agent_playbook_ids))
+        unique_ids = list(
+            dict.fromkeys(int(agent_id) for agent_id in agent_playbook_ids)
+        )
         response = (
             self._table("agent_playbook_source_user_playbooks")
             .select("agent_playbook_id, user_playbook_id")
@@ -2022,13 +2273,19 @@ class PlaybookMixin(SchemaScopedClient):
             else:
                 result.embedding = []
 
-            self._table("agent_success_evaluation_result").upsert(
-                agent_success_evaluation_result_to_data(result)
-            ).execute()
+            subject_ref = self._subject_ref_for_user_id(result.user_id)
+            self._assert_subject_writable_locked(subject_ref)
+            data = agent_success_evaluation_result_to_data(result)
+            data["governance_subject_ref"] = subject_ref
+            self._table("agent_success_evaluation_result").upsert(data).execute()
 
     @handle_exceptions
     def get_agent_success_evaluation_results(
-        self, limit: int = 100, agent_version: str | None = None
+        self,
+        limit: int = 100,
+        agent_version: str | None = None,
+        user_id: str | None = None,
+        only_untagged: bool = False,
     ) -> list[AgentSuccessEvaluationResult]:
         """
         Get agent success evaluation results from storage.
@@ -2050,11 +2307,16 @@ class PlaybookMixin(SchemaScopedClient):
         # Add agent_version filter if specified
         if agent_version is not None:
             query = query.eq("agent_version", agent_version)
+        if user_id is not None:
+            query = query.eq("user_id", user_id)
+        if only_untagged:
+            query = query.is_("tags", "null")
 
         response = query.execute()
         return [
             AgentSuccessEvaluationResult(
                 result_id=int(item["result_id"]),
+                user_id=str(item.get("user_id") or ""),
                 session_id=item["session_id"],
                 agent_version=item["agent_version"],
                 evaluation_name=item.get("evaluation_name"),
@@ -2073,6 +2335,7 @@ class PlaybookMixin(SchemaScopedClient):
                 or 0,
                 user_turns_to_resolution=item.get("user_turns_to_resolution"),
                 is_escalated=item.get("is_escalated", False) or False,
+                tags=item.get("tags"),
                 embedding=[],
             )
             for item in _rows(response)
@@ -2088,6 +2351,7 @@ class PlaybookMixin(SchemaScopedClient):
     @handle_exceptions
     def delete_agent_success_evaluation_results_for_session(
         self,
+        user_id: str,
         session_id: str,
         evaluation_name: str,
         agent_version: str,
@@ -2095,6 +2359,7 @@ class PlaybookMixin(SchemaScopedClient):
         response = (
             self._table("agent_success_evaluation_result")
             .delete()
+            .eq("user_id", user_id)
             .eq("session_id", session_id)
             .eq("evaluation_name", evaluation_name)
             .eq("agent_version", agent_version)

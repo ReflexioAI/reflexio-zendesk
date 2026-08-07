@@ -98,11 +98,71 @@ class RetentionMixin(ABC):
         target = get_retention_target(target_name)
         if not self._retention_table_exists(target.table_name):
             return 0
-        keys = self._retention_select_oldest_keys(target, count)
+        keys = self._retention_select_keys(target, count)
         if not keys:
             return 0
         self._retention_perform_delete(target, keys)
         return len(keys)
+
+    def gc_retired_optimization_jobs(
+        self,
+        *,
+        older_than_epoch: int,
+        stale_before_epoch: int,
+        limit: int = 1000,
+    ) -> int:
+        """Apply fixed optimization terminal and staging retention ownership.
+
+        Enterprise SQL backends override the protected hook. OSS backends have
+        no provider/publication staging tables and therefore return zero.
+        """
+        if older_than_epoch < 0 or stale_before_epoch < 0:
+            raise ValueError("optimization retention cutoffs must be non-negative")
+        if limit <= 0:
+            raise ValueError("optimization retention limit must be positive")
+        return self._retention_gc_retired_optimization_jobs(
+            older_than_epoch=older_than_epoch,
+            stale_before_epoch=stale_before_epoch,
+            limit=limit,
+        )
+
+    def _retention_gc_retired_optimization_jobs(
+        self,
+        *,
+        older_than_epoch: int,
+        stale_before_epoch: int,
+        limit: int,
+    ) -> int:
+        del older_than_epoch, stale_before_epoch, limit
+        return 0
+
+    def _retention_select_keys(
+        self, target: RetentionTarget, count: int
+    ) -> list[tuple[Any, ...]]:
+        """Select tombstones first, then oldest rows when a target opts in.
+
+        The tombstone pass can never under-delete: the fallback select returns
+        ``min(count, table_rows)`` keys and ``seen`` only ever holds tombstones
+        already counted, so the union still reaches ``count`` whenever the
+        table holds that many rows.
+        """
+        if not target.priority_statuses:
+            return self._retention_select_oldest_keys(target, count)
+
+        keys = self._retention_select_oldest_keys(
+            target, count, statuses=target.priority_statuses
+        )
+        if len(keys) >= count:
+            return keys
+
+        seen = set(keys)
+        for key in self._retention_select_oldest_keys(target, count):
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
+            if len(keys) == count:
+                break
+        return keys
 
     def _retention_perform_delete(
         self, target: RetentionTarget, keys: list[tuple[Any, ...]]
@@ -130,13 +190,23 @@ class RetentionMixin(ABC):
 
     @abstractmethod
     def _retention_select_oldest_keys(
-        self, target: RetentionTarget, count: int
+        self,
+        target: RetentionTarget,
+        count: int,
+        statuses: tuple[str, ...] | None = None,
     ) -> list[tuple[Any, ...]]:
         """Return up to ``count`` oldest key tuples for ``target``.
 
         Each key tuple contains values aligned with ``target.id_columns``.
         Ordering is by ``target.order_column`` ascending with the id
         columns as a stable tiebreaker.
+
+        Args:
+            target (RetentionTarget): Target whose keys are being selected.
+            count (int): Maximum number of key tuples to return.
+            statuses (tuple[str, ...] | None): When not None, restrict the
+                select to rows whose ``status`` is one of these values. An
+                empty tuple matches nothing (never every row).
         """
         raise NotImplementedError
 

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from reflexio.models.api_schema.domain.entities import LineageContext, LineageEvent
 from reflexio.models.api_schema.domain.enums import Status
-from reflexio.server.tracing import capture_anomaly
+from reflexio.server.error_reporting import capture_anomaly
 
 from ._base import _epoch_now
 
@@ -17,7 +17,12 @@ EntityType = Literal["user_playbook", "agent_playbook", "profile"]
 # Also used as the merge guard: a source that already carries any of these
 # statuses is skipped (no re-tombstone, no clock reset).
 _GC_ELIGIBLE_STATUSES: frozenset[str] = frozenset(
-    {Status.MERGED.value, Status.SUPERSEDED.value, Status.ARCHIVED.value}
+    {
+        Status.MERGED.value,
+        Status.SUPERSEDED.value,
+        Status.ARCHIVED.value,
+        Status.EXPIRED.value,
+    }
 )
 
 # Mapping from entity_type string to (table_name, primary_key_column).
@@ -56,17 +61,20 @@ def _append_event_stmt(
     from_status: str | None = None,
     to_status: str | None = None,
     status_namespace: str | None = None,
+    model_name: str | None = None,
+    provider: str | None = None,
 ) -> sqlite3.Cursor:
     """Insert a lineage event row; no-ops on (org_id, entity_type, entity_id, op, request_id) duplicate.
 
     Returns the cursor so callers can inspect ``rowcount``/``lastrowid``.
     """
-    return conn.execute(
+    cursor = conn.execute(
         "INSERT OR IGNORE INTO lineage_event "
         "(org_id, entity_type, entity_id, op, prov_relation, source_ids, "
         "actor, request_id, reason, created_at, "
-        "from_status, to_status, status_namespace) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "from_status, to_status, status_namespace, model_name, "
+        "provider) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             org_id,
             entity_type,
@@ -81,8 +89,67 @@ def _append_event_stmt(
             from_status,
             to_status,
             status_namespace,
+            model_name,
+            provider,
         ),
     )
+    if (
+        cursor.rowcount > 0
+        and entity_type == "user_playbook"
+        and op in {"create", "merge", "revise", "status_change", "purge"}
+    ):
+        if not str(entity_id).isdigit():
+            return cursor
+        parsed_entity_id = int(entity_id)
+        candidate_ids = sorted(
+            {
+                int(value)
+                for value in [parsed_entity_id, *source_ids]
+                if str(value).isdigit()
+            }
+        )
+        if not candidate_ids:
+            return cursor
+        placeholders = ",".join("?" for _ in candidate_ids)
+        version_rows = conn.execute(
+            "SELECT user_playbook_id, agent_version FROM user_playbooks "
+            f"WHERE user_playbook_id IN ({placeholders}) "
+            "AND trim(agent_version) <> '' "
+            "ORDER BY agent_version, user_playbook_id",
+            candidate_ids,
+        ).fetchall()
+        candidate_version_by_id = {
+            int(row[0]): str(row[1]).strip() for row in version_rows
+        }
+        source_id_values = [int(value) for value in source_ids if str(value).isdigit()]
+        for agent_version in sorted(set(candidate_version_by_id.values())):
+            version_source_ids = [
+                value
+                for value in source_id_values
+                if candidate_version_by_id.get(value) == agent_version
+            ]
+            # Creation only makes new intake discoverable. It cannot invalidate
+            # existing membership, so putting it on the invalidation queue would
+            # force the scheduler to drain one no-op event per new playbook.
+            if op != "create":
+                conn.execute(
+                    "INSERT INTO playbook_aggregation_invalidation "
+                    "(agent_version, operation, entity_id, source_ids) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        agent_version,
+                        op,
+                        parsed_entity_id,
+                        json.dumps(version_source_ids),
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO playbook_aggregation_state "
+                "(agent_version, pending, next_attempt_at) VALUES (?, 1, unixepoch()) "
+                "ON CONFLICT(agent_version) DO UPDATE SET pending=1",
+                (agent_version,),
+            )
+    return cursor
 
 
 # Per-entity purge SQL: blank every PII/content column.
@@ -95,7 +162,8 @@ _PROFILE_PURGE_SQL = (
     "UPDATE profiles SET "
     "content='', user_id='', generated_from_request_id='', source='', "
     "embedding=NULL, extractor_names=NULL, expanded_terms=NULL, tags=NULL, "
-    "custom_features=NULL, notes=NULL, source_span=NULL, reader_angle=NULL "
+    "custom_features=NULL, notes=NULL, source_span=NULL, reader_angle=NULL, "
+    "governance_subject_ref=NULL "
     "WHERE profile_id=?"
 )
 _USER_PLAYBOOK_PURGE_SQL = (
@@ -103,7 +171,8 @@ _USER_PLAYBOOK_PURGE_SQL = (
     "content='', user_id=NULL, request_id='', source=NULL, "
     "trigger=NULL, rationale=NULL, blocking_issue=NULL, "
     "source_interaction_ids=NULL, embedding=NULL, expanded_terms=NULL, "
-    "tags=NULL, source_span=NULL, notes=NULL, reader_angle=NULL "
+    "tags=NULL, source_span=NULL, notes=NULL, reader_angle=NULL, "
+    "governance_subject_ref=NULL "
     "WHERE user_playbook_id=?"
 )
 # agent_playbook purge not yet required; added when Task 3/4 needs it.
@@ -120,6 +189,7 @@ class SQLiteLineageMixin:
     conn: sqlite3.Connection
     _lock: threading.RLock
     org_id: str
+    _own_transaction: Any
 
     def append_lineage_event(self, event: LineageEvent) -> int:
         """Append an event; idempotent on (org_id, entity_type, entity_id, op, request_id).
@@ -150,6 +220,8 @@ class SQLiteLineageMixin:
                 from_status=event.from_status,
                 to_status=event.to_status,
                 status_namespace=event.status_namespace,
+                model_name=event.model_name,
+                provider=event.provider,
             )
             if (
                 cur.rowcount == 0
@@ -166,10 +238,12 @@ class SQLiteLineageMixin:
                     ),
                 ).fetchone()
                 eid = row[0] if row else None
-                self.conn.commit()
+                if self._own_transaction():
+                    self.conn.commit()
                 return int(eid) if eid is not None else 0
             last = cur.lastrowid
-            self.conn.commit()
+            if self._own_transaction():
+                self.conn.commit()
             return int(last) if last is not None else 0
 
     def get_lineage_events(
@@ -224,6 +298,8 @@ class SQLiteLineageMixin:
                 from_status=r["from_status"],
                 to_status=r["to_status"],
                 status_namespace=r["status_namespace"],
+                model_name=r["model_name"],
+                provider=r["provider"],
             )
             for r in rows
         ]
@@ -239,9 +315,17 @@ class SQLiteLineageMixin:
         """Soft-delete each source into the survivor in one atomic transaction.
 
         Sets ``status=MERGED`` and ``merged_into=survivor_id`` on each source
-        whose status is not already a tombstone. Appends a single ``merge``
-        lineage event keyed on ``survivor_id``. Idempotent — re-running on
-        already-tombstoned sources is a no-op.
+        whose status is not already a tombstone.
+
+        Appends **at most one** ``merge`` lineage event keyed on ``survivor_id``,
+        and only when at least one source was actually tombstoned. The event
+        records the sources this call changed, not the sources it was asked to
+        change — a partial merge (say 2 of 5 sources still eligible) records
+        exactly those 2, because the other 3 were merged by some earlier
+        operation and possibly into a different survivor.
+
+        Idempotent in both the rows and the event: re-running on
+        already-tombstoned sources changes nothing and records nothing.
 
         Args:
             entity_type (str): One of ``"user_playbook"``, ``"agent_playbook"``,
@@ -261,7 +345,18 @@ class SQLiteLineageMixin:
         eligible_ph = ",".join("?" * len(_GC_ELIGIBLE_STATUSES))
         eligible_vals = list(_GC_ELIGIBLE_STATUSES)
         with self._lock:
-            for sid in source_ids:
+            # Only the sources this call actually tombstoned, in sorted order.
+            # ``source_ids`` on a
+            # lineage event means "records merged into entity_id"
+            # (``LineageEvent.source_ids``), so listing a source that was ALREADY
+            # tombstoned would claim a merge this operation did not perform — and
+            # an already-MERGED source may have been merged into a DIFFERENT
+            # survivor entirely.
+            merged_source_ids: list[str] = []
+            # Sorted so concurrent merges over overlapping sources take their row
+            # locks in a consistent sequence — the Postgres RPC sorts identically,
+            # so both backends also emit source_ids in the same order.
+            for sid in sorted(source_ids):
                 if sid == survivor_id:
                     # Never tombstone the survivor itself, even if it is
                     # accidentally listed among the source ids.
@@ -269,7 +364,7 @@ class SQLiteLineageMixin:
                 # Skip sources that already carry any eligible/tombstone status
                 # (MERGED, SUPERSEDED, or ARCHIVED) — avoids re-tombstoning an
                 # already-archived source and resetting its retired_at clock.
-                self.conn.execute(
+                cur = self.conn.execute(
                     f"UPDATE {table} SET status=?, merged_into=?, retired_at=? "  # noqa: S608
                     f"WHERE {pk}=? AND {pk}!=? "
                     f"AND (status IS NULL OR status NOT IN ({eligible_ph}))",
@@ -282,6 +377,16 @@ class SQLiteLineageMixin:
                         *eligible_vals,
                     ),
                 )
+                if cur.rowcount > 0:
+                    merged_source_ids.append(sid)
+            if not merged_source_ids:
+                # Nothing committed, so there is nothing to record. Emitting here
+                # would write a ``merge`` event asserting a state change that
+                # never happened; the sibling ``supersede_record`` already guards
+                # the same way on its single-statement ``rowcount``.
+                if self._own_transaction():
+                    self.conn.commit()
+                return
             _append_event_stmt(
                 self.conn,
                 org_id=self.org_id,
@@ -289,12 +394,15 @@ class SQLiteLineageMixin:
                 entity_id=survivor_id,
                 op="merge",
                 prov="wasDerivedFrom",
-                source_ids=source_ids,
+                source_ids=merged_source_ids,
                 actor=context.actor,
                 request_id=context.request_id,
                 reason=context.reason,
+                model_name=context.model_name,
+                provider=context.provider,
             )
-            self.conn.commit()
+            if self._own_transaction():
+                self.conn.commit()
 
     def supersede_record(
         self,
@@ -336,7 +444,8 @@ class SQLiteLineageMixin:
                 (Status.SUPERSEDED.value, successor_id, _epoch_now(), incumbent_id),
             )
             if cur.rowcount == 0:
-                self.conn.commit()
+                if self._own_transaction():
+                    self.conn.commit()
                 return False
             _append_event_stmt(
                 self.conn,
@@ -349,8 +458,11 @@ class SQLiteLineageMixin:
                 actor=context.actor,
                 request_id=context.request_id,
                 reason=context.reason,
+                model_name=context.model_name,
+                provider=context.provider,
             )
-            self.conn.commit()
+            if self._own_transaction():
+                self.conn.commit()
             return True
 
     def purge_content(self, *, entity_type: EntityType, entity_id: str) -> bool:

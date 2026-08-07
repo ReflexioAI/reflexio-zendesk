@@ -78,7 +78,8 @@ class PostgresQuery:
         self._count_exact = False
         self._filters: list[tuple[str, str, Any]] = []
         self._or_filters: list[str] = []
-        self._order_by: tuple[str, bool] | None = None
+        self._text_search_filters: list[tuple[list[str], str]] = []
+        self._order_by: list[tuple[str, bool]] = []
         self._limit: int | None = None
         self._offset: int | None = None
         self._payload: Any = None
@@ -150,8 +151,13 @@ class PostgresQuery:
         self._or_filters.append(expression)
         return self
 
+    def search_text(self, columns: list[str], value: str) -> PostgresQuery:
+        """Apply a case-insensitive substring match across trusted columns."""
+        self._text_search_filters.append((columns, value))
+        return self
+
     def order(self, column: str, desc: bool = False) -> PostgresQuery:
-        self._order_by = (column, desc)
+        self._order_by.append((column, desc))
         return self
 
     def limit(self, value: int) -> PostgresQuery:
@@ -194,11 +200,14 @@ class PostgresQuery:
         if where_sql is not None:
             query += sql.SQL(" WHERE ") + where_sql
         if self._order_by:
-            column, desc = self._order_by
-            query += sql.SQL(" ORDER BY {} {}").format(
-                sql.Identifier(column),
-                sql.SQL("DESC" if desc else "ASC"),
-            )
+            order_parts = [
+                sql.SQL("{} {}").format(
+                    sql.Identifier(column),
+                    sql.SQL("DESC" if desc else "ASC"),
+                )
+                for column, desc in self._order_by
+            ]
+            query += sql.SQL(" ORDER BY ") + sql.SQL(", ").join(order_parts)
         if self._limit is not None:
             query += sql.SQL(" LIMIT %s")
             params.append(self._limit)
@@ -333,6 +342,17 @@ class PostgresQuery:
                 params.append(self._filter_value(column, op, value))
         for expression in self._or_filters:
             clauses.append(_parse_or_expression(expression, params))  # noqa: PERF401
+        for columns, value in self._text_search_filters:
+            text_clauses = [
+                sql.SQL("{} ILIKE %s").format(
+                    sql.Identifier(self._physical_column(column))
+                )
+                for column in columns
+            ]
+            clauses.append(
+                sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")")
+            )
+            params.extend([f"%{value}%"] * len(columns))
         if not clauses:
             return None
         return sql.SQL(" AND ").join(clauses)
@@ -405,7 +425,10 @@ class PostgresRpc:
 
 def _prepare_value(column: str, value: Any, *, table: str | None = None) -> Any:
     if column == "embedding" and isinstance(value, list):
-        return _vector_literal(value)
+        # pgvector has no zero-dimensional value. An empty embedding means the
+        # entity intentionally has no vector (for example, a triggerless
+        # playbook under the trigger-only embedding policy), so persist NULL.
+        return _vector_literal(value) if value else None
     if table == "profiles" and column == "source_interaction_ids":
         return Json(value)
     if column in _JSON_COLUMNS and isinstance(value, (dict, list)):

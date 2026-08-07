@@ -20,6 +20,8 @@ from reflexio.models.api_schema.service_schemas import (
     DeleteUserPlaybooksByIdsRequest,
     DowngradeUserPlaybooksRequest,
     DowngradeUserPlaybooksResponse,
+    ReviewUserPlaybooksRequest,
+    ReviewUserPlaybooksResponse,
     UpgradeUserPlaybooksRequest,
     UpgradeUserPlaybooksResponse,
 )
@@ -27,10 +29,44 @@ from reflexio.models.config_schema import SearchOptions
 from reflexio.server.services.playbook.service import (
     PlaybookGenerationService,
 )
+from reflexio.server.services.retrieval.user_context_guard import (
+    should_suppress_user_context,
+)
 from reflexio.server.tracing import profile_step
 
 
 class UserPlaybookMixin(ReflexioBase):
+    def review_user_playbooks(
+        self,
+        request: ReviewUserPlaybooksRequest | dict,
+        run_id: str | None = None,
+    ) -> ReviewUserPlaybooksResponse:
+        """Re-review current user playbooks selected by creation time.
+
+        Args:
+            request: The review request.
+            run_id: Optional caller-minted run id. Apply mode is dispatched to a
+                background task, so the route mints the id up front to return it
+                before the run finishes; it correlates the run's lineage events.
+        """
+        if isinstance(request, dict):
+            request = ReviewUserPlaybooksRequest(**request)
+        if not self._is_storage_configured():
+            return ReviewUserPlaybooksResponse(
+                success=False,
+                report_only=request.report_only,
+                run_id=run_id,
+                msg=STORAGE_NOT_CONFIGURED_MSG,
+            )
+        from reflexio.server.services.playbook.review_service import (
+            UserPlaybookReviewService,
+        )
+
+        return UserPlaybookReviewService(
+            request_context=self.request_context,
+            llm_client=self.llm_client,
+        ).run(request, run_id=run_id)
+
     def get_user_playbooks(
         self,
         request: GetUserPlaybooksRequest | dict,
@@ -53,10 +89,19 @@ class UserPlaybookMixin(ReflexioBase):
         try:
             user_playbooks = self._get_storage().get_user_playbooks(
                 limit=request.limit or 100,
+                user_playbook_id=request.user_playbook_id,
                 user_id=request.user_id,
+                request_id=request.request_id,
+                query=request.query,
                 playbook_name=request.playbook_name,
                 agent_version=request.agent_version,
                 status_filter=request.status_filter,
+                start_time=(
+                    int(request.start_time.timestamp()) if request.start_time else None
+                ),
+                end_time=(
+                    int(request.end_time.timestamp()) if request.end_time else None
+                ),
                 tags=request.tags,
             )
             return GetUserPlaybooksResponse(
@@ -116,6 +161,18 @@ class UserPlaybookMixin(ReflexioBase):
             )
         if isinstance(request, dict):
             request = SearchUserPlaybookRequest(**request)
+
+        with profile_step(
+            "search.user_context_guard", entity_type="user_playbooks"
+        ) as span:
+            suppress_user_context = should_suppress_user_context(request.query)
+            span.set_data("suppressed", suppress_user_context)
+        if suppress_user_context:
+            return SearchUserPlaybookResponse(
+                success=True,
+                user_playbooks=[],
+                msg="Found 0 matching user playbook(s)",
+            )
 
         try:
             query = (

@@ -30,15 +30,20 @@ class ModelRegistryEntry:
 def _build_registry() -> dict[str, ModelRegistryEntry]:
     """Build the model registry with lazy imports to avoid circular dependencies."""
     from reflexio.models.api_schema.eval_overview_schema import ShadowComparisonOutput
+    from reflexio.models.api_schema.retriever_schema import ReformulationResult
     from reflexio.server.services.agent_success_evaluation.agent_success_evaluation_constants import (
         AgentSuccessEvaluationOutput,
+    )
+    from reflexio.server.services.agent_success_evaluation.components.retrieved_learning_evaluator import (
+        RetrievedLearningImpactOutput,
+        RetrievedLearningRelevanceOutput,
     )
     from reflexio.server.services.playbook.components.consolidator import (
         PlaybookConsolidationOutput,
     )
     from reflexio.server.services.playbook.playbook_service_utils import (
         PlaybookAggregationOutput,
-        StructuredPlaybookList,
+        StructuredReferencedExtractedPlaybookList,
     )
     from reflexio.server.services.playbook_optimizer.models import JudgeOutput
     from reflexio.server.services.profile.components.consolidator import (
@@ -48,19 +53,19 @@ def _build_registry() -> dict[str, ModelRegistryEntry]:
         ProfileUpdateOutput,
         StructuredProfilesOutput,
     )
-    from reflexio.server.services.reflection.reflection_service_utils import (
-        ReflectionOutput,
-    )
     from reflexio.server.services.tagging.service import TagsOutput
 
     return {
         "playbook_extraction": ModelRegistryEntry(
-            model_class=StructuredPlaybookList,
+            model_class=StructuredReferencedExtractedPlaybookList,
             minimal_valid={
                 "playbooks": [
                     {
                         "content": "When user asks a question, provide a detailed answer rather than a brief response.",
                         "trigger": "when user asks a question",
+                        "rationale": "A referenced correction shows that a brief response omitted required detail.",
+                        "evidence_kind": "correction",
+                        "evidence_refs": ["T1"],
                     },
                 ],
             },
@@ -112,23 +117,36 @@ def _build_registry() -> dict[str, ModelRegistryEntry]:
             minimal_valid={
                 "is_success": True,
                 "is_escalated": False,
+                "number_of_correction_per_session": 0,
+            },
+        ),
+        "retrieved_learning_relevance": ModelRegistryEntry(
+            model_class=RetrievedLearningRelevanceOutput,
+            minimal_valid={
+                "verdicts": [
+                    {
+                        "learning_ref": "profile:mock-profile",
+                        "is_relevant": True,
+                        "relevance_reason": "Applies to the session task.",
+                    },
+                ],
+            },
+        ),
+        "retrieved_learning_impact": ModelRegistryEntry(
+            model_class=RetrievedLearningImpactOutput,
+            minimal_valid={
+                "verdicts": [
+                    {
+                        "learning_ref": "profile:mock-profile",
+                        "impact": "positive",
+                        "impact_reason": "The response followed this learning.",
+                    },
+                ],
             },
         ),
         "tagging": ModelRegistryEntry(
             model_class=TagsOutput,
             minimal_valid={"tags": ["example_tag"]},
-        ),
-        "reflection": ModelRegistryEntry(
-            model_class=ReflectionOutput,
-            minimal_valid={
-                "decisions": [
-                    {
-                        "target_kind": "profile",
-                        "target_id": "PROFILE-0",
-                        "reason": "no change",
-                    },
-                ],
-            },
         ),
         "playbook_optimizer_judge": ModelRegistryEntry(
             model_class=JudgeOutput,
@@ -151,6 +169,10 @@ def _build_registry() -> dict[str, ModelRegistryEntry]:
         "boolean_evaluation": ModelRegistryEntry(
             model_class=None,
             minimal_valid="true",
+        ),
+        "query_reformulation": ModelRegistryEntry(
+            model_class=ReformulationResult,
+            minimal_valid={"standalone_query": "example reformulated query"},
         ),
     }
 

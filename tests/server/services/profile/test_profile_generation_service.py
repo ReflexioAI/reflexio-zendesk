@@ -22,6 +22,7 @@ from reflexio.models.api_schema.service_schemas import (
 )
 from reflexio.models.config_schema import ProfileExtractorConfig
 from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.llm._litellm_types import ModelProvenance
 from reflexio.server.llm.litellm_client import LiteLLMClient, LiteLLMConfig
 from reflexio.server.services.base_generation_service import StatusChangeOperation
 from reflexio.server.services.profile.profile_generation_service_utils import (
@@ -310,9 +311,15 @@ class TestProcessResults:
 
         service._process_results([[sample_profile]])
 
-        request_context.storage.add_user_profile.assert_called_once_with(
-            "user_1", [sample_profile]
-        )
+        call = request_context.storage.add_user_profile.call_args
+        assert call.args[:2] == ("user_1", [sample_profile])
+        assert call.kwargs["skip_embedding"] is True
+        contexts = call.kwargs["lineage_contexts"]
+        assert len(contexts) == 1
+        assert contexts[0] is not None
+        assert contexts[0].op_kind == "create"
+        assert contexts[0].model_name is None
+        assert contexts[0].provider is None
         assert sample_profile.source == "api"
         assert sample_profile.status is None  # CURRENT (not pending)
 
@@ -330,12 +337,73 @@ class TestProcessResults:
 
         assert sample_profile.status == Status.PENDING
 
-    def test_save_failure_returns_early(self, service, request_context, sample_profile):
-        """When add_user_profile raises, the method returns without deleting."""
+    def test_save_profiles_carries_extractor_model_provenance(
+        self, service, request_context, sample_profile
+    ):
+        self._setup_service_config(service)
+        service._last_model_provenance = ModelProvenance(
+            model_name="served-model",
+            provider="provider",
+        )
+
+        service._process_results([[sample_profile]])
+
+        context = request_context.storage.add_user_profile.call_args.kwargs[
+            "lineage_contexts"
+        ][0]
+        assert context.op_kind == "create"
+        assert context.model_name == "served-model"
+        assert context.provider == "provider"
+
+    def test_merged_profile_uses_consolidator_completion_provenance(
+        self, service, request_context, sample_profile
+    ):
+        self._setup_service_config(service)
+        merged = sample_profile.model_copy(update={"profile_id": "merged-profile"})
+        provenance = ModelProvenance(
+            model_name="dedup-served",
+            provider="dedup-provider",
+        )
+
+        class FakeConsolidator:
+            model_provenance = provenance
+            lineage_sources_by_profile_id = {"merged-profile": ["old-profile"]}
+            consolidated_output_indices = {0}
+
+            def __init__(self, **_kwargs):
+                pass
+
+            def deduplicate(self, *_args):
+                return [merged], ["old-profile"], []
+
+        with patch(
+            "reflexio.server.services.profile.components.consolidator.ProfileConsolidator",
+            FakeConsolidator,
+        ):
+            service._process_results([[sample_profile]])
+
+        context = request_context.storage.add_user_profile.call_args.kwargs[
+            "lineage_contexts"
+        ][0]
+        assert context.actor == "consolidator"
+        assert context.source_ids == ["old-profile"]
+        assert context.model_name == "dedup-served"
+
+    def test_save_failure_reraises_without_deleting(
+        self, service, request_context, sample_profile
+    ):
+        """When add_user_profile raises, persist RE-RAISES (F1 symmetry with
+        playbook) without falling back to a delete.
+
+        The raise rolls back the fenced commit_scope (durable path) or leaves the
+        extractor bookmark un-advanced (sync path) so a failed write never
+        advances the bookmark over its window.
+        """
         self._setup_service_config(service)
         request_context.storage.add_user_profile.side_effect = RuntimeError("DB error")
 
-        service._process_results([[sample_profile]])
+        with pytest.raises(RuntimeError, match="DB error"):
+            service._process_results([[sample_profile]])
 
         request_context.storage.delete_user_profile.assert_not_called()
 
@@ -352,9 +420,15 @@ class TestProcessResults:
 
         service._process_results([[sample_profile]])
 
-        request_context.storage.add_user_profile.assert_called_once_with(
-            "user_1", [sample_profile]
-        )
+        call = request_context.storage.add_user_profile.call_args
+        assert call.args[:2] == ("user_1", [sample_profile])
+        assert call.kwargs["skip_embedding"] is True
+        contexts = call.kwargs["lineage_contexts"]
+        assert len(contexts) == 1
+        assert contexts[0] is not None
+        assert contexts[0].op_kind == "create"
+        assert contexts[0].model_name is None
+        assert contexts[0].provider is None
 
 
 # ===============================
@@ -402,10 +476,6 @@ class TestRunManualRegular:
         mock_state_mgr = MagicMock()
         mock_state_mgr.check_in_progress.return_value = None
 
-        request_context.storage.get_user_profile.return_value = [
-            MagicMock()
-        ]  # 1 profile
-
         with (
             patch.object(service, "_create_state_manager", return_value=mock_state_mgr),
             patch.object(service, "_run_batch_with_progress", return_value=(1, 1)),
@@ -441,17 +511,18 @@ class TestRunManualRegular:
         mock_state_mgr = MagicMock()
         mock_state_mgr.check_in_progress.return_value = None
 
-        request_context.storage.get_all_user_ids.return_value = ["u1", "u2", "u3"]
-        request_context.storage.get_user_profile.return_value = []
+        request_context.storage.get_all_user_ids.return_value = ["u1", "u2"]
 
         with (
             patch.object(service, "_create_state_manager", return_value=mock_state_mgr),
-            patch.object(service, "_run_batch_with_progress", return_value=(3, 0)),
+            patch.object(service, "_run_batch_with_progress", return_value=(2, 3)),
         ):
             request = ManualProfileGenerationRequest()
             response = service.run_manual_regular(request)
 
         assert response.success is True
+        assert response.profiles_generated == 3
+        assert response.msg == "Generated 3 profiles for 2 user(s)"
         request_context.storage.get_all_user_ids.assert_called_once()
 
 
@@ -463,42 +534,53 @@ class TestRunManualRegular:
 class TestCountManualGenerated:
     """Tests for _count_manual_generated."""
 
-    def test_counts_current_profiles(self, service, request_context, sample_profile):
+    def test_counts_current_profiles(self, service, request_context):
         """Counts profiles with CURRENT status (None filter)."""
-        request_context.storage.get_user_profile.return_value = [
-            sample_profile,
-            sample_profile,
-        ]
+        request_context.storage.count_user_profiles_by_status.return_value = 2
 
         request = ManualProfileGenerationRequest(user_id="user_1")
         count = service._count_manual_generated(request)
 
         assert count == 2
-        request_context.storage.get_user_profile.assert_called_once_with(
-            user_id="user_1",
-            status_filter=[None],
+        request_context.storage.count_user_profiles_by_status.assert_called_once_with(
+            user_ids=["user_1"],
+            status=None,
         )
 
     def test_returns_zero_when_no_profiles(self, service, request_context):
         """Returns 0 when no profiles exist."""
-        request_context.storage.get_user_profile.return_value = []
+        request_context.storage.count_user_profiles_by_status.return_value = 0
 
         request = ManualProfileGenerationRequest(user_id="user_1")
         count = service._count_manual_generated(request)
 
         assert count == 0
 
-    def test_no_user_id_filter(self, service, request_context):
-        """When user_id is None, passes None to storage."""
-        request_context.storage.get_user_profile.return_value = []
+    def test_counts_processed_users_without_user_id(self, service, request_context):
+        """When user_id is None, counts concrete processed users."""
+        request_context.storage.count_user_profiles_by_status.return_value = 3
 
         request = ManualProfileGenerationRequest()
-        service._count_manual_generated(request)
-
-        request_context.storage.get_user_profile.assert_called_once_with(
-            user_id=None,
-            status_filter=[None],
+        count = service._count_manual_generated(
+            request, processed_user_ids=["u1", "u2"]
         )
+
+        assert count == 3
+        request_context.storage.count_user_profiles_by_status.assert_called_once_with(
+            user_ids=["u1", "u2"],
+            status=None,
+        )
+
+    def test_empty_processed_users_does_not_fallback_to_request_user(
+        self, service, request_context
+    ):
+        """When all processing fails, no stale CURRENT profiles are counted."""
+        request = ManualProfileGenerationRequest(user_id="user_1")
+
+        count = service._count_manual_generated(request, processed_user_ids=[])
+
+        assert count == 0
+        request_context.storage.count_user_profiles_by_status.assert_not_called()
 
 
 # ===============================
@@ -742,19 +824,44 @@ class TestRerunHooks:
             RerunProfileGenerationRequest,
         )
 
-        request_context.storage.get_user_profile.return_value = [
-            MagicMock(),
-            MagicMock(),
-            MagicMock(),
-        ]
+        request_context.storage.count_user_profiles_by_status.return_value = 3
 
         request = RerunProfileGenerationRequest(user_id="user_1")
         count = service._get_generated_count(request)
 
         assert count == 3
-        request_context.storage.get_user_profile.assert_called_once_with(
-            user_id="user_1",
-            status_filter=[Status.PENDING],
+        request_context.storage.count_user_profiles_by_status.assert_called_once_with(
+            user_ids=["user_1"],
+            status=Status.PENDING,
+        )
+
+    def test_get_generated_count_empty_processed_users_does_not_fallback(
+        self, service, request_context
+    ):
+        """Rerun counts keep an empty successful-user batch empty."""
+        from reflexio.models.api_schema.service_schemas import (
+            RerunProfileGenerationRequest,
+        )
+
+        request = RerunProfileGenerationRequest(user_id="user_1")
+        count = service._get_generated_count(request, processed_user_ids=[])
+
+        assert count == 0
+        request_context.storage.count_user_profiles_by_status.assert_not_called()
+
+    def test_get_generated_count_manual_uses_processed_users(
+        self, service, request_context
+    ):
+        """Manual batch counts CURRENT profiles only for successful users."""
+        request_context.storage.count_user_profiles_by_status.return_value = 3
+
+        request = ManualProfileGenerationRequest()
+        count = service._get_generated_count(request, processed_user_ids=["u1", "u3"])
+
+        assert count == 3
+        request_context.storage.count_user_profiles_by_status.assert_called_once_with(
+            user_ids=["u1", "u3"],
+            status=None,
         )
 
     def test_create_rerun_response(self, service):

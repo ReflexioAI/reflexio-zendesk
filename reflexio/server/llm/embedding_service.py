@@ -7,12 +7,12 @@ import math
 import os
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from reflexio.server.llm.llm_utils import positive_int_env
@@ -21,6 +21,12 @@ from reflexio.server.llm.providers.nomic_embedding_provider import (
     NomicEmbedder,
     is_nomic_model,
 )
+from reflexio.server.llm.rerank.common import (
+    RERANK_MODEL,
+    CrossEncoderUnavailableError,
+    reranker_enabled,
+)
+from reflexio.server.llm.rerank.cross_encoder_model import CrossEncoderRunner
 
 logger = logging.getLogger(__name__)
 
@@ -34,29 +40,19 @@ _SUPPORTED_MODELS = {
 _ACTIVE_MODEL: str | None = None
 _ACTIVE_MODEL_LOCK = threading.Lock()
 
-# The underlying sentence-transformers / ONNX embedders share internal buffers
-# and are NOT thread-safe: concurrent ``.embed()`` calls interleave and corrupt
-# each other's padding/attention tensors (observed under concurrent publishes as
-# ``RuntimeError: The size of tensor a (62) must match the size of tensor b (61)
-# at non-singleton dimension 1``). The ``_ENCODE_SEMAPHORE`` below only caps how
-# many requests run at once (for memory), it does NOT serialize them, so this
-# lock guards the actual model inference. Throughput comes from micro-batch
-# coalescing (many texts per encode), not from parallel encodes on one model.
-_MODEL_ENCODE_LOCK = threading.Lock()
-
 DEFAULT_OSS_EMBEDDING_MODEL = MINILM_MODEL
 
-# Bound how many embed/encode calls run at once. The endpoint is a sync ``def``
-# served from Starlette's threadpool, so without a guard a burst of requests
-# would run that many model.encode() calls in parallel, stacking their
-# activation memory and OOM-killing the daemon. The semaphore caps simultaneous
-# encodes; excess requests block on acquire() and are picked up when a slot
-# frees — they queue, they are never rejected. Pair with a small encode
-# batch_size so each in-flight encode stays cheap.
+# Bound how many micro-batch processor threads run at once. The endpoint is a
+# sync ``def`` served from Starlette's threadpool, so without a cap a burst of
+# requests would spawn a processor per request and stack their activation
+# memory, OOM-killing the daemon. This caps concurrent processors; excess
+# requests queue on the micro-batch condition and are picked up when a slot
+# frees — they are never rejected. The embedder singletons (NomicEmbedder /
+# LocalEmbedder) serialize the actual model.encode() internally — the shared
+# models are not thread-safe — so no encode lock or semaphore is needed here.
+# Pair with a small encode batch_size so each in-flight encode stays cheap.
 _DEFAULT_MAX_CONCURRENCY = 4
 _ENV_MAX_CONCURRENCY = "REFLEXIO_EMBED_MAX_CONCURRENCY"
-_ENCODE_SEMAPHORE: threading.BoundedSemaphore | None = None
-_ENCODE_SEMAPHORE_LOCK = threading.Lock()
 
 # Opportunistically coalesce concurrent small requests before calling
 # model.encode(). This keeps request concurrency thread-based while giving the
@@ -71,11 +67,14 @@ _ACTIVE_BATCH_PROCESSORS = 0
 # Failsafe bound for a submitter waiting on its job (see _embed_texts).
 _JOB_WAIT_TIMEOUT_SECONDS = 600.0
 
+EmbeddingEncoder = Callable[[list[str]], list[list[float]]]
+
 
 @dataclass
 class _EmbeddingJob:
     model: str
     texts: list[str]
+    encoder: EmbeddingEncoder | None = None
     done: threading.Event = field(default_factory=threading.Event)
     result: list[list[float]] | None = None
     error: BaseException | None = None
@@ -111,16 +110,6 @@ def _micro_batch_max_texts() -> int:
     )
 
 
-def _encode_semaphore() -> threading.BoundedSemaphore:
-    """Return the process-wide encode semaphore, building it on first use."""
-    global _ENCODE_SEMAPHORE
-    if _ENCODE_SEMAPHORE is None:
-        with _ENCODE_SEMAPHORE_LOCK:
-            if _ENCODE_SEMAPHORE is None:
-                _ENCODE_SEMAPHORE = threading.BoundedSemaphore(_max_concurrency())
-    return _ENCODE_SEMAPHORE
-
-
 class EmbeddingRequest(BaseModel):
     model: str
     input: str | list[str]
@@ -139,19 +128,65 @@ class EmbeddingResponse(BaseModel):
     model: str
 
 
-def create_embedding_app(default_model: str | None = None) -> FastAPI:
-    """Create the embedding daemon app and optionally warm a default model."""
+class RerankRequest(BaseModel):
+    model: str
+    query: str
+    documents: list[str]
+
+
+class RerankData(BaseModel):
+    index: int
+    score: float
+
+
+class RerankResponse(BaseModel):
+    object: str = "list"
+    data: list[RerankData]
+    model: str
+
+
+class RerankHealthResponse(BaseModel):
+    status: Literal["ready", "disabled", "unavailable"]
+    configured_model: str
+    enabled: bool
+    ready: bool
+
+
+def create_embedding_app(
+    default_model: str | None = None,
+    *,
+    allowed_models: set[str] | None = None,
+    model_encoders: Mapping[str, EmbeddingEncoder] | None = None,
+    fixed_dimensions: Mapping[str, int] | None = None,
+    reranker_model: str = RERANK_MODEL,
+    reranker_runner: CrossEncoderRunner | None = None,
+) -> FastAPI:
+    """Create the embedding daemon app and optionally register external encoders."""
+    effective_encoders = dict(model_encoders or {})
+    effective_fixed_dimensions = dict(fixed_dimensions or {})
+    effective_allowed_models = (
+        set(allowed_models) if allowed_models is not None else set(_SUPPORTED_MODELS)
+    )
+    runner = reranker_runner or CrossEncoderRunner(reranker_model)
+
+    def embed_texts(model: str, texts: list[str]) -> list[list[float]]:
+        return _embed_texts(
+            model,
+            texts,
+            encoder=effective_encoders.get(model),
+            allowed_models=effective_allowed_models,
+        )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        if not default_model:
-            yield
-            return
-        try:
-            _embed_texts(default_model, ["reflexio embedding daemon warmup"])
-        except Exception:
-            logger.exception("Failed to warm embedding model %s", default_model)
-            raise
+        if default_model:
+            try:
+                embed_texts(default_model, ["reflexio embedding daemon warmup"])
+            except Exception:
+                logger.exception("Failed to warm embedding model %s", default_model)
+                raise
+        if reranker_enabled():
+            runner.prewarm()
         yield
 
     embedding_app = FastAPI(title="Reflexio Embedding Service", lifespan=lifespan)
@@ -159,15 +194,66 @@ def create_embedding_app(default_model: str | None = None) -> FastAPI:
     @embedding_app.get("/health")
     def health() -> dict[str, Any]:
         """Health check endpoint."""
-        return {"status": "ok", "active_model": _ACTIVE_MODEL}
+        return {
+            "status": "ok",
+            "active_model": _ACTIVE_MODEL,
+            "configured_model": default_model,
+            "configured_reranker_model": reranker_model,
+            "reranker_enabled": reranker_enabled(),
+            "reranker_ready": runner.ready(),
+        }
+
+    @embedding_app.get("/health/rerank", response_model=RerankHealthResponse)
+    def rerank_health(response: Response) -> RerankHealthResponse:
+        """Report reranker readiness without affecting embedding health."""
+        enabled = reranker_enabled()
+        ready = enabled and runner.ready()
+        if not ready:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return RerankHealthResponse(
+            status=runner.status() if enabled else "disabled",
+            configured_model=reranker_model,
+            enabled=enabled,
+            ready=ready,
+        )
 
     @embedding_app.post("/v1/embeddings")
     def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         """Create embeddings using the daemon's single active local model."""
+        if request.model not in effective_allowed_models:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported model for this service: {request.model}",
+            )
+        expected_dimensions = effective_fixed_dimensions.get(request.model)
+        if (
+            expected_dimensions is not None
+            and request.dimensions is not None
+            and request.dimensions != expected_dimensions
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{request.model} embeddings use the fixed "
+                    f"{expected_dimensions}-dimension storage contract"
+                ),
+            )
         texts = (
             [request.input] if isinstance(request.input, str) else list(request.input)
         )
-        embeddings = _embed_texts(request.model, texts)
+        embeddings = embed_texts(request.model, texts)
+
+        if expected_dimensions is not None:
+            for embedding in embeddings:
+                if len(embedding) != expected_dimensions:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            f"Encoder for {request.model} returned "
+                            f"{len(embedding)} dimensions; expected "
+                            f"{expected_dimensions}"
+                        ),
+                    )
 
         if request.dimensions:
             embeddings = [
@@ -182,15 +268,46 @@ def create_embedding_app(default_model: str | None = None) -> FastAPI:
             model=request.model,
         )
 
+    @embedding_app.post("/v1/rerank")
+    def create_rerank_scores(request: RerankRequest) -> RerankResponse:
+        """Score query/document pairs using this daemon's local cross-encoder."""
+        if request.model != reranker_model:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported model: {request.model}"
+            )
+        if not reranker_enabled():
+            raise HTTPException(
+                status_code=503,
+                detail="Reranking is disabled by REFLEXIO_RERANK_ENABLED",
+            )
+        try:
+            scores = runner.score_pairs(request.query, request.documents)
+        except CrossEncoderUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        return RerankResponse(
+            data=[
+                RerankData(index=index, score=score)
+                for index, score in enumerate(scores)
+            ],
+            model=request.model,
+        )
+
     return embedding_app
 
 
-def _embed_texts(model: str, texts: list[str]) -> list[list[float]]:
-    _activate_model(model)
+def _embed_texts(
+    model: str,
+    texts: list[str],
+    *,
+    encoder: EmbeddingEncoder | None = None,
+    allowed_models: set[str] | None = None,
+) -> list[list[float]]:
+    _activate_model(model, allowed_models=allowed_models)
     if not texts:
         return []
 
-    job = _EmbeddingJob(model=model, texts=list(texts))
+    job = _EmbeddingJob(model=model, texts=list(texts), encoder=encoder)
     should_process = False
 
     global _ACTIVE_BATCH_PROCESSORS
@@ -261,6 +378,7 @@ def _take_micro_batch() -> list[_EmbeddingJob]:
                     index
                     for index, candidate in enumerate(_MICRO_BATCH_QUEUE)
                     if candidate.model == first.model
+                    and candidate.encoder is first.encoder
                     and total_texts + len(candidate.texts) <= max_texts
                 ),
                 None,
@@ -288,7 +406,12 @@ def _process_micro_batch(jobs: list[_EmbeddingJob]) -> None:
         slices.append((job, start, len(texts)))
 
     try:
-        embeddings = _encode_texts_now(jobs[0].model, texts)
+        encoder = jobs[0].encoder
+        embeddings = (
+            encoder(texts)
+            if encoder is not None
+            else _encode_texts_now(jobs[0].model, texts)
+        )
     except BaseException as exc:
         for job in jobs:
             job.error = exc
@@ -313,33 +436,23 @@ def _process_micro_batch(jobs: list[_EmbeddingJob]) -> None:
 
 
 def _encode_texts_now(model: str, texts: list[str]) -> list[list[float]]:
-    semaphore = _encode_semaphore()
-    # Non-blocking probe purely for observability: if no slot is free, this
-    # request will have to wait. The real acquire below blocks until a slot
-    # opens, so the request queues and is picked up later — never rejected.
-    if not semaphore.acquire(blocking=False):
-        logger.info(
-            "Embedding request queued; all %d encode slots busy",
-            _max_concurrency(),
-        )
-        semaphore.acquire()
-    try:
-        # Serialize the actual inference: the shared embedder models are not
-        # thread-safe, so concurrent encodes race and produce tensor-shape
-        # errors. The semaphore (above) bounds memory; this lock bounds the
-        # model to one in-flight encode at a time.
-        with _MODEL_ENCODE_LOCK:
-            if is_nomic_model(model):
-                return NomicEmbedder.get().embed(texts)
-            if model == MINILM_MODEL:
-                return LocalEmbedder.get().embed(texts)
-        raise HTTPException(status_code=400, detail=f"Unsupported model: {model}")
-    finally:
-        semaphore.release()
+    # The embedder singletons serialize their own model.encode() internally
+    # (the shared sentence-transformers / ONNX models are not thread-safe — see
+    # NomicEmbedder / LocalEmbedder). Concurrency is already bounded by the
+    # micro-batch processor cap (``_max_concurrency``), so no extra encode
+    # lock/semaphore is needed here.
+    if is_nomic_model(model):
+        return NomicEmbedder.get().embed(texts)
+    if model == MINILM_MODEL:
+        return LocalEmbedder.get().embed(texts)
+    raise HTTPException(status_code=400, detail=f"Unsupported model: {model}")
 
 
-def _activate_model(model: str) -> None:
-    if model not in _SUPPORTED_MODELS:
+def _activate_model(model: str, *, allowed_models: set[str] | None = None) -> None:
+    effective_allowed_models = (
+        allowed_models if allowed_models is not None else _SUPPORTED_MODELS
+    )
+    if model not in effective_allowed_models:
         raise HTTPException(status_code=400, detail=f"Unsupported model: {model}")
     global _ACTIVE_MODEL
     with _ACTIVE_MODEL_LOCK:

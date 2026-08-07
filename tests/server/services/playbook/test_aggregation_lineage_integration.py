@@ -10,7 +10,7 @@ Asserts:
 - source_ids contains str(UP-a.user_playbook_id) and str(UP-b.user_playbook_id).
 
 Also includes a regression test verifying that a failure in the atomic
-``save_agent_playbook_with_aggregate_event`` ABORTS the run, restores any
+``save_agent_playbooks`` ABORTS the run, restores any
 archived playbooks, and re-raises — all-or-nothing semantics (C1).
 
 Mirrors the real-SQLite + mocked-cluster fixture style of
@@ -21,11 +21,15 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from reflexio.lib._agent_playbook import reconstruct_playbook_aggregation_change_log
+from reflexio.models.api_schema.domain.entities import LineageContext
 from reflexio.models.api_schema.service_schemas import (
     AgentPlaybook,
     PlaybookStatus,
@@ -33,11 +37,13 @@ from reflexio.models.api_schema.service_schemas import (
 )
 from reflexio.models.config_schema import PlaybookAggregatorConfig, PlaybookConfig
 from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.llm._litellm_types import ModelProvenance
 from reflexio.server.services.playbook.components.aggregator import PlaybookAggregator
 from reflexio.server.services.playbook.playbook_service_utils import (
     PlaybookAggregatorRequest,
 )
 from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
+from reflexio.server.services.storage.storage_base import AGGREGATE_REASON_PREFIX
 
 pytestmark = pytest.mark.integration
 
@@ -166,7 +172,7 @@ def test_aggregation_emits_aggregate_lineage_event(
         patch.object(
             PlaybookAggregator,
             "_generate_playbooks_with_source_clusters",
-            return_value=[(unsaved_ap, cluster_playbooks)],
+            return_value=[(unsaved_ap, cluster_playbooks, None)],
         ),
     ):
         aggregator.run(PlaybookAggregatorRequest(agent_version="v0", rerun=True))
@@ -195,13 +201,166 @@ def test_aggregation_emits_aggregate_lineage_event(
     assert evt.request_id != "", "request_id must be non-empty"
 
 
+def test_non_managed_aggregation_preserves_lineage_operation_key_deduplication(
+    sqlite_storage: SQLiteStorage,
+    request_context: RequestContext,
+    aggregator: PlaybookAggregator,
+) -> None:
+    up_a = _seed_user_playbook(sqlite_storage, uid=101, org_id=request_context.org_id)
+    up_b = _seed_user_playbook(sqlite_storage, uid=102, org_id=request_context.org_id)
+    cluster_playbooks = [up_a, up_b]
+    unsaved = AgentPlaybook(
+        agent_playbook_id=0,
+        playbook_name="default",
+        agent_version="v0",
+        content="Durably keyed aggregation.",
+        playbook_status=PlaybookStatus.PENDING,
+    )
+
+    with (
+        patch.object(
+            PlaybookAggregator,
+            "get_clusters",
+            return_value={0: cluster_playbooks},
+        ),
+        patch.object(
+            PlaybookAggregator,
+            "_generate_playbooks_with_source_clusters",
+            return_value=[(unsaved, cluster_playbooks, None)],
+        ),
+    ):
+        aggregator.run(
+            PlaybookAggregatorRequest(
+                agent_version="v0",
+                rerun=True,
+                operation_key="42",
+            )
+        )
+        retry = aggregator.run(
+            PlaybookAggregatorRequest(
+                agent_version="v0",
+                rerun=True,
+                operation_key="42",
+            )
+        )
+
+    saved = sqlite_storage.get_agent_playbooks()
+    assert len(saved) == 1
+    events = sqlite_storage.get_lineage_events(
+        entity_type="agent_playbook",
+        entity_id=str(saved[0].agent_playbook_id),
+    )
+    assert [event.request_id for event in events if event.op == "aggregate"] == ["42"]
+
+    assert retry["skipped"] == "operation already applied"
+    assert len(sqlite_storage.get_agent_playbooks()) == 1
+
+
+def test_managed_aggregation_prepares_then_atomically_completes_all_effects(
+    sqlite_storage: SQLiteStorage,
+    request_context: RequestContext,
+) -> None:
+    up_a = _seed_user_playbook(sqlite_storage, uid=103, org_id=request_context.org_id)
+    up_b = _seed_user_playbook(sqlite_storage, uid=104, org_id=request_context.org_id)
+    cluster_playbooks = [up_a, up_b]
+    unsaved = AgentPlaybook(
+        agent_playbook_id=0,
+        playbook_name="default",
+        agent_version="v0",
+        content="Retry-safe aggregation.",
+        playbook_status=PlaybookStatus.PENDING,
+    )
+
+    class _Coordinator:
+        prepared = False
+        active = False
+        completed_result: dict[str, Any] | None = None
+
+        def prepare(self, playbooks: list[AgentPlaybook]) -> None:
+            assert not self.active
+            assert playbooks == [unsaved]
+            self.prepared = True
+
+        @contextmanager
+        def apply_scope(self) -> Generator[None, None, None]:
+            assert self.prepared
+            self.active = True
+            try:
+                yield
+            finally:
+                self.active = False
+
+        def save_agent_playbook(
+            self,
+            playbook: AgentPlaybook,
+            *,
+            source_ids: list[str],
+            request_id: str,
+            run_mode: str,
+            provenance: ModelProvenance | None,
+        ) -> AgentPlaybook:
+            assert self.active
+            return sqlite_storage.save_agent_playbooks(
+                [playbook],
+                lineage_contexts=[
+                    LineageContext(
+                        op_kind="aggregate",
+                        actor="aggregator",
+                        request_id=request_id,
+                        source_ids=source_ids,
+                        reason=f"{AGGREGATE_REASON_PREFIX}{run_mode}",
+                        model_name=provenance.model_name if provenance else None,
+                        provider=provenance.provider if provenance else None,
+                    )
+                ],
+            )[0]
+
+        def complete(self, result: dict[str, Any]) -> None:
+            assert self.active
+            self.completed_result = result
+
+    coordinator = _Coordinator()
+    aggregator = PlaybookAggregator(
+        llm_client=MagicMock(),
+        request_context=request_context,
+        agent_version="v0",
+        effect_coordinator=coordinator,
+    )
+
+    with (
+        patch.object(
+            PlaybookAggregator,
+            "get_clusters",
+            return_value={0: cluster_playbooks},
+        ),
+        patch.object(
+            PlaybookAggregator,
+            "_generate_playbooks_with_source_clusters",
+            return_value=[(unsaved, cluster_playbooks, None)],
+        ),
+    ):
+        result = aggregator.run(
+            PlaybookAggregatorRequest(
+                agent_version="v0",
+                rerun=True,
+                operation_key="43",
+            )
+        )
+
+    assert result["playbooks_generated"] == 1
+    assert coordinator.completed_result == result
+    assert coordinator.active is False
+    assert len(sqlite_storage.get_agent_playbooks()) == 1
+    assert len(sqlite_storage.get_lineage_events(request_id="43")) == 1
+
+
 def test_aggregate_save_failure_aborts_and_restores(
     sqlite_storage: SQLiteStorage,
     request_context: RequestContext,
     aggregator: PlaybookAggregator,
     worker_id: str,
 ):
-    """C1: a failure in save_agent_playbook_with_aggregate_event aborts the run and restores archives.
+    """C1: a failure in save_agent_playbooks aborts the run and restores archives.
 
     The per-playbook save no longer silently skips on failure.  Instead the
     exception propagates to the outer handler which:
@@ -210,7 +369,7 @@ def test_aggregate_save_failure_aborts_and_restores(
     (c) leaves no orphan agent_playbook row (atomic rollback of the INSERT + event).
 
     Setup: seed one archived agent playbook (the old generation) + two user
-    playbooks.  Patch save_agent_playbook_with_aggregate_event to raise.
+    playbooks.  Patch save_agent_playbooks to raise.
     The archived playbook must survive (be restorable) and no new row must appear.
     """
     org_id = request_context.org_id
@@ -248,11 +407,11 @@ def test_aggregate_save_failure_aborts_and_restores(
         patch.object(
             PlaybookAggregator,
             "_generate_playbooks_with_source_clusters",
-            return_value=[(new_ap, cluster_playbooks)],
+            return_value=[(new_ap, cluster_playbooks, None)],
         ),
         patch.object(
             sqlite_storage,
-            "save_agent_playbook_with_aggregate_event",
+            "save_agent_playbooks",
             side_effect=RuntimeError("simulated atomic failure"),
         ),
         pytest.raises(RuntimeError, match="simulated atomic failure"),
@@ -272,7 +431,7 @@ def test_aggregate_save_failure_aborts_and_restores(
         ap.agent_playbook_id for ap in all_aps if ap.agent_playbook_id != old_ap_id
     ]
     assert not new_ids, (
-        "No new agent playbook must be saved when save_agent_playbook_with_aggregate_event fails"
+        "No new agent playbook must be saved when save_agent_playbooks fails"
     )
 
 
@@ -312,7 +471,7 @@ def test_e2e_reconstruct_added_and_run_mode(
     """E2E: run aggregation (full_archive) → reconstruct → assert added + run_mode.
 
     Validates the D1 rewire end-to-end: each saved playbook's aggregate event is
-    emitted atomically via ``save_agent_playbook_with_aggregate_event``, and
+    emitted atomically via ``save_agent_playbooks``, and
     ``reconstruct_playbook_aggregation_change_log`` can reconstruct the run with:
     - correct ``added_agent_playbooks`` (from aggregate events),
     - ``run_mode == "full_archive"`` (reason == "aggregate:full_archive"),
@@ -354,7 +513,7 @@ def test_e2e_reconstruct_added_and_run_mode(
         patch.object(
             PlaybookAggregator,
             "_generate_playbooks_with_source_clusters",
-            return_value=[(new_ap, cluster_playbooks)],
+            return_value=[(new_ap, cluster_playbooks, None)],
         ),
     ):
         aggregator = PlaybookAggregator(
@@ -425,7 +584,7 @@ def test_e2e_reconstruct_incremental_run_mode(
         patch.object(
             PlaybookAggregator,
             "_generate_playbooks_with_source_clusters",
-            return_value=[(ap_run1, cluster_run1)],
+            return_value=[(ap_run1, cluster_run1, None)],
         ),
     ):
         agg1 = PlaybookAggregator(
@@ -448,6 +607,9 @@ def test_e2e_reconstruct_incremental_run_mode(
     )
 
     # Run 2 — incremental (rerun=False, prev fingerprints now present).
+    # This test exercises reconstruction of the legacy fingerprint path. The
+    # durable incremental engine has its own typed-state integration coverage.
+    storage.supports_incremental_playbook_aggregation = False
     with (
         patch.object(
             PlaybookAggregator, "get_clusters", return_value={0: cluster_run2}
@@ -455,7 +617,7 @@ def test_e2e_reconstruct_incremental_run_mode(
         patch.object(
             PlaybookAggregator,
             "_generate_playbooks_with_source_clusters",
-            return_value=[(ap_run2, cluster_run2)],
+            return_value=[(ap_run2, cluster_run2, None)],
         ),
     ):
         agg2 = PlaybookAggregator(

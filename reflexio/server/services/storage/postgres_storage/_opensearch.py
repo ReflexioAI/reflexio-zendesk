@@ -44,7 +44,7 @@ _SYNC_SELECT_COLUMNS: dict[str, str] = {
         profile_id, user_id, content, last_modified_timestamp,
         generated_from_request_id, profile_time_to_live, expiration_timestamp,
         custom_features, source, status, extractor_names, expanded_terms,
-        source_span, notes, reader_angle, embedding::text AS embedding
+        source_span, notes, reader_angle, tags, embedding::text AS embedding
     """,
     "interactions": """
         interaction_id, user_id, content, request_id, created_at, role,
@@ -55,12 +55,12 @@ _SYNC_SELECT_COLUMNS: dict[str, str] = {
         user_playbook_id, user_id, playbook_name, created_at, request_id,
         agent_version, content, "trigger", rationale, blocking_issue, status,
         source, source_interaction_ids, expanded_terms, source_span, notes,
-        reader_angle, embedding::text AS embedding
+        reader_angle, tags, embedding::text AS embedding
     """,
     "agent_playbooks": """
         agent_playbook_id, playbook_name, created_at, agent_version, content,
         "trigger", rationale, blocking_issue, playbook_status,
-        playbook_metadata, expanded_terms, status, embedding::text AS embedding
+        playbook_metadata, expanded_terms, tags, status, embedding::text AS embedding
     """,
 }
 
@@ -217,10 +217,14 @@ class PostgresOpenSearch:
     def index_rows(self, entity: str, rows: Sequence[Mapping[str, Any]]) -> None:
         if not rows:
             return
+        materialized_rows = [dict(row) for row in rows]
+        defer = getattr(self.storage, "_defer_opensearch_operation", None)
+        if callable(defer) and defer("index_rows", entity, materialized_rows):
+            return
         body: list[dict[str, Any]] = []
         id_field = _ENTITY_ID_FIELD[entity]
         index = self.index_name(entity)
-        for row in rows:
+        for row in materialized_rows:
             doc_id = row.get(id_field)
             if doc_id in (None, ""):
                 continue
@@ -232,10 +236,14 @@ class PostgresOpenSearch:
                 raise StorageError(message=f"OpenSearch bulk index failed: {response}")
 
     def delete_ids(self, entity: str, ids: Iterable[Any]) -> None:
+        materialized_ids = list(ids)
+        defer = getattr(self.storage, "_defer_opensearch_operation", None)
+        if callable(defer) and defer("delete_ids", entity, materialized_ids):
+            return
         index = self.index_name(entity)
         body = [
             {"delete": {"_index": index, "_id": str(value)}}
-            for value in ids
+            for value in materialized_ids
             if value not in (None, "")
         ]
         if not body:
@@ -245,6 +253,9 @@ class PostgresOpenSearch:
             raise StorageError(message=f"OpenSearch bulk delete failed: {response}")
 
     def delete_by_filter(self, entity: str, filters: list[dict[str, Any]]) -> None:
+        defer = getattr(self.storage, "_defer_opensearch_operation", None)
+        if callable(defer) and defer("delete_by_filter", entity, list(filters)):
+            return
         query: dict[str, Any] = (
             {"bool": {"filter": filters}} if filters else {"match_all": {}}
         )

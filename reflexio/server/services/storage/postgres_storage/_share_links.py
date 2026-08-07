@@ -4,6 +4,8 @@ import logging
 import time
 from typing import Any
 
+from psycopg2 import sql
+
 from reflexio.models.api_schema.domain import ShareLink
 
 from ._base import PostgresStorageBase, _rows
@@ -155,6 +157,27 @@ class PostgresShareLinkMixin(SchemaScopedClient):
         )
         rows = _rows(response)
         return len(rows) if rows else 0
+
+    @handle_exceptions
+    def delete_expired_share_links(
+        self, *, now: int, grace_seconds: int, limit: int = 1000
+    ) -> int:
+        if limit <= 0:
+            return 0
+        rows = self._fetch_all(
+            sql.SQL(
+                """DELETE FROM {} WHERE id IN (
+                       SELECT id FROM {} WHERE org_id = %s
+                         AND expires_at IS NOT NULL AND expires_at < %s
+                       ORDER BY expires_at LIMIT %s FOR UPDATE SKIP LOCKED
+                   ) RETURNING id"""
+            ).format(
+                self._table_identifier("share_links"),
+                self._table_identifier("share_links"),
+            ),
+            [self.org_id, now - grace_seconds, limit],
+        )
+        return len(rows)
 
 
 def _row_to_share_link(row: dict[str, Any]) -> ShareLink:

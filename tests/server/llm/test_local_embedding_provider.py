@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import sys
+import tarfile
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from reflexio.server.llm import _litellm_embedding
 from reflexio.server.llm.providers import local_embedding_provider as lep
 from reflexio.server.llm.providers.local_embedding_provider import (
     LocalEmbedder,
@@ -176,6 +182,274 @@ class TestRegisterIfEnabled:
 
 
 class TestEmbedPadding:
+    def test_real_chroma_minilm_attrs_match_cache_recovery_contract(self) -> None:
+        embedding_functions = pytest.importorskip("chromadb.utils.embedding_functions")
+        minilm_cls = embedding_functions.ONNXMiniLM_L6_V2
+
+        assert minilm_cls.MODEL_NAME == "all-MiniLM-L6-v2"
+        assert minilm_cls.DOWNLOAD_PATH.name == minilm_cls.MODEL_NAME
+        assert minilm_cls.EXTRACTED_FOLDER_NAME == "onnx"
+        assert minilm_cls.ARCHIVE_FILENAME == "onnx.tar.gz"
+
+    @pytest.mark.parametrize("cache_shape", ["partial", "complete"])
+    def test_corrupt_minilm_cache_is_cleared_and_retried_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, cache_shape: str
+    ) -> None:
+        cache_dir = tmp_path / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        extracted_dir = cache_dir / "onnx"
+        cache_dir.mkdir(parents=True)
+        if cache_shape == "complete":
+            extracted_dir.mkdir()
+            for file_name in lep._MINILM_EXPECTED_FILES:
+                (extracted_dir / file_name).write_text("present")
+            first_error: Exception = RuntimeError(
+                f"Failed to load {extracted_dir / 'model.onnx'}"
+            )
+        else:
+            (cache_dir / "partial-download").write_text("corrupt")
+            first_error = tarfile.ReadError("bad checksum")
+        attempts = 0
+
+        class FailingThenWorkingMiniLM:
+            MODEL_NAME = "all-MiniLM-L6-v2"
+            DOWNLOAD_PATH = str(cache_dir)
+            EXTRACTED_FOLDER_NAME = "onnx"
+            ARCHIVE_FILENAME = "onnx.tar.gz"
+
+            def __call__(self, docs: list[str]) -> list[list[float]]:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise first_error
+                return [[0.1] * 384 for _ in docs]
+
+        fake = MagicMock()
+        fake.ONNXMiniLM_L6_V2 = FailingThenWorkingMiniLM
+        monkeypatch.setitem(sys.modules, "chromadb", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils.embedding_functions", fake)
+
+        result = LocalEmbedder.get().embed(["hello"])
+
+        assert attempts == 2
+        assert result == [[0.1] * 384 + [0.0] * 128]
+        assert not cache_dir.exists()
+
+    def test_constructor_failure_does_not_clear_cache(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        cache_dir = tmp_path / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "model").write_text("valid")
+
+        class FailingConstructorMiniLM:
+            MODEL_NAME = "all-MiniLM-L6-v2"
+            DOWNLOAD_PATH = str(cache_dir)
+
+            def __init__(self) -> None:
+                raise ValueError("The onnxruntime python package is not installed")
+
+        fake = MagicMock()
+        fake.ONNXMiniLM_L6_V2 = FailingConstructorMiniLM
+        monkeypatch.setitem(sys.modules, "chromadb", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils.embedding_functions", fake)
+
+        with pytest.raises(ValueError, match="onnxruntime"):
+            LocalEmbedder.get().embed(["hello"])
+
+        assert cache_dir.exists()
+        assert (cache_dir / "model").exists()
+
+    def test_retry_reuses_embedder_recovered_by_another_thread(self, tmp_path) -> None:
+        cache_dir = tmp_path / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "partial-download").write_text("corrupt")
+
+        class MiniLM:
+            MODEL_NAME = "all-MiniLM-L6-v2"
+            DOWNLOAD_PATH = str(cache_dir)
+            EXTRACTED_FOLDER_NAME = "onnx"
+            ARCHIVE_FILENAME = "onnx.tar.gz"
+
+        failed_ef = MagicMock()
+        recovered_ef = MagicMock(return_value=[[0.3] * 384])
+        embedder = LocalEmbedder()
+        embedder._ef = recovered_ef
+
+        result = embedder._retry_embed_after_cache_clear(
+            failed_ef, tarfile.ReadError("bad checksum"), ["hello"]
+        )
+
+        assert result == [[0.3] * 384]
+        recovered_ef.assert_called_once_with(["hello"])
+        assert cache_dir.exists()
+        assert (cache_dir / "partial-download").exists()
+
+    def test_cache_clear_and_retry_run_under_filesystem_lock(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        cache_dir = tmp_path / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "partial-download").write_text("corrupt")
+        lock_active = False
+        attempts = 0
+
+        @contextmanager
+        def fake_file_lock(_lock_path) -> Iterator[None]:
+            nonlocal lock_active
+            lock_active = True
+            try:
+                yield
+            finally:
+                lock_active = False
+
+        def checked_rmtree(*args, **kwargs) -> None:
+            assert lock_active
+            shutil_rmtree(*args, **kwargs)
+
+        class FailingThenWorkingMiniLM:
+            MODEL_NAME = "all-MiniLM-L6-v2"
+            DOWNLOAD_PATH = str(cache_dir)
+            EXTRACTED_FOLDER_NAME = "onnx"
+            ARCHIVE_FILENAME = "onnx.tar.gz"
+
+            def __call__(self, docs: list[str]) -> list[list[float]]:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise tarfile.ReadError("bad checksum")
+                assert lock_active
+                return [[0.2] * 384 for _ in docs]
+
+        fake = MagicMock()
+        fake.ONNXMiniLM_L6_V2 = FailingThenWorkingMiniLM
+        monkeypatch.setitem(sys.modules, "chromadb", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils.embedding_functions", fake)
+        monkeypatch.setattr(lep, "_exclusive_file_lock", fake_file_lock)
+        shutil_rmtree = lep.shutil.rmtree
+        monkeypatch.setattr(lep.shutil, "rmtree", checked_rmtree)
+
+        result = LocalEmbedder.get().embed(["hello"])
+
+        assert attempts == 2
+        assert result == [[0.2] * 384 + [0.0] * 128]
+
+    def test_retry_exhaustion_includes_manual_cache_recovery_hint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        cache_dir = tmp_path / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "partial-download").write_text("corrupt")
+        attempts = 0
+
+        class AlwaysFailingMiniLM:
+            MODEL_NAME = "all-MiniLM-L6-v2"
+            DOWNLOAD_PATH = str(cache_dir)
+            EXTRACTED_FOLDER_NAME = "onnx"
+            ARCHIVE_FILENAME = "onnx.tar.gz"
+
+            def __call__(self, _docs: list[str]) -> list[list[float]]:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise tarfile.ReadError("bad checksum")
+                raise RuntimeError("still corrupt")
+
+        fake = MagicMock()
+        fake.ONNXMiniLM_L6_V2 = AlwaysFailingMiniLM
+        monkeypatch.setitem(sys.modules, "chromadb", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils.embedding_functions", fake)
+
+        with pytest.raises(lep.LocalEmbedderError) as exc_info:
+            LocalEmbedder.get().embed(["hello"])
+
+        message = str(exc_info.value)
+        assert str(cache_dir) in message
+        assert (
+            "Delete this cache directory, restart Reflexio, and retry local embedding"
+        ) in message
+        assert attempts == 2
+
+    def test_retry_keeps_cache_refreshed_by_another_process(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        cache_dir = tmp_path / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        extracted_dir = cache_dir / "onnx"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "partial-download").write_text("corrupt")
+        attempts = 0
+
+        @contextmanager
+        def fake_file_lock(_lock_path) -> Iterator[None]:
+            extracted_dir.mkdir(parents=True)
+            for file_name in lep._MINILM_EXPECTED_FILES:
+                (extracted_dir / file_name).write_text("present")
+            yield
+
+        class RecoveredMiniLM:
+            MODEL_NAME = "all-MiniLM-L6-v2"
+            DOWNLOAD_PATH = str(cache_dir)
+            EXTRACTED_FOLDER_NAME = "onnx"
+            ARCHIVE_FILENAME = "onnx.tar.gz"
+
+            def __call__(self, docs: list[str]) -> list[list[float]]:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise tarfile.ReadError("bad checksum")
+                return [[0.4] * 384 for _ in docs]
+
+        fake = MagicMock()
+        fake.ONNXMiniLM_L6_V2 = RecoveredMiniLM
+        monkeypatch.setitem(sys.modules, "chromadb", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils.embedding_functions", fake)
+        monkeypatch.setattr(lep, "_exclusive_file_lock", fake_file_lock)
+        rmtree = MagicMock()
+        monkeypatch.setattr(lep.shutil, "rmtree", rmtree)
+
+        result = LocalEmbedder.get().embed(["hello"])
+
+        assert result == [[0.4] * 384 + [0.0] * 128]
+        assert attempts == 2
+        rmtree.assert_not_called()
+        assert extracted_dir.exists()
+
+    def test_complete_cache_with_unrelated_tar_error_is_not_recoverable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        cache_dir = tmp_path / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        extracted_dir = cache_dir / "onnx"
+        extracted_dir.mkdir(parents=True)
+        for file_name in lep._MINILM_EXPECTED_FILES:
+            (extracted_dir / file_name).write_text("present")
+
+        class UnrelatedTarErrorMiniLM:
+            MODEL_NAME = "all-MiniLM-L6-v2"
+            DOWNLOAD_PATH = str(cache_dir)
+            EXTRACTED_FOLDER_NAME = "onnx"
+            ARCHIVE_FILENAME = "onnx.tar.gz"
+
+            def __call__(self, _docs: list[str]) -> list[list[float]]:
+                raise tarfile.ReadError("bad checksum")
+
+        fake = MagicMock()
+        fake.ONNXMiniLM_L6_V2 = UnrelatedTarErrorMiniLM
+        monkeypatch.setitem(sys.modules, "chromadb", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils.embedding_functions", fake)
+        rmtree = MagicMock()
+        monkeypatch.setattr(lep.shutil, "rmtree", rmtree)
+
+        with pytest.raises(tarfile.ReadError, match="bad checksum"):
+            LocalEmbedder.get().embed(["hello"])
+
+        rmtree.assert_not_called()
+        assert extracted_dir.exists()
+
     def test_384_vector_padded_to_512(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install_fake_chroma(monkeypatch)
 
@@ -221,6 +495,161 @@ class TestEmbedPadding:
             LocalEmbedder.get().embed(["hi"])
 
 
+class TestEncodeSerialization:
+    """The shared ONNX embedding function is not thread-safe.
+
+    ``LocalEmbedder.embed()`` must serialize the actual encode call so
+    concurrent publishes can't interleave and corrupt shared buffers.
+    """
+
+    def test_encode_is_serialized_across_threads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """8 threads on ONE embedder never enter the encode callable at once.
+
+        Reverting the ``self._encode_lock`` guard in ``embed()`` makes this
+        fail: the stub records/raises on concurrent entry.
+        """
+        state = {"active": False, "reentered": False, "calls": 0}
+        guard = threading.Lock()
+
+        def encode(docs: list[str]) -> list[list[float]]:
+            with guard:
+                if state["active"]:
+                    state["reentered"] = True
+                    raise AssertionError("embedder entered by two threads at once")
+                state["active"] = True
+                state["calls"] += 1
+            try:
+                time.sleep(0.02)  # widen the race window
+            finally:
+                with guard:
+                    state["active"] = False
+            return [[0.1] * 384 for _ in docs]
+
+        ef_instance = MagicMock()
+        ef_instance.side_effect = encode
+        ef_class = MagicMock(return_value=ef_instance)
+        ef_class.MODEL_NAME = "all-MiniLM-L6-v2"
+        ef_class.DOWNLOAD_PATH = "/fake/cache"
+        fake = MagicMock()
+        fake.ONNXMiniLM_L6_V2 = ef_class
+        monkeypatch.setitem(sys.modules, "chromadb", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils.embedding_functions", fake)
+
+        embedder = LocalEmbedder.get()
+        payloads = [
+            ["short"],
+            ["x" * 500],
+            ["a", "b", "c"],
+            ["", "y" * 50],
+            ["one"],
+            ["p", "q"],
+            ["z" * 700],
+            ["m", "n", "o", "p"],
+        ]
+        results: list[list[list[float]]] = []
+        errors: list[BaseException] = []
+        results_lock = threading.Lock()
+
+        def worker(texts: list[str]) -> None:
+            try:
+                out = embedder.embed(texts)
+            except BaseException as exc:  # noqa: BLE001
+                with results_lock:
+                    errors.append(exc)
+                return
+            with results_lock:
+                results.append(out)
+
+        threads = [threading.Thread(target=worker, args=(p,)) for p in payloads]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert state["reentered"] is False
+        assert state["calls"] == len(payloads)
+        assert len(results) == len(payloads)
+        assert all(len(vec) == 512 for out in results for vec in out)
+
+    def test_concurrent_cache_recovery_does_not_deadlock(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """Recovery path (``_ef_lock``) nests safely inside ``_encode_lock``.
+
+        The recovery path re-embeds while holding ``_ef_lock``; because it runs
+        under the outer ``_encode_lock``, no encode call ever overlaps and the
+        two locks never deadlock. Drives it concurrently to prove both.
+        """
+        cache_dir = tmp_path / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "partial-download").write_text("corrupt")
+
+        guard = threading.Lock()
+        state = {"active": False, "reentered": False, "attempts": 0}
+
+        class FlakyMiniLM:
+            MODEL_NAME = "all-MiniLM-L6-v2"
+            DOWNLOAD_PATH = str(cache_dir)
+            EXTRACTED_FOLDER_NAME = "onnx"
+            ARCHIVE_FILENAME = "onnx.tar.gz"
+
+            def __call__(self, docs: list[str]) -> list[list[float]]:
+                with guard:
+                    if state["active"]:
+                        state["reentered"] = True
+                        raise AssertionError("encode entered by two threads at once")
+                    state["active"] = True
+                    state["attempts"] += 1
+                    first = state["attempts"] == 1
+                try:
+                    time.sleep(0.01)
+                    if first:
+                        raise tarfile.ReadError("bad checksum")
+                finally:
+                    with guard:
+                        state["active"] = False
+                return [[0.2] * 384 for _ in docs]
+
+        fake = MagicMock()
+        fake.ONNXMiniLM_L6_V2 = FlakyMiniLM
+        monkeypatch.setitem(sys.modules, "chromadb", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils", MagicMock())
+        monkeypatch.setitem(sys.modules, "chromadb.utils.embedding_functions", fake)
+
+        embedder = LocalEmbedder.get()
+        results: list[list[list[float]]] = []
+        errors: list[BaseException] = []
+        results_lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                out = embedder.embed(["hello", "world"])
+            except BaseException as exc:  # noqa: BLE001
+                with results_lock:
+                    errors.append(exc)
+                return
+            with results_lock:
+                results.append(out)
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        # No thread is stuck: the _encode_lock/_ef_lock ordering can't deadlock.
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert state["reentered"] is False
+        assert len(results) == 6
+        assert all(len(vec) == 512 for out in results for vec in out)
+
+
 class TestLiteLLMClientShortCircuit:
     """When model starts with ``local/`` and the provider is enabled,
     LiteLLMClient.get_embedding(s) must delegate to LocalEmbedder and
@@ -238,7 +667,7 @@ class TestLiteLLMClientShortCircuit:
         # is hermetic (no running daemon required).
         monkeypatch.setenv("CLAUDE_SMART_USE_LOCAL_EMBEDDING", "1")
         monkeypatch.setattr(
-            litellm_client,
+            _litellm_embedding,
             "get_service_embeddings",
             lambda texts, **_kwargs: [[0.0] * 512 for _ in texts],
         )
@@ -261,7 +690,7 @@ class TestLiteLLMClientShortCircuit:
         # embedding *service* (daemon) too. Mock the service call for hermeticity.
         monkeypatch.setenv("CLAUDE_SMART_USE_LOCAL_EMBEDDING", "1")
         monkeypatch.setattr(
-            litellm_client,
+            _litellm_embedding,
             "get_service_embeddings",
             lambda texts, **_kwargs: [[0.0] * 512 for _ in texts],
         )
@@ -307,9 +736,11 @@ class TestLiteLLMClientShortCircuit:
         from reflexio.server.llm import litellm_client
         from reflexio.server.llm.litellm_client import LiteLLMClient, LiteLLMConfig
 
-        _install_fake_chroma(monkeypatch)
-        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_EMBEDDING", raising=False)
-        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: MagicMock())
+        monkeypatch.setattr(
+            _litellm_embedding,
+            "get_service_embeddings",
+            lambda *_args, **_kwargs: [[0.1] * 512],
+        )
 
         client = LiteLLMClient(LiteLLMConfig(model="claude-code/default"))
 
@@ -326,9 +757,11 @@ class TestLiteLLMClientShortCircuit:
         from reflexio.server.llm import litellm_client
         from reflexio.server.llm.litellm_client import LiteLLMClient, LiteLLMConfig
 
-        _install_fake_chroma(monkeypatch)
-        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_EMBEDDING", raising=False)
-        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: MagicMock())
+        monkeypatch.setattr(
+            _litellm_embedding,
+            "get_service_embeddings",
+            lambda *_args, **_kwargs: [[0.1] * 512, [0.2] * 512],
+        )
 
         client = LiteLLMClient(LiteLLMConfig(model="claude-code/default"))
 
@@ -339,35 +772,29 @@ class TestLiteLLMClientShortCircuit:
         assert len(result) == 2
         assert all(len(vec) == 512 for vec in result)
 
-    def test_get_embedding_local_without_chromadb_raises(
+    def test_get_embedding_local_service_failure_does_not_fallback(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When local/* is requested but chromadb is missing, raise a clear error."""
+        """When local inference is down, do not construct an in-process model."""
         from reflexio.server.llm import litellm_client
         from reflexio.server.llm.litellm_client import (
             LiteLLMClient,
-            LiteLLMClientError,
             LiteLLMConfig,
         )
 
-        # Force "inprocess" provider mode so the embedding-service short-circuit
-        # doesn't intercept the local/* model before the chromadb-import check.
-        # Clearing the env vars is not enough: model-driven routing probes the
-        # local daemon, so if one happens to be running on this host the call
-        # would route there. Force the service gate off to stay hermetic.
-        monkeypatch.delenv("REFLEXIO_EMBEDDING_PROVIDER", raising=False)
-        monkeypatch.delenv("REFLEXIO_EMBEDDING_SERVICE_URL", raising=False)
-        monkeypatch.delenv("CLAUDE_SMART_USE_LOCAL_EMBEDDING", raising=False)
         monkeypatch.setattr(
-            litellm_client, "should_use_embedding_service", lambda _model: False
+            _litellm_embedding,
+            "get_service_embeddings",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("service unavailable")
+            ),
         )
-        monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: None)
 
         client = LiteLLMClient(LiteLLMConfig(model="claude-code/default"))
 
         with (
             patch.object(litellm_client.litellm, "embedding") as mock_embedding,
-            pytest.raises((LiteLLMClientError, RuntimeError), match="chromadb"),
+            pytest.raises(RuntimeError, match="service unavailable"),
         ):
             client.get_embedding("hello", model="local/minilm-l6-v2")
 

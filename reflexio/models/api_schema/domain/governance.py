@@ -15,6 +15,10 @@ AuditEntityType = Literal[
     "request",
     "session",
     "agent_success_evaluation_result",
+    # READ-COMPAT ONLY — do not remove. The retrieval-capture subsystem is gone
+    # and no writer emits this entity type any more, but historical audit_events
+    # rows still carry it; dropping the literal would make Pydantic reject those
+    # rows on read.
     "playbook_retrieval_log",
     "org",
 ]
@@ -23,6 +27,7 @@ PurgeOperationType = Literal["user_erasure", "org_purge"]
 PurgeScopeType = Literal["user", "org"]
 PurgeStatus = Literal["pending", "running", "failed", "complete"]
 PurgeTargetStatus = Literal["pending", "running", "failed", "complete"]
+SubjectBarrierStatus = Literal["erasing", "erased", "failed"]
 
 __all__ = [
     "AuditActorType",
@@ -33,9 +38,11 @@ __all__ = [
     "PurgeScopeType",
     "PurgeStatus",
     "PurgeTargetStatus",
+    "SubjectBarrierStatus",
     "AuditEvent",
     "PurgeOperation",
     "PurgeOperationTarget",
+    "SubjectWriteBarrier",
     "UserExportResult",
     "UserEraseResult",
 ]
@@ -87,6 +94,17 @@ class PurgeOperationTarget(BaseModel):
     error_detail: str | None = None
     started_at: int | None = None
     completed_at: int | None = None
+
+
+class SubjectWriteBarrier(BaseModel):
+    org_id: str
+    subject_ref: str
+    purge_id: str
+    status: SubjectBarrierStatus
+    error_code: str | None = None
+    error_detail: str | None = None
+    created_at: int = Field(default_factory=_now_epoch)
+    updated_at: int = Field(default_factory=_now_epoch)
 
 
 class UserExportResult(BaseModel):

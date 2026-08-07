@@ -22,6 +22,7 @@ from reflexio.models.api_schema.domain.entities import (
     AgentSuccessEvaluationResult,
 )
 from reflexio.models.api_schema.eval_overview_schema import (
+    BehaviorSuccessMetric,
     BraintrustTileRow,
     BucketLiteral,
     ContextTile,
@@ -47,6 +48,7 @@ from reflexio.server.services.evaluation_overview.components.hero_state import (
     compute_hero_state,
 )
 from reflexio.server.services.evaluation_overview.components.rule_attribution import (
+    CitationKey,
     compute_net_sessions,
 )
 from reflexio.server.services.evaluation_overview.components.shadow_aggregation import (
@@ -80,14 +82,14 @@ class EvaluationOverviewService:
         Time windows used here:
           - ``[request.from_ts, request.to_ts]`` is the *trend* window. The hero
             chart, rule attribution, and the rule-attribution session set are
-            all computed over it. The frontend sends an 8-week range so the
-            trend chart has shape.
+            all computed over it. The frontend defaults to a 7-day range but
+            the user can widen it via the date pickers.
           - The *tile baseline* and *distribution baseline* are tighter:
             ``last_7d`` (≤ to_ts) vs ``prior_7d`` (the 7d before that).
-            Tying these to ``request.from_ts`` is wrong — with an 8-week
-            request, ``prior`` would land 9 weeks back and always be empty,
-            so every tile would display "no baseline" regardless of how much
-            data the org has.
+            Tying these to ``request.from_ts`` is wrong — for any window wider
+            than 7 days ``prior`` would land before the requested window and
+            always be empty, so every tile would display "no baseline"
+            regardless of how much data the org has.
         """
         # Tile + distribution baselines are always last-7d-vs-prior-7d,
         # anchored to ``request.to_ts`` (which is "now" from the frontend's
@@ -206,6 +208,9 @@ class EvaluationOverviewService:
         results: list[AgentSuccessEvaluationResult],
         earliest_eval_ts: int | None,
     ) -> HeroBlock:
+        # days_since only feeds the EARLY-vs-FULL gate, which is reachable only
+        # when shadow_enabled is True. Shadow is hardcoded off below, so this is
+        # currently inert — retained for the (pending) shadow re-enable.
         if earliest_eval_ts is None:
             days_since = None
         else:
@@ -238,6 +243,7 @@ class EvaluationOverviewService:
     ) -> ContextTile:
         cur_success = _success_rate(current) * 100
         prev_success = _success_rate(previous) * 100
+        behavior_success = _behavior_success_metric(current, previous)
         cur_corr = _mean(r.number_of_correction_per_session for r in current)
         prev_corr = _mean(r.number_of_correction_per_session for r in previous)
         cur_turns = _mean(
@@ -256,6 +262,7 @@ class EvaluationOverviewService:
             success=PercentWithDelta(
                 current=cur_success, delta_pp=cur_success - prev_success
             ),
+            behavior_success=behavior_success,
             corrections=NumberWithDelta(current=cur_corr, delta=cur_corr - prev_corr),
             turns=NumberWithDelta(current=cur_turns, delta=cur_turns - prev_turns),
             escalation=PercentWithDelta(current=cur_esc, delta_pp=cur_esc - prev_esc),
@@ -264,8 +271,8 @@ class EvaluationOverviewService:
     def _build_attribution(
         self,
         results: list[AgentSuccessEvaluationResult],
-        citations_by_session: dict[ResultKey, list[tuple[str, str]]],
-        rule_titles: dict[tuple[str, str], str],
+        citations_by_session: dict[ResultKey, list[CitationKey]],
+        rule_titles: dict[CitationKey, str],
     ) -> list[RuleAttributionRow]:
         is_success_by_session = {
             (r.user_id, r.session_id): r.is_success for r in results
@@ -291,7 +298,7 @@ class EvaluationOverviewService:
 
     def _load_citations(
         self, result_keys: list[ResultKey]
-    ) -> tuple[dict[ResultKey, list[tuple[str, str]]], dict[tuple[str, str], str]]:
+    ) -> tuple[dict[ResultKey, list[CitationKey]], dict[CitationKey, str]]:
         """Pull `Interaction.citations` keyed by user/session, with title lookup.
 
         Falls back to empty data when the underlying storage method returns
@@ -300,8 +307,8 @@ class EvaluationOverviewService:
         """
         wanted = set(result_keys)
         session_ids = sorted({session_id for _, session_id in result_keys})
-        citations_by_session: dict[ResultKey, list[tuple[str, str]]] = defaultdict(list)
-        rule_titles: dict[tuple[str, str], str] = {}
+        citations_by_session: dict[ResultKey, list[CitationKey]] = defaultdict(list)
+        rule_titles: dict[CitationKey, str] = {}
         for citation in self.storage.get_citations_by_session_ids(session_ids):  # type: ignore[attr-defined]
             result_key = (citation.user_id, citation.session_id)
             if result_key not in wanted:
@@ -369,8 +376,8 @@ class EvaluationOverviewService:
         previous: list[AgentSuccessEvaluationResult],
         session_sources: dict[ResultKey, str],
         bucket: BucketLiteral,
-        citations_by_session: dict[ResultKey, list[tuple[str, str]]],
-        rule_titles: dict[tuple[str, str], str],
+        citations_by_session: dict[ResultKey, list[CitationKey]],
+        rule_titles: dict[CitationKey, str],
         current_scores: list[ImportedScore],
         prior_scores: list[ImportedScore],
     ) -> SourceSetComparison:
@@ -522,6 +529,37 @@ def _success_rate(results: list[AgentSuccessEvaluationResult]) -> float:
     if not results:
         return 0.0
     return sum(1 for r in results if r.is_success) / len(results)
+
+
+def _behavior_success_metric(
+    current: list[AgentSuccessEvaluationResult],
+    previous: list[AgentSuccessEvaluationResult],
+) -> BehaviorSuccessMetric:
+    """Return behavior-only success, excluding canonical system-error rows."""
+    current_eligible = [r for r in current if not _is_system_error(r)]
+    previous_eligible = [r for r in previous if not _is_system_error(r)]
+    current_rate = _success_rate(current_eligible) * 100 if current_eligible else None
+    previous_rate = (
+        _success_rate(previous_eligible) * 100 if previous_eligible else None
+    )
+    delta_pp = (
+        current_rate - previous_rate
+        if current_rate is not None and previous_rate is not None
+        else None
+    )
+    return BehaviorSuccessMetric(
+        current=current_rate,
+        delta_pp=delta_pp,
+        eligible_sessions=len(current_eligible),
+        excluded_system_errors=len(current) - len(current_eligible),
+    )
+
+
+def _is_system_error(result: AgentSuccessEvaluationResult) -> bool:
+    return (
+        not result.is_success
+        and (result.failure_type or "").strip().lower() == "system_error"
+    )
 
 
 def _escalation_rate(results: list[AgentSuccessEvaluationResult]) -> float:

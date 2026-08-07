@@ -26,6 +26,39 @@ def test_scheduler_fires_scheduled_callback(monkeypatch: Any) -> None:
     assert fired.wait(timeout=5)
 
 
+def test_scheduler_drain_waits_for_scheduled_callback(monkeypatch: Any) -> None:
+    # Keep the debounce tiny so the test does not wait on the real delay.
+    monkeypatch.setattr(tagging_scheduler, "_EFFECTIVE_DELAY_SECONDS", 0.01)
+    fired = threading.Event()
+    scheduler = TaggingScheduler.get_instance()
+    scheduler.schedule(("org", "drain-user", "v1"), fired.set)
+
+    assert scheduler.drain(timeout_seconds=2.0)
+    assert fired.is_set()
+
+
+def test_scheduler_coalesces_same_scope_to_latest_callback(monkeypatch: Any) -> None:
+    now = [100.0]
+    monkeypatch.setattr(tagging_scheduler, "_EFFECTIVE_DELAY_SECONDS", 10.0)
+    monkeypatch.setattr(tagging_scheduler.time, "monotonic", lambda: now[0])
+    first_fired = threading.Event()
+    latest_fired = threading.Event()
+    scheduler = TaggingScheduler()
+
+    scheduler.schedule(("org", "coalesced-user", "v1"), first_fired.set)
+    scheduler.schedule(("org", "coalesced-user", "v1"), latest_fired.set)
+
+    with scheduler._mutex:
+        first_entry, latest_entry = scheduler._heap
+        assert first_entry[0] == latest_entry[0]
+        assert first_entry[1] != latest_entry[1]
+
+    now[0] = 111.0
+    scheduler._wake_event.set()
+    assert latest_fired.wait(timeout=5)
+    assert not first_fired.is_set()
+
+
 def test_schedule_tagging_skips_when_no_user(monkeypatch: Any) -> None:
     scheduled: list[tuple[Any, Any]] = []
     monkeypatch.setattr(

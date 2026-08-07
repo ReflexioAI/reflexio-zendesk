@@ -30,14 +30,15 @@ _PROMPT_BANK_DIR = (
 # holds the expected mock response for this prompt's structured output.
 # None means the prompt does not produce structured output relevant to mocking.
 PROMPT_VERSION_MAP: dict[str, tuple[str, str | None]] = {
-    "playbook_extraction_main": ("v1.3.0", "playbook_extraction"),
-    "playbook_extraction_context": ("v4.4.0", None),
+    "playbook_extraction_main": ("v1.5.0", "playbook_extraction"),
+    "playbook_extraction_context": ("v4.6.0", None),
+    "playbook_candidate_review": ("v1.2.0", None),
     "playbook_should_generate": ("v3.0.0", "boolean_evaluation"),
     "playbook_should_generate_expert": ("v1.0.0", "boolean_evaluation"),
-    "playbook_extraction_context_expert": ("v3.4.0", None),
+    "playbook_extraction_context_expert": ("v3.5.0", None),
     "playbook_extraction_main_expert": ("v1.2.0", "playbook_extraction"),
-    "playbook_aggregation": ("v2.3.0", "playbook_aggregation"),
-    "playbook_consolidation": ("v2.3.3", "playbook_consolidation"),
+    "playbook_aggregation": ("v2.4.0", "playbook_aggregation"),
+    "playbook_consolidation": ("v2.6.0", "playbook_consolidation"),
     "playbook_optimizer_judge": ("v1.2.0", None),
     "profile_update_main": ("v1.0.0", "profile_extraction"),
     "profile_update_instruction_start": ("v1.2.0", None),
@@ -45,7 +46,11 @@ PROMPT_VERSION_MAP: dict[str, tuple[str, str | None]] = {
     "profile_should_generate_override": ("v1.0.0", "boolean_evaluation"),
     "profile_deduplication": ("v1.0.0", "profile_deduplication"),
     "tagging": ("v1.0.0", "tagging"),
-    "agent_success_evaluation": ("v1.0.0", "agent_success_evaluation"),
+    "agent_success_evaluation": ("v1.3.0", "agent_success_evaluation"),
+    # Retrieved-learning judges — per-learning relevance/impact verdicts for
+    # sessions publishing interactions with ``retrieved_learnings``.
+    "retrieved_learning_relevance": ("v1.0.0", "retrieved_learning_relevance"),
+    "retrieved_learning_impact": ("v1.0.0", "retrieved_learning_impact"),
     # F1 cleanup: the session-level shadow comparison branch was retracted.
     # The prompt directories remain on disk (marked active: false in their
     # frontmatter) as historical records, but they no longer drive any
@@ -53,17 +58,19 @@ PROMPT_VERSION_MAP: dict[str, tuple[str, str | None]] = {
     # registry key was removed, so they are mapped without a registry key.
     "agent_success_evaluation_with_comparison": ("v1.0.0", None),
     "shadow_content_evaluation": ("v1.0.0", None),
-    "memory_reflection": ("v1.7.0", None),
-    "query_reformulation": ("v1.0.0", None),
-    "document_expansion": ("v1.0.0", None),
+    # v2.1.0: structured output + source-language/script preservation (window,
+    # recency_dominant, wants_current) in the same pre-search LLM call.
+    "query_reformulation": ("v2.1.0", "query_reformulation"),
+    # v1.1.0: fact-key/category phrasings + escaped JSON braces (v1.0.0 never
+    # rendered — literal braces broke str.format and the expander swallowed it).
+    "document_expansion": ("v1.1.0", None),
     "compress_session_for_query": ("v1.3.0", None),
-    "rerank_relevance": ("v1.1.0", None),
     # Answer-LLM system prompt for memory-grounded user questions
     "answer_synthesis": ("v1.5.2", None),
     # F1 — per-turn shadow comparison judge. Produces structured
     # ShadowComparisonOutput; the mock dispatch lives in the integration
     # tests rather than the global heuristic mock, so no registry key.
-    "shadow_comparison": ("v1.0.0", None),
+    "shadow_comparison": ("v1.1.0", None),
 }
 
 
@@ -94,8 +101,8 @@ def _is_active(path: Path) -> bool:
 def _get_latest_prompt_version(prompt_id: str) -> str:
     """Scan prompt_bank/<prompt_id>/ for the latest ACTIVE v*.prompt.md file.
 
-    Sorted by semver tuple, not lexically — without this v1.10.0 would
-    sort BEFORE v1.9.0 and the trip-wire would lock to a stale version.
+    Sorted by semver tuple rather than lexically so future two-digit minor
+    versions cannot sort before a lower single-digit minor version.
 
     Files with ``active: false`` (typically ``-deprecated`` historical
     records) are filtered out so the trip-wire pins the version the runtime
@@ -189,3 +196,25 @@ class TestPromptVersionMapping:
             f"Prompt directories not in PROMPT_VERSION_MAP: {unmapped}. "
             f"Add them with their latest version and registry key."
         )
+
+    @pytest.mark.parametrize("prompt_id", list(PROMPT_VERSION_MAP.keys()))
+    def test_active_prompt_renders_with_dummy_variables(self, prompt_id):
+        """Every ACTIVE prompt must render through str.format with its
+        declared variables.
+
+        Literal ``{``/``}`` in a prompt body (e.g. JSON output examples)
+        break ``str.format`` at render time, and several callers swallow the
+        error — ``document_expansion`` v1.0.0 shipped this way and silently
+        never rendered, making ``enable_document_expansion`` a no-op.
+        Literal braces must be escaped as ``{{``/``}}``.
+        """
+        from reflexio.server.prompt.prompt_manager import PromptManager
+
+        manager = PromptManager()
+        prompt = manager._get_prompt(prompt_id, None)
+        if prompt is None:
+            pytest.skip(f"{prompt_id} has no active version (historical record)")
+        rendered = manager.render_prompt(
+            prompt_id, dict.fromkeys(prompt.variables, "dummy")
+        )
+        assert rendered

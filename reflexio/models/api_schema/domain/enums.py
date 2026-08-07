@@ -9,8 +9,24 @@ __all__ = [
     "Status",
     "OperationStatus",
     "RegularVsShadow",
+    "SessionOutcomeKind",
+    "SessionOutcomeFailureReason",
     "BlockingIssueKind",
 ]
+
+
+class SessionOutcomeKind(StrEnum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
+class SessionOutcomeFailureReason(StrEnum):
+    UNKNOWN_SESSION = "unknown_session"
+    OCCURRED_BEFORE_SESSION = "occurred_before_session"
+    OCCURRED_IN_FUTURE = "occurred_in_future"
+    AFTER_OUTCOME_WINDOW = "after_outcome_window"
+    SUBJECT_NOT_WRITABLE = "subject_not_writable"
+    STORAGE_ERROR = "storage_error"
 
 
 class UserActionType(StrEnum):
@@ -46,6 +62,7 @@ class Status(str, Enum):  # noqa: UP042 - CURRENT=None is not compatible with St
     SUPERSEDED = (
         "superseded"  # tombstone: replaced by a new version (superseded_by set)
     )
+    EXPIRED = "expired"  # tombstone: TTL elapsed while active (see expiry reclamation)
 
 
 class OperationStatus(StrEnum):

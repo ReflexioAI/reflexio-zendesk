@@ -335,6 +335,11 @@ def _run_aggregator_with_supersede(
 ) -> tuple[SQLiteStorage, RequestContext]:
     """Run one aggregation with one new and one old archived playbook."""
     storage = _make_storage(temp_dir, worker_id, suffix=suffix)
+    if not full_archive:
+        # These cases characterize the legacy fingerprint replacement path.
+        # Durable incremental aggregation only attaches or creates clusters and
+        # intentionally performs no supersession.
+        storage.supports_incremental_playbook_aggregation = False
     ctx = _make_request_context(storage, temp_dir, worker_id, suffix=suffix)
 
     # Seed old archived agent playbook (will be removed on SUCCESS path)
@@ -366,7 +371,7 @@ def _run_aggregator_with_supersede(
         patch.object(
             PlaybookAggregator,
             "_generate_playbooks_with_source_clusters",
-            return_value=[(new_ap, cluster_playbooks)],
+            return_value=[(new_ap, cluster_playbooks, None)],
         ),
     ):
         aggregator = PlaybookAggregator(
@@ -601,7 +606,7 @@ class TestEmptyRunIdFailLoud:
             patch.object(
                 PlaybookAggregator,
                 "_generate_playbooks_with_source_clusters",
-                return_value=[(new_ap, cluster_playbooks)],
+                return_value=[(new_ap, cluster_playbooks, None)],
             ),
             patch(uuid_path, return_value=_EmptyStrUUID()),
         ):
@@ -611,7 +616,7 @@ class TestEmptyRunIdFailLoud:
                 agent_version="v0",
             )
             # The storage guard raises on empty request_id; outer handler restores + re-raises.
-            with pytest.raises(StorageError, match="non-empty request_id"):
+            with pytest.raises(StorageError, match="requires request_id"):
                 aggregator.run(
                     PlaybookAggregatorRequest(agent_version="v0", rerun=True)
                 )
