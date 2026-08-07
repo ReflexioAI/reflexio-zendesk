@@ -29,9 +29,19 @@ from reflexio.models.config_schema import (
     PlaybookConfig,
 )
 from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.llm._litellm_types import CompletionResult, ModelProvenance
+from reflexio.server.services.playbook.components.consolidator import (
+    IndependentDecision,
+    PlaybookConsolidationOutput,
+)
+from reflexio.server.services.playbook.components.reviewer import (
+    CandidateReviewDecision,
+    PlaybookCandidateReviewOutput,
+)
 from reflexio.server.services.playbook.playbook_service_utils import (
     PlaybookGenerationRequest,
     StructuredPlaybookContent,
+    StructuredPlaybookEvidence,
     StructuredPlaybookList,
 )
 from reflexio.server.services.playbook.service import (
@@ -156,6 +166,22 @@ def _setup_mock_chat_completion(
 
     def mock_generate_chat_response(messages, **kwargs):
         """Route on prompt content / extraction mode to the right mock response."""
+        response_format = kwargs.get("response_format")
+        if response_format is PlaybookConsolidationOutput:
+            return PlaybookConsolidationOutput(
+                decisions=[IndependentDecision(new_id="NEW-0")]
+            )
+        if response_format is PlaybookCandidateReviewOutput:
+            return PlaybookCandidateReviewOutput(
+                decisions=[
+                    CandidateReviewDecision(
+                        id="C1",
+                        decision="accept",
+                        reason_code="grounded_useful",
+                        evidence_ids=["C1-E1"],
+                    )
+                ]
+            )
         # Get the prompt content from the messages
         prompt_content = ""
         for message in messages:
@@ -177,12 +203,28 @@ def _setup_mock_chat_completion(
                 StructuredPlaybookContent(
                     trigger="interacting with users",
                     content=content,
+                    rationale="The user's explicit acceptance applies to future support interactions and supports reusing the successful response behavior.",
+                    evidence_kind="verified-success",
+                    future_task_class="support interactions",
+                    improvement_mechanism="reuses behavior the user explicitly accepted",
+                    reader_angle="verified-success",
+                    evidence=[
+                        StructuredPlaybookEvidence(
+                            turn_ref="T2",
+                            source_span="Thank you for your help!",
+                        )
+                    ],
                 )
             ]
         )
 
     service.client.generate_chat_response = MagicMock(
         side_effect=mock_generate_chat_response
+    )
+    service.client.generate_chat_response_with_provenance = MagicMock(
+        side_effect=lambda *args, **kwargs: CompletionResult(
+            mock_generate_chat_response(*args, **kwargs), ModelProvenance()
+        )
     )
 
 
@@ -420,9 +462,20 @@ def test_playbook_message_construction_with_interactions(
             ]
         )
 
-    with patch(
-        "reflexio.server.llm.litellm_client.LiteLLMClient.generate_chat_response",
-        side_effect=mock_generate_chat_response,
+    def mock_generate_with_provenance(*args, **kwargs):
+        return CompletionResult(
+            mock_generate_chat_response(*args, **kwargs), ModelProvenance()
+        )
+
+    with (
+        patch(
+            "reflexio.server.llm.litellm_client.LiteLLMClient.generate_chat_response",
+            side_effect=mock_generate_chat_response,
+        ),
+        patch(
+            "reflexio.server.llm.litellm_client.LiteLLMClient.generate_chat_response_with_provenance",
+            side_effect=mock_generate_with_provenance,
+        ),
     ):
         # Create playbook generation request with new API
         request = PlaybookGenerationRequest(

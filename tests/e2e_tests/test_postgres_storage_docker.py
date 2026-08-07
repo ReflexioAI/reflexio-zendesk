@@ -19,11 +19,15 @@ from psycopg2 import sql
 
 from reflexio.models.api_schema.service_schemas import (
     NEVER_EXPIRES_TIMESTAMP,
+    GetSessionOutcomesRequest,
+    Interaction,
     LineageContext,
-    PlaybookRetrievalLog,
-    PlaybookRetrievalLogItem,
     ProfileTimeToLive,
     Request,
+    RetrievedLearning,
+    RetrievedLearningEvaluationResult,
+    SessionOutcomeKind,
+    SetSessionOutcomeRequest,
     UserPlaybook,
     UserProfile,
 )
@@ -39,6 +43,9 @@ from reflexio.server.services.storage.storage_base import (
     build_pending_tool_call_dedup_key,
     build_scope_hash,
     human_feedback_scope,
+)
+from reflexio.server.services.storage.storage_base.retrieved_learning_state import (
+    session_fingerprint,
 )
 from tests.server.test_utils import skip_in_precommit
 
@@ -228,7 +235,7 @@ def test_postgres_pending_tool_call_round_trip(
 
 
 @skip_in_precommit
-def test_postgres_lineage_and_retrieval_log_round_trip(
+def test_postgres_lineage_round_trip(
     postgres_storage: PostgresStorage,
 ) -> None:
     run_id = uuid.uuid4().hex[:8]
@@ -271,34 +278,186 @@ def test_postgres_lineage_and_retrieval_log_round_trip(
         request_id=request_id,
     )
     assert [(event.op, event.source_ids) for event in events] == [
-        ("revise", [str(first.user_playbook_id)])
+        ("create", []),
+        ("revise", [str(first.user_playbook_id)]),
     ]
 
-    retrieval_id = postgres_storage.save_playbook_retrieval_log(
-        PlaybookRetrievalLog(
+
+@skip_in_precommit
+def test_postgres_upstream_storage_contract_round_trip(
+    postgres_storage: PostgresStorage,
+) -> None:
+    run_id = uuid.uuid4().hex[:8]
+    user_id = f"pg-contract-user-{run_id}"
+    request_id = f"pg-contract-request-{run_id}"
+    session_id = f"pg-contract-session-{run_id}"
+    now = int(time.time())
+    postgres_storage.add_request(
+        Request(
             request_id=request_id,
-            session_id=f"session-{run_id}",
             user_id=user_id,
-            query="Postgres storage guidance",
+            created_at=now,
+            source="docker-postgres-contract-e2e",
             agent_version="codex",
-            shown_items=[
-                PlaybookRetrievalLogItem(
-                    ordinal=0,
-                    agent_playbook_id=17,
-                    source_user_playbook_ids=[successor.user_playbook_id],
-                    source_interaction_ids_by_user_playbook_id={
-                        str(successor.user_playbook_id): [101, 102]
-                    },
-                )
-            ],
+            session_id=session_id,
         )
     )
 
-    logs = postgres_storage.get_playbook_retrieval_logs(request_id=request_id)
-    assert [log.retrieval_log_id for log in logs] == [retrieval_id]
-    assert logs[0].shown_items[0].source_user_playbook_ids == [
-        successor.user_playbook_id
+    context = postgres_storage.get_session_outcome_context(session_id)
+    outcome = postgres_storage.record_session_outcome(
+        SetSessionOutcomeRequest(
+            session_id=session_id,
+            outcome=SessionOutcomeKind.SUCCESS,
+            occurred_at=now + 1,
+            label="resolved",
+            metadata={"path": "postgres"},
+        ),
+        created_at=now + 1,
+        expected_context=context,
+    )
+    assert outcome.recorded
+    stored_outcomes = postgres_storage.get_session_outcomes(
+        GetSessionOutcomesRequest(session_ids=[session_id])
+    )
+    assert [(item.session_id, item.outcome) for item in stored_outcomes] == [
+        (session_id, SessionOutcomeKind.SUCCESS)
     ]
-    assert logs[0].shown_items[0].source_interaction_ids_by_user_playbook_id == {
-        str(successor.user_playbook_id): [101, 102]
-    }
+
+    first_job_id = postgres_storage.enqueue_learning_job(
+        org_id=postgres_storage.org_id,
+        user_id=user_id,
+        request_id=request_id,
+        covers_through=float(now),
+    )
+    second_job_id = postgres_storage.enqueue_learning_job(
+        org_id=postgres_storage.org_id,
+        user_id=user_id,
+        request_id=request_id,
+        covers_through=float(now + 1),
+    )
+    assert second_job_id == first_job_id
+    claimed = postgres_storage.claim_learning_jobs(
+        claimed_by="postgres-e2e", limit=1, lease_seconds=60
+    )
+    assert [job.job_id for job in claimed] == [first_job_id]
+    assert claimed[0].claim_token
+    assert postgres_storage.heartbeat_learning_job(
+        job_id=first_job_id,
+        claim_token=claimed[0].claim_token,
+        lease_seconds=60,
+    )
+    assert (
+        postgres_storage.complete_learning_job(
+            job_id=first_job_id, claim_token="stale-fence"
+        )
+        == 0
+    )
+    assert (
+        postgres_storage.complete_learning_job(
+            job_id=first_job_id, claim_token=claimed[0].claim_token
+        )
+        == 1
+    )
+
+    playbook = UserPlaybook(
+        user_id=user_id,
+        request_id=request_id,
+        agent_version="codex",
+        playbook_name="postgres-contract",
+        content="Retrieve the Postgres contract learning.",
+        trigger="When Postgres storage contracts are verified",
+    )
+    postgres_storage.save_user_playbooks([playbook])
+    assert playbook.user_playbook_id
+    postgres_storage.add_user_interaction(
+        user_id,
+        Interaction(
+            interaction_id=101,
+            user_id=user_id,
+            request_id=request_id,
+            created_at=now + 2,
+            role="Assistant",
+            content="Applied the Postgres contract learning.",
+            retrieved_learnings=[
+                RetrievedLearning(
+                    kind="user_playbook",
+                    learning_id=str(playbook.user_playbook_id),
+                )
+            ],
+        ),
+    )
+    snapshot = postgres_storage.load_bounded_retrieved_learning_snapshot(
+        user_id, session_id
+    )
+    fingerprint = session_fingerprint(snapshot)
+    generation = postgres_storage.begin_retrieved_learning_evaluation_run(
+        user_id, session_id
+    )
+    commit = postgres_storage.replace_retrieved_learning_evaluation_results(
+        user_id,
+        session_id,
+        generation,
+        fingerprint,
+        "complete",
+        {"source": "postgres-e2e"},
+        [
+            RetrievedLearningEvaluationResult(
+                user_id=user_id,
+                session_id=session_id,
+                agent_version="codex",
+                interaction_id=101,
+                interaction_created_at=now + 2,
+                kind="user_playbook",
+                learning_id=str(playbook.user_playbook_id),
+                is_relevant=True,
+                relevance_reason="Used by the response",
+                created_at=now + 3,
+            )
+        ],
+    )
+    assert (commit.disposition, commit.status, commit.committed_count) == (
+        "applied",
+        "complete",
+        1,
+    )
+    stored_evaluations = postgres_storage.get_retrieved_learning_evaluation_results(
+        user_id=user_id, session_id=session_id
+    )
+    assert [(item.kind, item.learning_id) for item in stored_evaluations] == [
+        ("user_playbook", str(playbook.user_playbook_id))
+    ]
+
+    purge_id = "purge_contract_e2e"
+    subject_ref = postgres_storage._subject_ref_for_user_id(user_id)
+    postgres_storage.begin_purge_operation(
+        purge_id=purge_id,
+        idempotency_key=purge_id,
+        operation_type="user_erasure",
+        scope_type="user",
+        subject_ref=subject_ref,
+        request_ref="reqref_v1_contract_e2e",
+    )
+    postgres_storage.begin_subject_erasure_barrier(subject_ref, purge_id)
+    postgres_storage.prepare_governance_erase_targets(
+        purge_id, user_id, {int(playbook.user_playbook_id)}
+    )
+    deleted = postgres_storage.apply_governance_user_data_delete(purge_id, user_id)
+
+    assert deleted["session_outcomes"] == 1
+    assert deleted["retrieved_learning_evaluation_results"] == 1
+    assert deleted["evaluation_operation_states"] == 1
+    assert (
+        postgres_storage.get_session_outcomes(
+            GetSessionOutcomesRequest(session_ids=[session_id])
+        )
+        == []
+    )
+    assert (
+        postgres_storage.get_retrieved_learning_evaluation_results(
+            user_id=user_id, session_id=session_id
+        )
+        == []
+    )
+    delete_targets = postgres_storage.list_purge_targets(purge_id, phase="delete")
+    assert len(delete_targets) == 12
+    assert all(target.status == "complete" for target in delete_targets)

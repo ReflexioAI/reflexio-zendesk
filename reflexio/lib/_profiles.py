@@ -46,6 +46,9 @@ from reflexio.models.api_schema.service_schemas import (
 from reflexio.server.services.profile.service import (
     ProfileGenerationService,
 )
+from reflexio.server.services.retrieval.user_context_guard import (
+    should_suppress_user_context,
+)
 from reflexio.server.tracing import profile_step
 
 
@@ -70,6 +73,15 @@ class ProfilesMixin(ReflexioBase):
             )
         if isinstance(request, dict):
             request = SearchUserProfileRequest(**request)
+        with profile_step("search.user_context_guard", entity_type="profiles") as span:
+            suppress_user_context = should_suppress_user_context(request.query)
+            span.set_data("suppressed", suppress_user_context)
+        if suppress_user_context:
+            return SearchUserProfileResponse(
+                success=True,
+                user_profiles=[],
+                msg="Found 0 matching profile(s)",
+            )
         if status_filter is None:
             status_filter = [None]  # Default to current profiles
         rewritten = self._reformulate_query(
@@ -128,6 +140,15 @@ class ProfilesMixin(ReflexioBase):
             )
         if isinstance(request, dict):
             request = RerankUserProfilesRequest(**request)
+        with profile_step("search.user_context_guard", entity_type="profiles") as span:
+            suppress_user_context = should_suppress_user_context(request.query)
+            span.set_data("suppressed", suppress_user_context)
+        if suppress_user_context:
+            return RerankUserProfilesResponse(
+                success=True,
+                user_profiles=[],
+                msg="Reranked 0 profile(s); dropped 0 unknown id(s)",
+            )
         if not request.profile_ids:
             return RerankUserProfilesResponse(
                 success=True, user_profiles=[], msg="No profile_ids provided"
@@ -143,8 +164,8 @@ class ProfilesMixin(ReflexioBase):
         candidates = [p for p in all_profiles if p.profile_id in wanted]
         dropped = len(request.profile_ids) - len(candidates)
 
-        # Lazy import keeps test collection fast; the cross-encoder pulls in
-        # torch + sentence-transformers on first call.
+        # Lazy import keeps test collection fast; scoring is delegated to the
+        # shared inference service only when this explicit operation is called.
         from reflexio.server.llm.rerank import score_pairs
 
         scores = score_pairs(request.query, [p.content for p in candidates])
@@ -414,25 +435,21 @@ class ProfilesMixin(ReflexioBase):
                 status_filter = [None]  # Default to current profiles
 
         profiles = self._get_storage().get_user_profile(
-            request.user_id, status_filter=status_filter, tags=request.tags
+            request.user_id,
+            status_filter=status_filter,
+            tags=request.tags,
+            profile_id=request.profile_id,
+            query=request.query,
+            source=request.source,
+            profile_time_to_live=request.profile_time_to_live,
+            start_time=(
+                int(request.start_time.timestamp()) if request.start_time else None
+            ),
+            end_time=int(request.end_time.timestamp()) if request.end_time else None,
         )
         profiles = sorted(
             profiles, key=lambda x: x.last_modified_timestamp, reverse=True
         )
-
-        # Apply time filters
-        if request.start_time:
-            profiles = [
-                p
-                for p in profiles
-                if p.last_modified_timestamp >= int(request.start_time.timestamp())
-            ]
-        if request.end_time:
-            profiles = [
-                p
-                for p in profiles
-                if p.last_modified_timestamp <= int(request.end_time.timestamp())
-            ]
 
         # Apply top_k limit
         if request.top_k:
@@ -450,6 +467,13 @@ class ProfilesMixin(ReflexioBase):
         self,
         limit: int = 100,
         status_filter: list[Status | None] | None = None,
+        user_id: str | None = None,
+        profile_id: str | None = None,
+        query: str | None = None,
+        source: str | None = None,
+        profile_time_to_live: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
     ) -> GetUserProfilesResponse:
         """Get all user profiles across all users.
 
@@ -467,7 +491,15 @@ class ProfilesMixin(ReflexioBase):
         if status_filter is None:
             status_filter = [None]  # Default to current profiles
         profiles = self._get_storage().get_all_profiles(
-            limit=limit, status_filter=status_filter
+            limit=limit,
+            status_filter=status_filter,
+            user_id=user_id,
+            profile_id=profile_id,
+            query=query,
+            source=source,
+            profile_time_to_live=profile_time_to_live,
+            start_time=start_time,
+            end_time=end_time,
         )
         profiles = sorted(
             profiles, key=lambda x: x.last_modified_timestamp, reverse=True
@@ -613,8 +645,8 @@ def reconstruct_profile_change_log(
     * **removed(R)** — entity_ids of ``status_change`` lineage events with
       ``to_status == "superseded"`` and ``request_id == R``.  This is the
       exact signature emitted by ``supersede_profiles_by_ids`` (the dedup
-      soft-delete path).  It is distinct from reflection which emits
-      ``op="revise"``, so reflection events are never mis-counted as removals.
+      soft-delete path). Other revision events are never mis-counted as
+      removals.
 
     Groups are formed over the union of request_ids from both signals.
     Request_id ``""`` is skipped — it would merge unrelated runs.
@@ -645,8 +677,7 @@ def reconstruct_profile_change_log(
 
     # Dedup soft-delete signature: status_change to_status=="superseded".
     # Each such event records one profile removed in the dedup run ``request_id``.
-    # Distinct from reflection which emits op="revise" — so revise events are
-    # never counted as removals here.
+    # Revise events are never counted as removals here.
     removal_by_req: dict[str, list[str]] = defaultdict(list)
     sort_key: dict[str, tuple[int, int]] = {}  # request_id -> (created_at, event_id)
     for evt in all_events:

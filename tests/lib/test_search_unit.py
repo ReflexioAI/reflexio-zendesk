@@ -115,6 +115,8 @@ def _make_request_interaction(
 ) -> RequestInteractionDataModel:
     """Build a RequestInteractionDataModel for testing."""
     mock_request = MagicMock(spec=Request)
+    mock_request.retrieval_experiment_id = None
+    mock_request.retrieval_experiment_arm = None
     mock_interaction = MagicMock(spec=Interaction)
     return RequestInteractionDataModel(
         session_id=session_id,
@@ -144,10 +146,16 @@ class TestGetRequests:
         assert "session_b" in session_ids
 
     def test_has_more_flag_true(self):
-        """has_more is True when total returned equals top_k."""
+        """has_more is True when the number of sessions returned equals top_k.
+
+        Pagination is session-based: a single busy session (many requests) must
+        not flip has_more on; only filling the session limit does.
+        """
         mixin = _make_mixin()
-        items = [_make_request_interaction("s", f"req_{i}") for i in range(5)]
-        _get_storage(mixin).get_sessions.return_value = {"s": items}
+        # 5 sessions, each with one request, fills a top_k=5 session page.
+        _get_storage(mixin).get_sessions.return_value = {
+            f"s{i}": [_make_request_interaction(f"s{i}", f"req_{i}")] for i in range(5)
+        }
 
         request = GetRequestsRequest(top_k=5)
         response = mixin.get_requests(request)
@@ -155,8 +163,20 @@ class TestGetRequests:
         assert response.success is True
         assert response.has_more is True
 
+    def test_has_more_flag_false_for_single_busy_session(self):
+        """A single session with many requests does not set has_more (top_k counts sessions)."""
+        mixin = _make_mixin()
+        items = [_make_request_interaction("s", f"req_{i}") for i in range(20)]
+        _get_storage(mixin).get_sessions.return_value = {"s": items}
+
+        request = GetRequestsRequest(top_k=5)
+        response = mixin.get_requests(request)
+
+        assert response.success is True
+        assert response.has_more is False
+
     def test_has_more_flag_false(self):
-        """has_more is False when total returned is less than top_k."""
+        """has_more is False when fewer sessions than top_k are returned."""
         mixin = _make_mixin()
         items = [_make_request_interaction("s", "req_1")]
         _get_storage(mixin).get_sessions.return_value = {"s": items}
@@ -201,9 +221,9 @@ class TestUnifiedSearch:
         mixin.llm_client = MagicMock()
         mock_config = MagicMock()
         mock_config.llm_config = None
-        cast(Any, mixin.request_context.configurator.get_config).return_value = (
-            mock_config
-        )
+        cast(
+            Any, mixin.request_context.configurator.get_config
+        ).return_value = mock_config
 
         expected_response = UnifiedSearchResponse(success=True)
 
@@ -227,9 +247,9 @@ class TestUnifiedSearch:
         mixin.llm_client = MagicMock()
         mock_config = MagicMock()
         mock_config.llm_config = None
-        cast(Any, mixin.request_context.configurator.get_config).return_value = (
-            mock_config
-        )
+        cast(
+            Any, mixin.request_context.configurator.get_config
+        ).return_value = mock_config
 
         events: list[tuple[str, str, dict[str, object] | None]] = []
 
@@ -285,19 +305,17 @@ class TestUnifiedSearch:
         assert response.msg is not None
 
     def test_always_dispatches_to_unified_search(self):
-        """unified_search unconditionally routes through run_unified_search.
-
-        After the extraction/search unification, there is no agentic search
-        backend and no config-driven branch — the public /api/search path
-        always uses the unified search service.
+        """unified_search unconditionally routes through run_unified_search —
+        there is no config-driven backend branch; temporal behavior rides on
+        the reformulation call inside the service.
         """
         mixin = _make_mixin()
         mixin.llm_client = MagicMock()
         mock_config = MagicMock()
         mock_config.llm_config = None
-        cast(Any, mixin.request_context.configurator.get_config).return_value = (
-            mock_config
-        )
+        cast(
+            Any, mixin.request_context.configurator.get_config
+        ).return_value = mock_config
 
         expected_response = UnifiedSearchResponse(success=True)
 

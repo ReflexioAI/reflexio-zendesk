@@ -12,9 +12,37 @@ from reflexio.models.api_schema.domain.governance import (
     AuditEvent,
     PurgeOperation,
     PurgeOperationTarget,
+    SubjectWriteBarrier,
 )
 from reflexio.models.config_schema import GovernanceRetentionConfig
+from reflexio.server.services.governance.config import (
+    get_governance_ref_secret,
+    governance_subject_ref,
+)
+from reflexio.server.services.storage.error import SubjectWriteBarrierError
+from reflexio.server.services.storage.governance_validation import (
+    _CANONICAL_DELETE_TARGET_NAMES,
+    _PREPARE_PHASE,
+    _SNAPSHOT_TARGET_NAME,
+    _canonicalize_audit_event_for_persistence,
+    _is_successful_erase_event,
+    _successful_erase_identity,
+    _validate_governance_error_code,
+    _validate_governance_error_detail,
+    _validate_governance_prefixed_ref,
+    _validate_governance_purge_id,
+)
 from reflexio.server.services.storage.postgres_storage._base import PostgresStorageBase
+from reflexio.server.services.storage.storage_base.evaluation_state_keys import (
+    GRADE_ON_DEMAND_CACHE_PREFIX,
+    build_agent_success_marker_key,
+    build_grade_on_demand_session_prefix,
+)
+from reflexio.server.services.storage.storage_base.retrieved_learning_state import (
+    build_retrieved_learning_state_key,
+)
+
+from ._protocols import SchemaScopedClient
 
 handle_exceptions = PostgresStorageBase.handle_exceptions
 
@@ -70,14 +98,29 @@ def _purge_target(row: dict[str, Any]) -> PurgeOperationTarget:
         detail=row.get("detail"),
         deleted_count=int(row.get("deleted_count") or 0),
         error_detail=row.get("error_detail"),
-        started_at=int(row["started_at"]) if row.get("started_at") is not None else None,
+        started_at=int(row["started_at"])
+        if row.get("started_at") is not None
+        else None,
         completed_at=(
             int(row["completed_at"]) if row.get("completed_at") is not None else None
         ),
     )
 
 
-class PostgresGovernanceMixin:
+def _subject_barrier(row: dict[str, Any]) -> SubjectWriteBarrier:
+    return SubjectWriteBarrier(
+        org_id=str(row["org_id"]),
+        subject_ref=str(row["subject_ref"]),
+        purge_id=str(row["purge_id"]),
+        status=cast(Any, row["status"]),
+        error_code=row.get("error_code"),
+        error_detail=row.get("error_detail"),
+        created_at=int(row["created_at"]),
+        updated_at=int(row["updated_at"]),
+    )
+
+
+class PostgresGovernanceMixin(SchemaScopedClient):
     """Postgres-backed audit and purge tracking."""
 
     org_id: str
@@ -86,6 +129,301 @@ class PostgresGovernanceMixin:
     _table: Any
     clear_user_data: Any
     _opensearch: Any
+    commit_scope: Any
+
+    def _subject_ref_for_user_id(self, user_id: str) -> str:
+        return governance_subject_ref(self.org_id, user_id, get_governance_ref_secret())
+
+    def _active_subject_barrier(self, subject_ref: str) -> dict[str, Any] | None:
+        rows = self._fetch_all(
+            sql.SQL(
+                """SELECT * FROM {} WHERE org_id = %s AND subject_ref = %s
+                   AND status IN ('erasing', 'erased')"""
+            ).format(self._table_identifier("subject_write_barriers")),
+            [self.org_id, subject_ref],
+        )
+        return rows[0] if rows else None
+
+    def _assert_subject_writable_locked(self, subject_ref: str) -> None:
+        row = self._active_subject_barrier(subject_ref)
+        if row is not None:
+            raise SubjectWriteBarrierError(
+                f"subject {subject_ref} is blocked by erasure barrier {row['purge_id']}"
+            )
+
+    def _same_subject_rows_remain(self, subject_ref: str) -> bool:
+        tables = (
+            "requests",
+            "interactions",
+            "profiles",
+            "user_playbooks",
+            "agent_success_evaluation_result",
+            "retrieved_learning_evaluation",
+            "session_outcomes",
+        )
+        for table in tables:
+            rows = self._fetch_all(
+                sql.SQL(
+                    "SELECT 1 FROM {} WHERE governance_subject_ref = %s LIMIT 1"
+                ).format(self._table_identifier(table)),
+                [subject_ref],
+            )
+            if rows:
+                return True
+
+        # Rows written before governance_subject_ref was introduced must also
+        # block completion. Recompute their minimized subject reference without
+        # persisting or exposing the raw user id.
+        for table in tables:
+            columns = self._table_columns(table)
+            if "user_id" not in columns:
+                continue
+            rows = self._fetch_all(
+                sql.SQL(
+                    "SELECT DISTINCT user_id FROM {} WHERE governance_subject_ref IS NULL"
+                ).format(self._table_identifier(table))
+            )
+            if any(
+                self._subject_ref_for_user_id(str(row["user_id"])) == subject_ref
+                for row in rows
+            ):
+                return True
+        return False
+
+    @handle_exceptions
+    def begin_subject_erasure_barrier(
+        self, subject_ref: str, purge_id: str
+    ) -> SubjectWriteBarrier:
+        _validate_governance_prefixed_ref(
+            "subject_ref", subject_ref, prefix="subref_v1_"
+        )
+        validated_purge_id = _validate_governance_purge_id("purge_id", purge_id)
+        now = _now()
+        with self.commit_scope():
+            purge_rows = self._fetch_all(
+                sql.SQL(
+                    "SELECT * FROM {} WHERE org_id = %s AND purge_id = %s FOR UPDATE"
+                ).format(self._table_identifier("purge_operations")),
+                [self.org_id, validated_purge_id],
+            )
+            if not purge_rows:
+                raise ValueError(f"Purge operation {validated_purge_id!r} not found")
+            purge = _purge_operation(purge_rows[0])
+            if purge.subject_ref != subject_ref:
+                raise ValueError(
+                    "Purge operation subject_ref must match the barrier subject_ref"
+                )
+            existing = self._fetch_all(
+                sql.SQL(
+                    "SELECT * FROM {} WHERE org_id = %s AND subject_ref = %s FOR UPDATE"
+                ).format(self._table_identifier("subject_write_barriers")),
+                [self.org_id, subject_ref],
+            )
+            if existing and str(existing[0]["purge_id"]) != validated_purge_id:
+                raise ValueError(
+                    "Existing barrier purge_id must match the requested purge_id"
+                )
+            if existing and str(existing[0]["status"]) == "erased":
+                return _subject_barrier(existing[0])
+            rows = self._fetch_all(
+                sql.SQL(
+                    """INSERT INTO {} (
+                           org_id, subject_ref, purge_id, status, created_at, updated_at
+                       ) VALUES (%s, %s, %s, 'erasing', %s, %s)
+                       ON CONFLICT (org_id, subject_ref) DO UPDATE SET
+                           purge_id = EXCLUDED.purge_id, status = 'erasing',
+                           error_code = NULL, error_detail = NULL,
+                           updated_at = EXCLUDED.updated_at
+                       RETURNING *"""
+                ).format(self._table_identifier("subject_write_barriers")),
+                [self.org_id, subject_ref, validated_purge_id, now, now],
+            )
+        return _subject_barrier(rows[0])
+
+    @handle_exceptions
+    def assert_subject_writable(self, subject_ref: str) -> None:
+        _validate_governance_prefixed_ref(
+            "subject_ref", subject_ref, prefix="subref_v1_"
+        )
+        self._assert_subject_writable_locked(subject_ref)
+
+    @handle_exceptions
+    def complete_subject_erasure_barrier_after_empty_check(
+        self, purge_id: str, audit_event: AuditEvent
+    ) -> PurgeOperation:
+        validated_purge_id = _validate_governance_purge_id("purge_id", purge_id)
+        if audit_event.org_id != self.org_id:
+            raise ValueError("Audit event org_id must match storage org_id")
+        if audit_event.idempotency_key != validated_purge_id:
+            raise ValueError("Audit event idempotency key must match purge_id")
+        if not _is_successful_erase_event(audit_event, purge_id=validated_purge_id):
+            raise ValueError(
+                "Completion requires a successful ERASE audit event for this purge"
+            )
+        audit_event = _canonicalize_audit_event_for_persistence(audit_event)
+        now = _now()
+        with self.commit_scope():
+            purge_rows = self._fetch_all(
+                sql.SQL(
+                    "SELECT * FROM {} WHERE org_id = %s AND purge_id = %s FOR UPDATE"
+                ).format(self._table_identifier("purge_operations")),
+                [self.org_id, validated_purge_id],
+            )
+            if not purge_rows:
+                raise ValueError(f"Purge operation {validated_purge_id!r} not found")
+            purge = _purge_operation(purge_rows[0])
+            if purge.subject_ref != audit_event.subject_ref:
+                raise ValueError(
+                    "Audit event subject_ref must match purge operation subject_ref"
+                )
+            if purge.request_ref != audit_event.request_ref:
+                raise ValueError(
+                    "Audit event request_ref must match purge operation request_ref"
+                )
+            snapshot = self._fetch_all(
+                sql.SQL(
+                    """SELECT 1 FROM {} WHERE org_id = %s AND purge_id = %s
+                       AND target_name = %s AND target_ref = 'all'
+                       AND phase = %s AND status = 'complete'"""
+                ).format(self._table_identifier("purge_operation_targets")),
+                [
+                    self.org_id,
+                    validated_purge_id,
+                    _SNAPSHOT_TARGET_NAME,
+                    _PREPARE_PHASE,
+                ],
+            )
+            if not snapshot:
+                raise ValueError("Cannot complete purge without target snapshot marker")
+            if self._same_subject_rows_remain(audit_event.subject_ref or ""):
+                raise ValueError("same-subject rows remain")
+            delete_rows = self._fetch_all(
+                sql.SQL(
+                    """SELECT target_name, status FROM {}
+                       WHERE org_id = %s AND purge_id = %s AND phase = 'delete'
+                       AND target_ref = 'all'"""
+                ).format(self._table_identifier("purge_operation_targets")),
+                [self.org_id, validated_purge_id],
+            )
+            delete_statuses = {
+                str(row["target_name"]): str(row["status"]) for row in delete_rows
+            }
+            missing = [
+                name
+                for name in _CANONICAL_DELETE_TARGET_NAMES
+                if delete_statuses.get(name) != "complete"
+            ]
+            if missing:
+                raise ValueError(
+                    "Cannot complete purge without complete delete target matrix: "
+                    + ", ".join(missing)
+                )
+            incomplete = self._fetch_all(
+                sql.SQL(
+                    """SELECT 1 FROM {} WHERE org_id = %s AND purge_id = %s
+                       AND status != 'complete' LIMIT 1"""
+                ).format(self._table_identifier("purge_operation_targets")),
+                [self.org_id, validated_purge_id],
+            )
+            if incomplete:
+                raise ValueError("Cannot complete purge with incomplete targets")
+
+            existing_audit = self._fetch_all(
+                sql.SQL(
+                    "SELECT * FROM {} WHERE org_id = %s AND idempotency_key = %s"
+                ).format(self._table_identifier("audit_events")),
+                [self.org_id, validated_purge_id],
+            )
+            if existing_audit:
+                existing_event = _audit_event(existing_audit[0])
+                if not _is_successful_erase_event(
+                    existing_event, purge_id=validated_purge_id
+                ) or _successful_erase_identity(
+                    existing_event
+                ) != _successful_erase_identity(audit_event):
+                    raise ValueError(
+                        "Existing audit row for purge_id must be the matching successful ERASE row"
+                    )
+            elif not self.append_audit_event(audit_event):
+                raise ValueError("Completion requires a successful ERASE audit row")
+
+            barrier = self._fetch_all(
+                sql.SQL(
+                    """UPDATE {} SET status = 'erased', error_code = NULL,
+                           error_detail = NULL, updated_at = %s
+                       WHERE org_id = %s AND subject_ref = %s AND purge_id = %s
+                         AND status = 'erasing' RETURNING 1"""
+                ).format(self._table_identifier("subject_write_barriers")),
+                [
+                    now,
+                    self.org_id,
+                    audit_event.subject_ref,
+                    validated_purge_id,
+                ],
+            )
+            if len(barrier) != 1:
+                raise ValueError("subject erasure barrier is missing")
+            completed = self._fetch_all(
+                sql.SQL(
+                    """UPDATE {} SET status = 'complete', error_code = NULL,
+                           error_detail = NULL, updated_at = %s, completed_at = %s
+                       WHERE org_id = %s AND purge_id = %s RETURNING *"""
+                ).format(self._table_identifier("purge_operations")),
+                [now, now, self.org_id, validated_purge_id],
+            )
+        return _purge_operation(completed[0])
+
+    @handle_exceptions
+    def fail_subject_erasure_barrier(
+        self,
+        subject_ref: str,
+        purge_id: str,
+        error_code: str,
+        error_detail: str,
+    ) -> SubjectWriteBarrier:
+        _validate_governance_prefixed_ref(
+            "subject_ref", subject_ref, prefix="subref_v1_"
+        )
+        validated_purge_id = _validate_governance_purge_id("purge_id", purge_id)
+        code = _validate_governance_error_code(error_code)
+        detail = _validate_governance_error_detail(error_detail)
+        now = _now()
+        with self.commit_scope():
+            rows = self._fetch_all(
+                sql.SQL(
+                    """UPDATE {} SET status = 'failed', error_code = %s,
+                           error_detail = %s, updated_at = %s
+                       WHERE org_id = %s AND subject_ref = %s AND purge_id = %s
+                         AND status = 'erasing' RETURNING *"""
+                ).format(self._table_identifier("subject_write_barriers")),
+                [code, detail, now, self.org_id, subject_ref, validated_purge_id],
+            )
+            if len(rows) != 1:
+                raise ValueError(
+                    "subject erasure barrier failure requires a matching barrier"
+                )
+            self._fetch_all(
+                sql.SQL(
+                    """UPDATE {} SET status = 'failed', error_code = %s,
+                           error_detail = %s, updated_at = %s, completed_at = %s
+                       WHERE org_id = %s AND purge_id = %s RETURNING 1"""
+                ).format(self._table_identifier("purge_operations")),
+                [code, detail, now, now, self.org_id, validated_purge_id],
+            )
+        return _subject_barrier(rows[0])
+
+    @handle_exceptions
+    def get_subject_write_barrier(self, subject_ref: str) -> SubjectWriteBarrier | None:
+        _validate_governance_prefixed_ref(
+            "subject_ref", subject_ref, prefix="subref_v1_"
+        )
+        rows = self._fetch_all(
+            sql.SQL("SELECT * FROM {} WHERE org_id = %s AND subject_ref = %s").format(
+                self._table_identifier("subject_write_barriers")
+            ),
+            [self.org_id, subject_ref],
+        )
+        return _subject_barrier(rows[0]) if rows else None
 
     @handle_exceptions
     def append_audit_event(self, event: AuditEvent) -> bool:
@@ -283,16 +621,63 @@ class PostgresGovernanceMixin:
     ) -> None:
         if self.purge_targets_prepared(purge_id):
             return
+        if owned_user_playbook_ids is None:
+            owned_user_playbook_ids = {
+                int(row["user_playbook_id"])
+                for row in self._fetch_all(
+                    sql.SQL(
+                        "SELECT user_playbook_id FROM {} WHERE user_id = %s"
+                    ).format(self._table_identifier("user_playbooks")),
+                    [user_id],
+                )
+            }
+        profile_ids = [
+            str(row["profile_id"])
+            for row in self._fetch_all(
+                sql.SQL("SELECT profile_id FROM {} WHERE user_id = %s").format(
+                    self._table_identifier("profiles")
+                ),
+                [user_id],
+            )
+        ]
+        purge_profile_ids, delete_profile_ids = self._partition_purge_vs_delete(
+            "profile", profile_ids
+        )
+        purge_playbook_ids, delete_playbook_ids = self._partition_purge_vs_delete(
+            "user_playbook",
+            [str(value) for value in sorted(owned_user_playbook_ids)],
+        )
+        session_rows = self._fetch_all(
+            sql.SQL("SELECT DISTINCT session_id FROM {} WHERE user_id = %s").format(
+                self._table_identifier("requests")
+            ),
+            [user_id],
+        )
+        subject_ref = self._subject_ref_for_user_id(user_id)
+        session_outcome_rows = self._fetch_all(
+            sql.SQL(
+                """SELECT count(*) AS count FROM {}
+                   WHERE user_id = %s OR governance_subject_ref = %s"""
+            ).format(self._table_identifier("session_outcomes")),
+            [user_id, subject_ref],
+        )
         counts = {
+            "session_outcome": int(session_outcome_rows[0]["count"]),
             "request": self._count_where("requests", "user_id", user_id),
             "interaction": self._count_where("interactions", "user_id", user_id),
-            "profile": self._count_where("profiles", "user_id", user_id),
-            "user_playbook": self._count_where("user_playbooks", "user_id", user_id),
+            "profile": len(delete_profile_ids),
+            "user_playbook": len(delete_playbook_ids),
             "agent_success_evaluation_result": self._count_where(
                 "agent_success_evaluation_result", "user_id", user_id
             ),
-            "profile_purge": 0,
-            "user_playbook_purge": 0,
+            "retrieved_learning_evaluation_result": self._count_where(
+                "retrieved_learning_evaluation", "user_id", user_id
+            ),
+            "evaluation_operation_state": 3 * len(session_rows),
+            "offline_tuner_reward_label": 0,
+            "offline_tuner_reward_label_target_by_target_owner": 0,
+            "profile_purge": len(purge_profile_ids),
+            "user_playbook_purge": len(purge_playbook_ids),
         }
         for target_name, count in counts.items():
             self.record_purge_target(
@@ -363,13 +748,92 @@ class PostgresGovernanceMixin:
     def apply_governance_user_data_delete(
         self, purge_id: str, user_id: str
     ) -> dict[str, int]:
+        with self.commit_scope():
+            return self._apply_governance_user_data_delete(purge_id, user_id)
+
+    def _apply_governance_user_data_delete(
+        self, purge_id: str, user_id: str
+    ) -> dict[str, int]:
+        session_ids = [
+            str(row["session_id"])
+            for row in self._fetch_all(
+                sql.SQL("SELECT DISTINCT session_id FROM {} WHERE user_id = %s").format(
+                    self._table_identifier("requests")
+                ),
+                [user_id],
+            )
+        ]
         counts = self.clear_user_data(user_id)
+        counts["agent_success_evaluation_results"] = len(
+            self._fetch_all(
+                sql.SQL("DELETE FROM {} WHERE user_id = %s RETURNING 1").format(
+                    self._table_identifier("agent_success_evaluation_result")
+                ),
+                [user_id],
+            )
+        )
+        counts["retrieved_learning_evaluation_results"] = len(
+            self._fetch_all(
+                sql.SQL("DELETE FROM {} WHERE user_id = %s RETURNING 1").format(
+                    self._table_identifier("retrieved_learning_evaluation")
+                ),
+                [user_id],
+            )
+        )
+        exact_keys = [
+            build_retrieved_learning_state_key(user_id, session_id)
+            for session_id in session_ids
+        ] + [
+            build_agent_success_marker_key(self.org_id, user_id, session_id)
+            for session_id in session_ids
+        ]
+        grade_prefixes = tuple(
+            build_grade_on_demand_session_prefix(self.org_id, session_id)
+            for session_id in session_ids
+        )
+        grade_rows = self._fetch_all(
+            sql.SQL("SELECT service_name FROM {} WHERE service_name LIKE %s").format(
+                self._table_identifier("_operation_state")
+            ),
+            [f"{GRADE_ON_DEMAND_CACHE_PREFIX}::%"],
+        )
+        state_keys = [
+            *exact_keys,
+            *[
+                str(row["service_name"])
+                for row in grade_rows
+                if str(row["service_name"]).startswith(grade_prefixes)
+            ],
+        ]
+        counts["evaluation_operation_states"] = (
+            len(
+                self._fetch_all(
+                    sql.SQL(
+                        "DELETE FROM {} WHERE service_name = ANY(%s) RETURNING 1"
+                    ).format(self._table_identifier("_operation_state")),
+                    [state_keys],
+                )
+            )
+            if state_keys
+            else 0
+        )
+        counts["offline_tuner_reward_labels"] = 0
+        counts["offline_tuner_reward_label_targets_by_target_owner"] = 0
         target_names = {
+            "session_outcomes": "session_outcome",
             "interactions": "interaction",
             "user_playbooks": "user_playbook",
             "profiles": "profile",
             "requests": "request",
             "agent_success_evaluation_results": "agent_success_evaluation_result",
+            "retrieved_learning_evaluation_results": (
+                "retrieved_learning_evaluation_result"
+            ),
+            "evaluation_operation_states": "evaluation_operation_state",
+            "offline_tuner_reward_labels": "offline_tuner_reward_label",
+            "offline_tuner_reward_label_targets_by_target_owner": (
+                "offline_tuner_reward_label_target_by_target_owner"
+            ),
             "purged_profiles": "profile_purge",
             "purged_user_playbooks": "user_playbook_purge",
         }

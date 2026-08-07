@@ -1,7 +1,7 @@
 """Shared atomic supersede primitive for applying a playbook edit.
 
-Extracted from ReflectionService._replace_playbook so online and background
-playbook repair paths share one lifecycle (insert-then-supersede, no orphan).
+Online and background playbook repair paths share one lifecycle
+(insert-then-supersede, no orphan).
 """
 
 from typing import TYPE_CHECKING
@@ -12,6 +12,10 @@ if TYPE_CHECKING:
     from reflexio.server.services.storage.storage_base import BaseStorage
 
 
+class _LostSupersedeRaceError(Exception):
+    """Internal signal used to roll back a provisional successor."""
+
+
 def apply_playbook_edit(
     storage: "BaseStorage",
     *,
@@ -19,6 +23,8 @@ def apply_playbook_edit(
     new_playbook: UserPlaybook,
     source: str,
     request_id: str,
+    skip_embedding: bool = False,
+    revise_context: LineageContext | None = None,
 ) -> int:
     """Insert a replacement playbook then atomically supersede the incumbent.
 
@@ -28,21 +34,23 @@ def apply_playbook_edit(
     - Insert the new playbook as CURRENT.
     - Call ``supersede_record(incumbent_id → new_id)``, which only succeeds when
       the incumbent is still CURRENT (``status IS NULL``).
-    - If ``supersede_record`` returns ``False`` (incumbent already gone), delete
-      the just-inserted successor and return ``-1``.
+    - If ``supersede_record`` returns ``False`` (incumbent already gone), roll
+      back the transaction and return ``-1``.
 
     Args:
         storage: A BaseStorage instance providing ``save_user_playbooks``,
-            ``supersede_record``, and ``delete_user_playbooks_by_ids``.
+            ``supersede_record``, and ``commit_scope``.
         incumbent_id: ``user_playbook_id`` of the playbook being replaced.
         new_playbook: The replacement playbook (inserted as CURRENT, i.e.
             ``status=None``).
         source: Provenance label stored on the new playbook row and in the
             lineage event actor field.
         request_id: Operation-run correlation id for the lineage event. Must be
-            non-empty; use the reflection run id (``ReflectionServiceRequest.request_id``)
-            or another operation-scoped id. Raises ``ValueError`` immediately
-            (before any storage write) when empty, preventing orphaned successor rows.
+            non-empty; use an operation-scoped id. Raises ``ValueError``
+            immediately (before any storage write) when empty, preventing
+            orphaned successor rows.
+        skip_embedding: Forwarded to ``save_user_playbooks``. Defaults to
+            ``False`` (precompute the embedding before opening the transaction).
 
     Returns:
         The ``user_playbook_id`` of the newly inserted playbook, or ``-1`` if
@@ -56,19 +64,24 @@ def apply_playbook_edit(
             "apply_playbook_edit: request_id must be non-empty (operation-run correlation id)"
         )
     new_playbook.source = source
-    storage.save_user_playbooks([new_playbook])
-    new_id: int = new_playbook.user_playbook_id
+    if not skip_embedding:
+        storage.precompute_user_playbook_embeddings([new_playbook])
 
-    ctx = LineageContext(op_kind="revise", actor=source, request_id=request_id)
-    superseded = storage.supersede_record(
-        entity_type="user_playbook",
-        incumbent_id=str(incumbent_id),
-        successor_id=str(new_id),
-        context=ctx,
+    ctx = revise_context or LineageContext(
+        op_kind="revise", actor=source, request_id=request_id
     )
-    if not superseded:
-        # lost the race: delete the just-inserted successor so no orphan CURRENT row
-        # remains. It was never live, so this is a rollback — not an audited erasure.
-        storage.delete_user_playbooks_by_ids([new_id], emit_hard_delete=False)
+    try:
+        with storage.commit_scope():
+            storage.save_user_playbooks([new_playbook], skip_embedding=True)
+            new_id = new_playbook.user_playbook_id
+            if not storage.supersede_record(
+                entity_type="user_playbook",
+                incumbent_id=str(incumbent_id),
+                successor_id=str(new_id),
+                context=ctx,
+            ):
+                raise _LostSupersedeRaceError
+    except _LostSupersedeRaceError:
+        new_playbook.user_playbook_id = 0
         return -1
     return new_id

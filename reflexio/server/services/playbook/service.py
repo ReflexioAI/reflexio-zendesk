@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -8,8 +9,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from reflexio.server.api_endpoints.request_context import RequestContext
     from reflexio.server.llm.litellm_client import LiteLLMClient
+    from reflexio.server.services.deferred_learning_plan import GenerationComputePlan
     from reflexio.server.services.storage.storage_base import BaseStorage
 
+from reflexio.models.api_schema.common import sanitise_for_log
+from reflexio.models.api_schema.domain.entities import LineageContext
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.models.api_schema.service_schemas import (
     DowngradeUserPlaybooksResponse,
@@ -22,21 +26,25 @@ from reflexio.models.api_schema.service_schemas import (
     UserPlaybook,
 )
 from reflexio.models.config_schema import PlaybookConfig
-from reflexio.server.operation_limiter import run_with_operation_limit
+from reflexio.server.llm._litellm_types import ModelProvenance
 from reflexio.server.services.base_generation_service import (
     BaseGenerationService,
     StatusChangeOperation,
 )
-from reflexio.server.services.playbook.components.aggregator import PlaybookAggregator
+from reflexio.server.services.deferred_learning_plan import PlaybookWritePlan
+from reflexio.server.services.playbook.aggregation_trigger import (
+    maybe_trigger_user_playbook_aggregation,
+)
 from reflexio.server.services.playbook.components.extractor import PlaybookExtractor
 from reflexio.server.services.playbook.playbook_service_constants import (
     PlaybookServiceConstants,
 )
 from reflexio.server.services.playbook.playbook_service_utils import (
-    PlaybookAggregatorRequest,
     PlaybookGenerationRequest,
     format_expert_comparison_pairs,
     has_expert_content,
+    is_evidence_validated,
+    uses_evidence_grounded_extraction,
 )
 from reflexio.server.services.service_utils import (
     extract_interactions_from_request_interaction_data_models,
@@ -99,6 +107,15 @@ class PlaybookGenerationServiceConfig:
     force_extraction: bool = False
 
 
+def _consolidation_search_keys(playbooks: list[UserPlaybook]) -> set[str]:
+    """Return the strings consolidation would use as its hybrid-search queries.
+
+    Mirrors the query selection in ``retrieve_existing_playbooks`` so callers can
+    tell whether a cached retrieval is still valid for a changed candidate set.
+    """
+    return {(playbook.trigger or playbook.content).strip() for playbook in playbooks}
+
+
 class PlaybookGenerationService(
     BaseGenerationService[
         PlaybookConfig,
@@ -137,6 +154,7 @@ class PlaybookGenerationService(
         self.allow_manual_trigger = allow_manual_trigger
         self.output_pending_status = output_pending_status
         self.skip_aggregation = skip_aggregation
+        self._review_window_cache: list[RequestInteractionDataModel] | None = None
 
     def _load_generation_service_config(
         self, request: PlaybookGenerationRequest
@@ -150,8 +168,12 @@ class PlaybookGenerationService(
         Returns:
             PlaybookGenerationServiceConfig object
         """
+        # One service instance can process multiple users in a batch. Never let
+        # a review window loaded for the previous request cross that boundary.
+        self._review_window_cache = None
+        generation_request_id = request.request_id
         return PlaybookGenerationServiceConfig(
-            request_id=request.request_id,
+            request_id=generation_request_id,
             agent_version=request.agent_version,
             user_id=request.user_id,
             source=request.source,
@@ -165,6 +187,40 @@ class PlaybookGenerationService(
     def _configured_playbook_config(self) -> PlaybookConfig | None:
         root_config = self.configurator.get_config()
         return getattr(root_config, "user_playbook_extractor_config", None)
+
+    def _review_interaction_window(
+        self, playbook_config: PlaybookConfig
+    ) -> list[RequestInteractionDataModel]:
+        """Load the interaction window the reviewer reasons over, once per run.
+
+        The reviewer needs the same chronology extraction saw. Extraction runs in
+        a separate step that does not hand its window back, so this reloads it —
+        memoized because ``_resolve_write_plan`` may be reached more than once for
+        one generation.
+
+        Args:
+            playbook_config (PlaybookConfig): Config whose window/source filters
+                define the interaction window.
+
+        Returns:
+            list[RequestInteractionDataModel]: The reloaded interaction window.
+
+        Raises:
+            RuntimeError: If the configured source filter excludes the reviewer
+                reload after extraction already produced candidates.
+        """
+        if self._review_window_cache is None:
+            if self.service_config is None:
+                raise RuntimeError("service_config must be set before review")
+            loaded_window = self._create_extractor(
+                playbook_config, self.service_config
+            )._get_interactions()
+            if loaded_window is None:
+                raise RuntimeError(
+                    "Normal playbook review source filter excluded its interaction window"
+                )
+            self._review_window_cache = loaded_window
+        return self._review_window_cache
 
     def _load_extractor_config(self) -> PlaybookConfig | None:
         """
@@ -286,50 +342,164 @@ class PlaybookGenerationService(
                 all_playbooks.extend(result)
         self._finalize_extracted_items(all_playbooks)
 
-    def _finalize_extracted_items(self, all_playbooks: list[UserPlaybook]) -> None:
-        """Deduplicate, persist, and aggregate extracted user playbook items."""
+    def _resolve_write_plan(
+        self, results: list[list[UserPlaybook]]
+    ) -> PlaybookWritePlan | None:
+        """Compute-half of playbook finalization — NO learning DB write.
+
+        Flattens + ``dedupe_and_drop_empty``, runs the deduplicator (its 2nd
+        LLM call + reads of existing rows), assigns ``source``/``status``, and
+        **precomputes embeddings** on the survivors. Returns a
+        :class:`PlaybookWritePlan` for the persist half, or ``None`` when there
+        is nothing to write (matching the pre-split ``if all_playbooks:`` gate,
+        which suppressed save/lineage/schedulers alike). Issues no
+        ``save_user_playbooks``/``merge_records``/``supersede_*`` — the write is
+        the persist half's job (compute is write-free).
+        """
         from reflexio.server.services.playbook.playbook_service_utils import (
             dedupe_and_drop_empty,
         )
 
+        generation_request_id = self.service_config.request_id  # type: ignore[reportOptionalMemberAccess]
+
+        all_playbooks: list[UserPlaybook] = []
+        for result in results:
+            if isinstance(result, list):
+                all_playbooks.extend(result)
         all_playbooks = dedupe_and_drop_empty(all_playbooks)
 
-        # Deduplicate against existing entries in DB when deduplicator is enabled
-        existing_ids_to_delete: list[int] = []
-        merge_groups: list[tuple[int, list[int]]] = []
-        from reflexio.server.site_var.feature_flags import is_deduplicator_enabled
+        # Review complete evidence-grounded normal candidates before
+        # consolidation. Legacy or expert paths remain unchanged in this
+        # iteration; every new normal candidate is expected to carry validated
+        # evidence and therefore enters this fail-closed review path.
+        from reflexio.server.services.playbook.components.consolidator import (
+            PlaybookConsolidator,
+        )
+        from reflexio.server.services.playbook.components.reviewer import (
+            PlaybookCandidateReviewer,
+        )
 
-        if is_deduplicator_enabled(self.org_id):
-            from reflexio.server.services.playbook.components.consolidator import (
-                PlaybookConsolidator,
-            )
+        playbook_config = self._configured_playbook_config()
+        dedup_config = playbook_config.deduplication_config if playbook_config else None
 
-            playbook_config = self._configured_playbook_config()
-            dedup_config = (
-                playbook_config.deduplication_config if playbook_config else None
+        consolidator = PlaybookConsolidator(
+            request_context=self.request_context,
+            llm_client=self.client,
+            dedup_config=dedup_config,
+        )
+        reviewer = PlaybookCandidateReviewer(
+            request_context=self.request_context,
+            llm_client=self.client,
+        )
+        # Retrieved once and shared: the reviewer and the consolidator need the
+        # same existing rows, and the hybrid search costs one embedding query per
+        # candidate.
+        existing_playbooks: list[UserPlaybook] | None = None
+        # MOCK_LLM_RESPONSE is the repository's explicit no-LLM pipeline mode:
+        # extraction creates a deterministic fixture and consolidation also skips
+        # its model call. Keep reviewer behavior consistent instead of making mock
+        # mode unexpectedly contact a provider.
+        if (
+            all_playbooks
+            and reviewer.is_enabled()
+            and playbook_config is not None
+            and self.service_config is not None
+            and os.getenv("MOCK_LLM_RESPONSE", "").lower() != "true"
+        ):
+            review_interactions = self._review_interaction_window(playbook_config)
+            if not review_interactions:
+                raise RuntimeError(
+                    "Normal playbook review could not reload its interaction window"
+                )
+            flat_review_interactions = (
+                extract_interactions_from_request_interaction_data_models(
+                    review_interactions
+                )
             )
+            expert_batch = has_expert_content(flat_review_interactions)
+            if expert_batch:
+                logger.info(
+                    "Skipping normal candidate reviewer for expert-content batch"
+                )
+            else:
+                strict_normal = uses_evidence_grounded_extraction(
+                    self.request_context.prompt_manager,
+                    expert=False,
+                )
+                if not strict_normal:
+                    logger.info(
+                        "Skipping normal candidate reviewer for legacy extraction prompt"
+                    )
+                else:
+                    invalid_candidate_indexes = [
+                        index
+                        for index, playbook in enumerate(all_playbooks, start=1)
+                        if not is_evidence_validated(playbook)
+                    ]
+                    if invalid_candidate_indexes:
+                        raise RuntimeError(
+                            "Strict normal playbook candidates are missing validated "
+                            "evidence metadata: "
+                            + ",".join(
+                                f"C{index}" for index in invalid_candidate_indexes
+                            )
+                        )
 
-            consolidator = PlaybookConsolidator(
-                request_context=self.request_context,
-                llm_client=self.client,
-                dedup_config=dedup_config,
-            )
-            (
-                deduplicated_playbooks,
-                existing_ids_to_delete,
-                merge_groups,
-            ) = consolidator.deduplicate(
-                [all_playbooks],
-                self.service_config.request_id,  # type: ignore[reportOptionalMemberAccess]
-                self.service_config.agent_version,  # type: ignore[reportOptionalMemberAccess]
-                user_id=self.service_config.user_id,  # type: ignore[reportOptionalMemberAccess]
-            )
-            logger.info(
-                "User playbook entries after deduplication: %d",
-                len(deduplicated_playbooks),
-            )
-            if deduplicated_playbooks:
-                all_playbooks = deduplicated_playbooks
+                    existing_playbooks = consolidator.retrieve_existing_playbooks(
+                        all_playbooks,
+                        user_id=self.service_config.user_id,
+                        agent_version=self.service_config.agent_version,
+                    )
+                    root_config = self.request_context.configurator.get_config()
+                    tool_context = ""
+                    if root_config and root_config.tool_can_use:
+                        tool_context = "\n".join(
+                            f"{tool.tool_name}: {tool.tool_description}"
+                            for tool in root_config.tool_can_use
+                        )
+                    search_keys_before = _consolidation_search_keys(all_playbooks)
+                    all_playbooks = dedupe_and_drop_empty(
+                        reviewer.review(
+                            candidates=all_playbooks,
+                            request_interaction_data_models=review_interactions,
+                            existing_playbooks=existing_playbooks,
+                            agent_context=self.configurator.get_agent_context(),
+                            playbook_definition=(
+                                playbook_config.extraction_definition_prompt or ""
+                            ).strip(),
+                            tool_context=tool_context,
+                        )
+                    )
+                    # Consolidation searches by trigger. Reusing this retrieval is
+                    # only sound while the survivors' search keys are unchanged; a
+                    # revised trigger would match different stored rows, so drop the
+                    # cache and let consolidation search again.
+                    if not (
+                        _consolidation_search_keys(all_playbooks) <= search_keys_before
+                    ):
+                        existing_playbooks = None
+
+        # Deduplicate reviewed survivors against existing entries in DB.
+        (
+            deduplicated_playbooks,
+            existing_ids_to_delete,
+            merge_groups,
+        ) = consolidator.deduplicate(
+            [all_playbooks],
+            generation_request_id,
+            self.service_config.agent_version,  # type: ignore[reportOptionalMemberAccess]
+            user_id=self.service_config.user_id,  # type: ignore[reportOptionalMemberAccess]
+            existing_playbooks=existing_playbooks,
+        )
+        consolidation_provenance = consolidator.model_provenance
+        consolidated_output_indices = consolidator.consolidated_output_indices
+        logger.info(
+            "User playbook entries after deduplication: %d",
+            len(deduplicated_playbooks),
+        )
+        # An empty result is meaningful: every candidate may have been rejected
+        # as redundant. Never retain the pre-consolidation rows on reject-all.
+        all_playbooks = deduplicated_playbooks
 
         # Set status and source for all entries
         for playbook in all_playbooks:
@@ -338,41 +508,163 @@ class PlaybookGenerationService(
 
         logger.info("All user playbook entries: %s", all_playbooks)
 
+        if not all_playbooks:
+            return None
+
         logger.info(
             "Successfully completed %d %s playbook generation for request id: %s",
             len(all_playbooks),
             self._get_service_name(),
-            self.service_config.request_id,  # type: ignore[reportOptionalMemberAccess]
+            generation_request_id,
         )
 
-        # Save results
-        if all_playbooks:
-            try:
-                self.storage.save_user_playbooks(all_playbooks)  # type: ignore[reportOptionalMemberAccess]
-                self._enqueue_user_playbook_optimization(all_playbooks)
-                self._apply_consolidation_lineage(
-                    all_playbooks, merge_groups, existing_ids_to_delete
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to save %s results for request id: %s due to %s, exception type: %s",
-                    self._get_service_name(),
-                    self.service_config.request_id,  # type: ignore[reportOptionalMemberAccess]
-                    str(e),
-                    type(e).__name__,
-                )
-                raise
+        # Precompute embeddings on the survivors (compute-side, NO DB write). The
+        # persist half passes skip_embedding=True so no embedding runs in the fence.
+        self.storage.precompute_user_playbook_embeddings(all_playbooks)  # type: ignore[reportOptionalMemberAccess]
 
-            # Trigger playbook aggregation
-            if not self.output_pending_status and not self.skip_aggregation:
+        lineage_contexts: list[LineageContext] = []
+        for index, _playbook in enumerate(all_playbooks):
+            provenance = (
+                consolidation_provenance
+                if index in consolidated_output_indices
+                else self._last_model_provenance
+            )
+            lineage_contexts.append(
+                LineageContext(
+                    op_kind="create",
+                    actor=(
+                        "consolidator"
+                        if index in consolidated_output_indices
+                        else "extractor"
+                    ),
+                    request_id=generation_request_id,
+                    model_name=provenance.model_name if provenance else None,
+                    provider=provenance.provider if provenance else None,
+                )
+            )
+
+        return PlaybookWritePlan(
+            request_id=generation_request_id,
+            output_pending_status=self.output_pending_status,
+            skip_aggregation=self.skip_aggregation,
+            new_playbooks=all_playbooks,
+            superseded_ids=existing_ids_to_delete,
+            merge_groups=merge_groups,
+            lineage_contexts=lineage_contexts,
+            consolidation_provenance=consolidation_provenance,
+        )
+
+    def _persist_write_plan(self, plan: PlaybookWritePlan) -> None:
+        """Persist-half of playbook finalization — apply the resolved write-plan.
+
+        Issues only the fence-critical row writes: saves the new playbooks
+        (``skip_embedding=True`` — embeddings were precomputed in compute; the
+        save also assigns survivor ids) then materializes the consolidation
+        lineage, which MUST see those survivor ids and so runs AFTER the save.
+        NO LLM / embedding / dedup. The off-thread optimization/aggregation
+        schedulers are NOT here — they fire post-commit in
+        ``emit_generation_side_effects`` (durable / ``.run()``) or right after
+        persist in ``_finalize_extracted_items`` (resume/manual).
+        """
+        if not plan.new_playbooks:
+            return
+        try:
+            self.storage.save_user_playbooks(  # type: ignore[reportOptionalMemberAccess]
+                plan.new_playbooks,
+                skip_embedding=True,
+                lineage_contexts=plan.lineage_contexts,
+            )
+            self._apply_consolidation_lineage(
+                plan.new_playbooks,
+                plan.merge_groups,
+                plan.superseded_ids,
+                request_id=plan.request_id,
+                model_provenance=plan.consolidation_provenance,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to save %s results for request id: %s due to %s, exception type: %s",
+                self._get_service_name(),
+                plan.request_id,
+                str(e),
+                type(e).__name__,
+            )
+            raise
+
+    def _dispatch_playbook_schedulers(self, plan: PlaybookWritePlan) -> None:
+        """Fire the off-thread optimization + aggregation schedulers post-persist.
+
+        Phantom-billing gate: on the durable / ``.run()`` path this is invoked
+        from ``emit_generation_side_effects`` (post-commit), so a fence-lost
+        (superseded) job never enqueues optimization or triggers aggregation. On
+        the synchronous resume/manual path the permanent
+        ``_finalize_extracted_items`` wrapper invokes it right after persist,
+        keeping that path identical to the pre-split monolith. The two callers
+        are mutually exclusive, so the schedulers fire exactly once per run.
+        """
+        try:
+            self._enqueue_user_playbook_optimization(plan.new_playbooks)
+        except Exception:
+            logger.exception(
+                "Failed to schedule post-persist playbook optimization for request %s",
+                sanitise_for_log(plan.request_id),
+            )
+        if not plan.output_pending_status and not plan.skip_aggregation:
+            try:
                 logger.info("Trigger playbook aggregation")
                 self._trigger_playbook_aggregation()
+            except Exception:
+                logger.exception(
+                    "Failed to schedule post-persist playbook aggregation for request %s",
+                    sanitise_for_log(plan.request_id),
+                )
+
+    def emit_generation_side_effects(self, plan: GenerationComputePlan) -> None:
+        """Post-commit side-effects — base telemetry/billing + playbook schedulers.
+
+        Extends the base emit (``generation_succeeded`` + ② Learning billing)
+        with the off-thread optimization/aggregation schedulers, which move here
+        so they fire only for a fence-winning durable job (never for a
+        superseded one) — the phantom-billing gate.
+        """
+        super().emit_generation_side_effects(plan)
+        write_plan = plan.write_plan
+        if write_plan is not None:
+            self._dispatch_playbook_schedulers(write_plan)
+
+    def _finalize_extracted_items(
+        self,
+        all_playbooks: list[UserPlaybook],
+        *,
+        model_provenance: ModelProvenance | None = None,
+    ) -> list[UserPlaybook]:
+        """Permanent V3 wrapper: compute→persist→schedulers together (no fence).
+
+        Kept for the synchronous resume/manual callers
+        (``ExtractionResumeWorker`` calls this directly). Routes them through the
+        same ``_resolve_write_plan`` (compute) + ``_persist_write_plan``
+        (persist) split the durable worker uses — with no external
+        ``commit_scope`` — then dispatches the same off-thread schedulers, so the
+        result is identical to the pre-split monolith.
+        """
+        if model_provenance is not None:
+            self._last_model_provenance = model_provenance
+        plan = self._resolve_write_plan([all_playbooks])
+        if plan is None:
+            return []
+        with self.storage.commit_scope():  # type: ignore[reportOptionalMemberAccess]
+            self._persist_write_plan(plan)
+        self._dispatch_playbook_schedulers(plan)
+        return plan.new_playbooks
 
     def _apply_consolidation_lineage(
         self,
         saved_playbooks: list[UserPlaybook],
         merge_groups: list[tuple[int, list[int]]],
         existing_ids_to_delete: list[int],
+        *,
+        request_id: str,
+        model_provenance: ModelProvenance | None = None,
     ) -> None:
         """Materialize consolidation merges as lineage tombstones.
 
@@ -389,9 +681,12 @@ class PlaybookGenerationService(
             saved_playbooks: The just-persisted entries (survivor ids assigned).
             merge_groups: ``(survivor_index, source_existing_ids)`` per merge.
             existing_ids_to_delete: ALL archived ids (merge sources + leftovers).
+            request_id: Generation request id — the lineage key recorded on the
+                merge/supersede events. Passed explicitly (from the write-plan)
+                rather than read off ``self.service_config`` so persist stays
+                decoupled from the mutable service config on the fenced path.
         """
-        from reflexio.models.api_schema.domain.entities import LineageContext
-
+        generation_request_id = request_id
         merged_source_ids: set[int] = set()
         for survivor_idx, source_ids in merge_groups:
             survivor_id = saved_playbooks[survivor_idx].user_playbook_id
@@ -405,7 +700,11 @@ class PlaybookGenerationService(
                     actor="consolidator",
                     source_ids=[str(s) for s in source_ids],
                     reason="dedup-merge",
-                    request_id=self.service_config.request_id,  # type: ignore[reportOptionalMemberAccess]
+                    request_id=generation_request_id,
+                    model_name=(
+                        model_provenance.model_name if model_provenance else None
+                    ),
+                    provider=model_provenance.provider if model_provenance else None,
                 ),
             )
 
@@ -419,7 +718,7 @@ class PlaybookGenerationService(
             try:
                 superseded_count = self.storage.supersede_user_playbooks_by_ids(  # type: ignore[reportOptionalMemberAccess]
                     leftover_ids,
-                    self.service_config.request_id,  # type: ignore[reportOptionalMemberAccess]
+                    generation_request_id,
                 )
                 logger.info(
                     "Superseded %d split-source existing entries", superseded_count
@@ -524,46 +823,12 @@ class PlaybookGenerationService(
         Trigger playbook aggregation for playbook types that have aggregator config.
         This is called after raw user playbook entries are saved to check if aggregation should run.
         """
-        playbook_config = self._configured_playbook_config()
-        if not playbook_config or not playbook_config.aggregation_config:
-            return
-
-        logger.info("Triggering aggregation")
-
-        # Create aggregator request. Aggregation is singleton — it operates on the
-        # user's whole playbook set, so no name selector is threaded.
-        aggregator_request = PlaybookAggregatorRequest(
-            agent_version=self.service_config.agent_version,  # type: ignore[reportOptionalMemberAccess]
-        )
-
-        # Initialize and run aggregator (synchronous)
-        from reflexio.server.services.playbook.user_detail_stripping import (
-            create_aggregation_user_detail_stripper,
-        )
-
-        user_detail_stripper = create_aggregation_user_detail_stripper(
-            self.request_context.configurator
-        )
-        aggregator_kwargs = {}
-        if user_detail_stripper is not None:
-            aggregator_kwargs["user_detail_stripper"] = user_detail_stripper
-        aggregator = PlaybookAggregator(
-            llm_client=self.client,
+        maybe_trigger_user_playbook_aggregation(
             request_context=self.request_context,
+            llm_client=self.client,
             agent_version=self.service_config.agent_version,  # type: ignore[reportOptionalMemberAccess]
-            **aggregator_kwargs,
+            reason="playbook_generation",
         )
-        try:
-            run_with_operation_limit(
-                org_id=self.request_context.org_id,
-                operation="aggregation",
-                fn=lambda: aggregator.run(aggregator_request),
-            )
-        except TimeoutError:
-            logger.info(
-                "Skipping inline aggregation for agent_version=%s: aggregation limiter is saturated",
-                self.service_config.agent_version,  # type: ignore[reportOptionalMemberAccess]
-            )
 
     # ===============================
     # Rerun hook implementations (override base class methods)
@@ -646,8 +911,9 @@ class PlaybookGenerationService(
         """
         # Handle rerun requests (have start_time/end_time datetime objects)
         if isinstance(request, RerunPlaybookGenerationRequest):
+            operation_request_id = f"rerun_playbook_{uuid.uuid4().hex[:8]}"
             return PlaybookGenerationRequest(
-                request_id=f"rerun_playbook_{uuid.uuid4().hex[:8]}",
+                request_id=operation_request_id,
                 agent_version=request.agent_version,
                 user_id=user_id,
                 source=request.source,
@@ -660,8 +926,9 @@ class PlaybookGenerationService(
                 auto_run=False,
             )
         # Handle manual requests (ManualPlaybookGenerationRequest)
+        operation_request_id = f"manual_{uuid.uuid4().hex[:8]}"
         return PlaybookGenerationRequest(
-            request_id=f"manual_{uuid.uuid4().hex[:8]}",
+            request_id=operation_request_id,
             agent_version=request.agent_version,
             user_id=user_id,
             source=request.source,

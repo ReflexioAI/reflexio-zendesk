@@ -11,6 +11,7 @@ from reflexio.models.api_schema.service_schemas import (
     Interaction,
     ProfileChangeLog,
     ProfileTimeToLive,
+    RetrievedLearning,
     ToolUsed,
     UserActionType,
     UserProfile,
@@ -125,6 +126,16 @@ def response_to_interaction(item: Mapping[str, Any]) -> Interaction:
         if citations_data and isinstance(citations_data, list)
         else []
     )
+    retrieved_data = item.get("retrieved_learnings")
+    retrieved_learnings = (
+        [
+            RetrievedLearning(**entry)
+            for entry in retrieved_data
+            if isinstance(entry, dict)
+        ]
+        if isinstance(retrieved_data, list)
+        else []
+    )
 
     return Interaction(
         interaction_id=item["interaction_id"],
@@ -133,6 +144,7 @@ def response_to_interaction(item: Mapping[str, Any]) -> Interaction:
         request_id=item["request_id"],
         created_at=_parse_iso_timestamp(item["created_at"]),
         role=item.get("role", "User"),
+        token_count=item.get("token_count"),
         user_action=UserActionType(item["user_action"]),
         user_action_description=item["user_action_description"],
         interacted_image_url=item["interacted_image_url"],
@@ -140,6 +152,7 @@ def response_to_interaction(item: Mapping[str, Any]) -> Interaction:
         expert_content=item.get("expert_content") or "",
         tools_used=tools_used,
         citations=citations,
+        retrieved_learnings=retrieved_learnings,
     )
 
 
@@ -161,6 +174,7 @@ def interaction_to_data(interaction: Interaction) -> dict[str, Any]:
             interaction.created_at, tz=UTC
         ).isoformat(),
         "role": interaction.role,
+        "token_count": interaction.token_count,
         "user_action": interaction.user_action.value,
         "user_action_description": interaction.user_action_description,
         "interacted_image_url": interaction.interacted_image_url,
@@ -168,6 +182,9 @@ def interaction_to_data(interaction: Interaction) -> dict[str, Any]:
         "expert_content": interaction.expert_content,
         "tools_used": [t.model_dump() for t in interaction.tools_used],
         "citations": [c.model_dump() for c in interaction.citations],
+        "retrieved_learnings": [
+            learning.model_dump() for learning in interaction.retrieved_learnings
+        ],
         "embedding": interaction.embedding,
     }
     # Only include interaction_id if it's set (non-zero), otherwise let DB auto-generate

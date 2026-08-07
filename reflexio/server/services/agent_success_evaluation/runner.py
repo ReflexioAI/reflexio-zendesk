@@ -2,14 +2,20 @@
 
 Fetches all requests and interactions for a session,
 checks completion status, runs evaluation, and marks the group as evaluated.
+
+Also runs the retrieved-learning relevance/impact evaluation for the session
+after agent-success work completes. The two completions are independent: the
+existing ``agent_success_group_eval`` marker stays agent-success-only, and the
+retrieved evaluation keeps its own generation/fingerprint-fenced state (see
+``storage_base/retrieved_learning_state.py``).
 """
 
 import logging
-import random
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
-from reflexio.models.api_schema.domain.entities import Interaction
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.server.api_endpoints.request_context import RequestContext
 from reflexio.server.llm.litellm_client import LiteLLMClient
@@ -18,6 +24,9 @@ from reflexio.server.services.agent_success_evaluation._eval_health import SkipR
 from reflexio.server.services.agent_success_evaluation.agent_success_evaluation_utils import (
     AgentSuccessEvaluationRequest,
 )
+from reflexio.server.services.agent_success_evaluation.components.retrieved_learning_evaluator import (
+    RetrievedLearningEvaluator,
+)
 from reflexio.server.services.agent_success_evaluation.scheduler import (
     _EFFECTIVE_DELAY_SECONDS,
 )
@@ -25,16 +34,52 @@ from reflexio.server.services.agent_success_evaluation.service import (
     AgentSuccessEvaluationService,
 )
 from reflexio.server.services.extractor_config_utils import get_extractor_name
-from reflexio.server.services.shadow_comparison.judge import ShadowComparisonJudge
+from reflexio.server.services.storage.storage_base.evaluation_state_keys import (
+    build_agent_success_marker_key,
+)
+from reflexio.server.services.storage.storage_base.retrieved_learning_state import (
+    session_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
 # Key prefix for operation state tracking
 OPERATION_STATE_KEY_PREFIX = "agent_success_group_eval"
 
+type AgentSuccessInvocationStatus = Literal[
+    "complete", "failed", "not_applicable", "skipped"
+]
+type RetrievedLearningInvocationStatus = Literal[
+    "pending",
+    "complete",
+    "degraded",
+    "failed",
+    "not_applicable",
+    "stale",
+    "superseded",
+    "skipped",
+]
+
+
+@dataclass
+class GroupEvaluationOutcome:
+    """What one runner invocation did, per evaluation family.
+
+    ``retrieved_learning_fingerprint`` carries the session fingerprint at
+    which a terminal/applied retrieved outcome linearized; ``None`` for
+    nonterminal or skipped-without-state outcomes.
+    """
+
+    agent_success_status: AgentSuccessInvocationStatus
+    retrieved_learning_status: RetrievedLearningInvocationStatus
+    retrieved_learning_fingerprint: str | None = None
+
 
 def _build_state_key(org_id: str, user_id: str, session_id: str) -> str:
     """Build the operation state key for a session.
+
+    Delegates to the shared key builder so governance erasure scrubs the
+    exact same keys this runner writes.
 
     Args:
         org_id: Organization ID
@@ -44,7 +89,7 @@ def _build_state_key(org_id: str, user_id: str, session_id: str) -> str:
     Returns:
         str: The operation state key
     """
-    return f"{OPERATION_STATE_KEY_PREFIX}::{org_id}::{user_id}::{session_id}"
+    return build_agent_success_marker_key(org_id, user_id, session_id)
 
 
 def run_group_evaluation(
@@ -57,7 +102,9 @@ def run_group_evaluation(
     llm_client: LiteLLMClient,
     *,
     force_regenerate: bool = False,
-) -> None:
+    run_agent_success: bool = True,
+    run_retrieved_learning: bool = True,
+) -> GroupEvaluationOutcome:
     """Run agent success evaluation for an entire session.
 
     Steps:
@@ -65,12 +112,11 @@ def run_group_evaluation(
     2. Fetch all requests for the session
     3. Verify completion (latest request created_at >= delay ago; skipped when force_regenerate)
     4. Fetch interactions and build data models
-    5. Capture prior result_ids (when regenerating) so they
-       can be removed AFTER the new save lands
+    5. Capture prior result_ids (when regenerating) for post-save reconciliation
     6. Run evaluation service (which saves new rows)
-    7. On success, delete the captured prior rows by id — the new rows have
-       fresh auto-increment ids that do not overlap. A failure here leaves
-       the session in a consistent pre-regen state instead of zero rows.
+    7. On success, delete captured prior rows only when the backend inserted
+       fresh result_ids; preserve ids updated in place by an enterprise upsert.
+       A generation/save failure leaves the prior result untouched.
     8. Mark as evaluated in operation state
 
     Args:
@@ -84,30 +130,29 @@ def run_group_evaluation(
         force_regenerate: When True, bypass the already-evaluated short-circuit
             and the completeness delay gate so the regenerate worker can
             re-evaluate sessions of any age regardless of prior state.
+        run_agent_success: Whether this session was admitted for the
+            session-success judge. The publish scheduler samples the two
+            families independently (see ``sampling.py``) and passes the result;
+            direct callers leave it True.
+        run_retrieved_learning: Whether this session was admitted for the
+            retrieved-learning relevance/impact judge.
+
+    Returns:
+        GroupEvaluationOutcome: Per-family statuses for this invocation.
     """
     storage = request_context.storage
     state_key = _build_state_key(org_id, user_id, session_id)
 
-    # 1. Check if already evaluated — skipped in force_regenerate mode so the
-    # regenerate worker can re-evaluate a session that's already been marked.
-    if not force_regenerate:
-        existing_state = storage.get_operation_state(state_key)  # type: ignore[reportOptionalMemberAccess]
-        if existing_state and isinstance(existing_state.get("operation_state"), dict):
-            op_state = existing_state["operation_state"]
-            if op_state.get("evaluated"):
-                _eval_health.record_skip(SkipReason.ALREADY_EVALUATED)
-                logger.info("Session %s already evaluated, skipping", session_id)
-                return
-
-    # 2. Fetch all requests for the session
+    # 1. Fetch all requests for the session
     requests = storage.get_requests_by_session(user_id, session_id)  # type: ignore[reportOptionalMemberAccess]
     if not requests:
         _eval_health.record_skip(SkipReason.NO_REQUESTS)
         logger.info("No requests found for session %s, skipping", session_id)
-        return
+        return GroupEvaluationOutcome("not_applicable", "skipped")
 
-    # 3. Verify completion: latest request must be >= delay ago — skipped in
-    # force_regenerate mode so the operator can re-evaluate any session.
+    # 2. Verify completion: latest request must be >= delay ago — skipped in
+    # force_regenerate mode so the operator can re-evaluate any session. The
+    # liveness gate applies to both evaluation families.
     if not force_regenerate:
         latest_created_at = max(r.created_at for r in requests)
         now = int(datetime.now(UTC).timestamp())
@@ -120,7 +165,54 @@ def run_group_evaluation(
                 elapsed,
                 _EFFECTIVE_DELAY_SECONDS,
             )
-            return
+            return GroupEvaluationOutcome("skipped", "skipped")
+
+    # 3. Per-family admission. The scheduler samples the two families
+    # independently and tells us which ones this session was admitted for, so a
+    # session sampled only for retrieved-learning never pays the session-success
+    # judge. Direct callers (regen jobs, the on-demand grade route) leave both
+    # flags at their default and run both families, as before.
+    if not run_agent_success:
+        return _finish_with_retrieved_evaluation(
+            "skipped",
+            user_id=user_id,
+            session_id=session_id,
+            agent_version=agent_version,
+            request_context=request_context,
+            llm_client=llm_client,
+            force_regenerate=force_regenerate,
+            run_retrieved_learning=run_retrieved_learning,
+        )
+
+    # 4. Check if agent success is already evaluated — skipped in
+    # force_regenerate mode so the regenerate worker can re-evaluate a session
+    # that's already been marked. Retrieved-learning evaluation still runs
+    # below: its completion is independent of the agent-success marker.
+    agent_success_already_evaluated = False
+    if not force_regenerate:
+        existing_state = storage.get_operation_state(state_key)  # type: ignore[reportOptionalMemberAccess]
+        if existing_state and isinstance(existing_state.get("operation_state"), dict):
+            op_state = existing_state["operation_state"]
+            if op_state.get("evaluated"):
+                _eval_health.record_skip(SkipReason.ALREADY_EVALUATED)
+                logger.info(
+                    "Session %s already evaluated (agent success), skipping to"
+                    " retrieved-learning evaluation",
+                    session_id,
+                )
+                agent_success_already_evaluated = True
+
+    if agent_success_already_evaluated:
+        return _finish_with_retrieved_evaluation(
+            "skipped",
+            user_id=user_id,
+            session_id=session_id,
+            agent_version=agent_version,
+            request_context=request_context,
+            llm_client=llm_client,
+            force_regenerate=force_regenerate,
+            run_retrieved_learning=run_retrieved_learning,
+        )
 
     # 4. Fetch interactions for all requests
     request_ids = [r.request_id for r in requests]
@@ -128,7 +220,7 @@ def run_group_evaluation(
     if not all_interactions:
         _eval_health.record_skip(SkipReason.NO_INTERACTIONS)
         logger.info("No interactions found for session %s, skipping", session_id)
-        return
+        return GroupEvaluationOutcome("not_applicable", "skipped")
 
     # Group interactions by request_id
     interactions_by_request: dict[str, list] = defaultdict(list)
@@ -157,21 +249,23 @@ def run_group_evaluation(
             "No request interaction data models built for session %s, skipping",
             session_id,
         )
-        return
+        return GroupEvaluationOutcome("not_applicable", "skipped")
 
-    # 5. When regenerating, capture the prior result_ids
-    # so we can delete ONLY them AFTER the new rows have been saved. Doing
-    # the delete before the LLM call risks wiping the session's rows if the
-    # call fails (rate limit, network) and nothing replaces them. The new
-    # rows always get fresh auto-increment ids, so deleting the captured set
-    # afterwards cannot remove the new rows.
+    # 5. When regenerating, capture the prior result_ids so we can reconcile
+    # them AFTER the new rows have been saved. SQLite inserts a fresh row that
+    # needs the prior row cleaned up; enterprise storage upserts the prior row
+    # in place and therefore keeps its result_id. Doing any delete before the
+    # LLM call risks wiping the session's rows if the call fails (rate limit,
+    # network) and nothing replaces them.
     old_result_ids: list[int] = []
+    evaluation_name = ""
     if force_regenerate:
-        config = request_context.configurator.get_config()
+        root_config = request_context.configurator.get_config()
+        evaluation_name = get_extractor_name(root_config.agent_success_config)
         old_result_ids = storage.get_agent_success_evaluation_result_ids(  # type: ignore[reportOptionalMemberAccess]
             user_id=user_id,
             session_id=session_id,
-            evaluation_name=get_extractor_name(config),
+            evaluation_name=evaluation_name,
             agent_version=agent_version,
         )
 
@@ -206,7 +300,7 @@ def run_group_evaluation(
             evaluation_service.last_run_save_failed,
             len(old_result_ids),
         )
-        return
+        return GroupEvaluationOutcome("failed", "skipped")
 
     if evaluation_service.last_run_saved_result_count == 0:
         logger.warning(
@@ -215,36 +309,38 @@ def run_group_evaluation(
             session_id,
             len(old_result_ids),
         )
-        return
+        return GroupEvaluationOutcome("failed", "skipped")
 
-    # F1: per-turn shadow comparison. Dispatched only AFTER the regular
-    # success eval succeeds — a session whose success grade is unreliable
-    # would yield noisy verdicts that mislead the headline metric. The
-    # dispatch loop swallows per-interaction failures so one judge call
-    # cannot abort an entire batch.
-    _dispatch_shadow_comparison_judge(
-        storage=storage,
-        interactions=all_interactions,
-        session_id=session_id,
-        agent_version=agent_version,
-        request_context=request_context,
-        llm_client=llm_client,
-    )
-
-    # 6. New rows saved successfully — now safe to remove the captured prior
-    # rows. New rows have fresh auto-increment result_ids that do not overlap
-    # with old_result_ids, so this cannot delete the regenerated verdict.
+    # 7. New rows saved successfully. Delete captured prior rows only when the
+    # writer created a distinct new result_id (SQLite). Enterprise storage uses
+    # an in-place upsert, so its post-save ids are unchanged; deleting those ids
+    # would delete the regenerated verdict itself.
     if old_result_ids:
-        deleted = storage.delete_agent_success_evaluation_results_by_ids(  # type: ignore[reportOptionalMemberAccess]
-            old_result_ids
+        saved_result_ids = storage.get_agent_success_evaluation_result_ids(  # type: ignore[reportOptionalMemberAccess]
+            user_id=user_id,
+            session_id=session_id,
+            evaluation_name=evaluation_name,
+            agent_version=agent_version,
         )
-        logger.info(
-            "Regenerate cleanup: deleted %d prior result row(s) for session=%s"
-            " (expected %d)",
-            deleted,
-            session_id,
-            len(old_result_ids),
-        )
+        inserted_result_ids = set(saved_result_ids).difference(old_result_ids)
+        if inserted_result_ids:
+            deleted = storage.delete_agent_success_evaluation_results_by_ids(  # type: ignore[reportOptionalMemberAccess]
+                old_result_ids
+            )
+            logger.info(
+                "Regenerate cleanup: deleted %d prior result row(s) for session=%s"
+                " (expected %d)",
+                deleted,
+                session_id,
+                len(old_result_ids),
+            )
+        else:
+            logger.info(
+                "Regenerate cleanup: storage updated %d prior result row(s) in place"
+                " for session=%s",
+                len(old_result_ids),
+                session_id,
+            )
 
     # 7. Mark as evaluated
     evaluated_at = int(datetime.now(UTC).timestamp())
@@ -254,85 +350,188 @@ def run_group_evaluation(
     )
     logger.info("Marked session %s as evaluated at %d", session_id, evaluated_at)
 
+    # 8. Retrieved-learning evaluation — independent completion; a failure
+    # here can never be reported as complete nor force agent-success rows to
+    # regenerate.
+    return _finish_with_retrieved_evaluation(
+        "complete",
+        user_id=user_id,
+        session_id=session_id,
+        agent_version=agent_version,
+        request_context=request_context,
+        llm_client=llm_client,
+        force_regenerate=force_regenerate,
+        run_retrieved_learning=run_retrieved_learning,
+    )
 
-def _dispatch_shadow_comparison_judge(
+
+def _finish_with_retrieved_evaluation(
+    agent_success_status: AgentSuccessInvocationStatus,
     *,
-    storage,  # noqa: ANN001 — BaseStorage; imported lazily to avoid cycles
-    interactions: list[Interaction],
+    user_id: str,
     session_id: str,
     agent_version: str,
     request_context: RequestContext,
     llm_client: LiteLLMClient,
-) -> None:
-    """F1: grade each shadow-bearing interaction with the per-turn judge.
-
-    Iterates the session's interactions, skips any without ``shadow_content``,
-    invokes :class:`ShadowComparisonJudge.judge_turn`, and persists each
-    returned verdict via ``storage.save_shadow_comparison_verdict``. Per-
-    interaction exceptions are logged and the loop continues — partial
-    verdict sets are strictly better than nothing for the headline metric.
-
-    Args:
-        storage: The session storage. Must implement
-            ``save_shadow_comparison_verdict`` (currently SQLite + Supabase
-            + disk; backends without it surface ``NotImplementedError`` at
-            save time and the loop logs+continues).
-        interactions (list[Interaction]): Every interaction in the session,
-            in chronological order. Only those with non-empty
-            ``shadow_content`` are graded.
-        session_id (str): Denormalized onto each verdict.
-        agent_version (str): Denormalized onto each verdict.
-        request_context (RequestContext): Provides the configurator (for
-            the pinned ``shadow_comparison_judge_prompt_version``) and the
-            shared ``prompt_manager``.
-        llm_client (LiteLLMClient): The unified LLM client the judge uses
-            for the structured-output call.
-
-    Returns:
-        None: Verdicts are persisted as a side effect; the caller does not
-            need the count for control flow.
-    """
-    config = request_context.configurator.get_config()  # type: ignore[reportOptionalMemberAccess]
-    judge = ShadowComparisonJudge(
-        llm_client=llm_client,
-        prompt_manager=request_context.prompt_manager,  # type: ignore[reportOptionalMemberAccess]
-        prompt_version=config.shadow_comparison_judge_prompt_version,
-    )
-    rng = random.Random()  # noqa: S311 — position randomization, not crypto
-    saved_count = 0
-
-    for interaction in interactions:
-        if not interaction.shadow_content:
-            continue
-        try:
-            verdict = judge.judge_turn(
-                interaction=interaction,
-                session_id=session_id,
-                agent_version=agent_version,
-                rng=rng,
-            )
-        except Exception as exc:  # noqa: BLE001 — judge failure must not abort batch
-            logger.warning(
-                "F1 shadow_comparison dispatch failed for interaction %s: %s",
-                interaction.interaction_id,
-                exc,
-            )
-            continue
-        if verdict is None:
-            continue
-        try:
-            storage.save_shadow_comparison_verdict(verdict)
-            saved_count += 1
-        except Exception as exc:  # noqa: BLE001 — single-row save failure must not abort batch
-            logger.warning(
-                "F1 shadow_comparison verdict save failed for interaction %s: %s",
-                interaction.interaction_id,
-                exc,
-            )
-
-    if saved_count:
-        logger.info(
-            "F1: saved %d shadow_comparison verdict(s) for session=%s",
-            saved_count,
+    force_regenerate: bool,
+    run_retrieved_learning: bool = True,
+) -> GroupEvaluationOutcome:
+    """Run the retrieved-learning phase best-effort and build the outcome."""
+    if not run_retrieved_learning:
+        return GroupEvaluationOutcome(agent_success_status, "skipped")
+    try:
+        retrieved_status, fingerprint = _run_retrieved_learning_evaluation(
+            user_id=user_id,
+            session_id=session_id,
+            agent_version=agent_version,
+            request_context=request_context,
+            llm_client=llm_client,
+            force_regenerate=force_regenerate,
+        )
+    except Exception:
+        # Best-effort: never let the retrieved phase break the runner. The
+        # generation-guarded state was not advanced to a terminal status, so
+        # the next scheduled or forced run retries.
+        logger.exception(
+            "event=retrieved_learning_eval_failed session_id=%s reason=unexpected_error",
             session_id,
         )
+        _eval_health.record_retrieved_outcome("failed")
+        _eval_health.record_producer_failure()
+        return GroupEvaluationOutcome(agent_success_status, "failed")
+    return GroupEvaluationOutcome(agent_success_status, retrieved_status, fingerprint)
+
+
+def _run_retrieved_learning_evaluation(
+    *,
+    user_id: str,
+    session_id: str,
+    agent_version: str,
+    request_context: RequestContext,
+    llm_client: LiteLLMClient,
+    force_regenerate: bool,
+) -> tuple[RetrievedLearningInvocationStatus, str | None]:
+    """Evaluate the session's retrieved learnings with fencing.
+
+    Implements the generation + session-fingerprint protocol: allocate a
+    generation, judge the post-allocation snapshot, and atomically replace
+    the session's result set only while the fingerprint recomputed under the
+    replacement lock still matches. One immediate retry on a stale snapshot,
+    then ``pending`` for the next trigger.
+
+    Returns:
+        tuple: (invocation status, session fingerprint for terminal/applied
+        outcomes else None).
+    """
+    storage = request_context.storage
+    if storage is None:
+        return "skipped", None
+
+    snapshot = storage.load_bounded_retrieved_learning_snapshot(user_id, session_id)
+    fingerprint = session_fingerprint(snapshot)
+
+    # Fast path: terminal state at this exact fingerprint — nothing changed.
+    if not force_regenerate:
+        terminal = storage.get_matching_retrieved_learning_terminal_state(
+            user_id, session_id, fingerprint
+        )
+        if terminal:
+            status = terminal.get("status")
+            if status in ("complete", "not_applicable"):
+                return status, fingerprint
+
+    config = request_context.configurator.get_config()
+    agent_success = config.agent_success_config if config else None
+    success_definition = (
+        agent_success.success_definition_prompt.strip()
+        if agent_success and agent_success.success_definition_prompt
+        else ""
+    )
+    evaluator = RetrievedLearningEvaluator(
+        request_context=request_context,
+        llm_client=llm_client,
+        agent_context=(config.agent_context_prompt or "") if config else "",
+        success_definition=success_definition,
+    )
+
+    logger.info(
+        "event=retrieved_learning_eval_started session_id=%s raw_attachments=%d",
+        session_id,
+        snapshot.raw_attachment_count,
+    )
+
+    generation = 0
+    for _stale_attempt in range(2):
+        generation = storage.begin_retrieved_learning_evaluation_run(
+            user_id, session_id
+        )
+        # Judge the post-allocation snapshot, never the freshness-check one:
+        # every mutation is either visible here or changes the fingerprint
+        # that replacement recomputes under lock at commit time.
+        snapshot = storage.load_bounded_retrieved_learning_snapshot(user_id, session_id)
+        fingerprint = session_fingerprint(snapshot)
+        run = evaluator.evaluate(user_id, session_id, agent_version, snapshot)
+        if run.outcome == "failed":
+            storage.finish_retrieved_learning_evaluation_run(
+                user_id, session_id, generation, "failed", run.diagnostics
+            )
+            logger.warning(
+                "event=retrieved_learning_eval_failed session_id=%s reason=%s",
+                session_id,
+                run.diagnostics.get("error_type", "unknown"),
+            )
+            _eval_health.record_retrieved_outcome("failed", diagnostics=run.diagnostics)
+            _eval_health.record_producer_failure()
+            return "failed", None
+        commit = storage.replace_retrieved_learning_evaluation_results(
+            user_id,
+            session_id,
+            generation,
+            fingerprint,
+            run.proposed_status,
+            run.diagnostics,
+            run.rows,
+        )
+        if commit.disposition == "applied":
+            # An applied commit's authoritative status is always one of
+            # complete/degraded/not_applicable (the storage layer validates
+            # proposed_status and may only downgrade to not_applicable).
+            final_status: RetrievedLearningInvocationStatus = (
+                commit.status
+                if commit.status in ("complete", "degraded", "not_applicable")
+                else run.proposed_status
+            )
+            logger.info(
+                "event=retrieved_learning_eval_%s session_id=%s candidates=%d"
+                " committed=%d failed_relevance_chunks=%s failed_impact_chunks=%s",
+                "completed"
+                if final_status in ("complete", "not_applicable")
+                else final_status,
+                session_id,
+                len(run.rows),
+                commit.committed_count,
+                run.diagnostics.get("failed_relevance_chunks", 0),
+                run.diagnostics.get("failed_impact_chunks", 0),
+            )
+            _eval_health.record_retrieved_outcome(
+                final_status, diagnostics=run.diagnostics
+            )
+            return final_status, fingerprint
+        if commit.disposition == "superseded":
+            logger.info(
+                "event=retrieved_learning_eval_superseded session_id=%s generation=%d",
+                session_id,
+                generation,
+            )
+            return "superseded", None
+        logger.info(
+            "event=retrieved_learning_eval_stale session_id=%s generation=%d",
+            session_id,
+            generation,
+        )
+
+    # Two stale snapshots in a row: leave pending for the next trigger.
+    storage.finish_retrieved_learning_evaluation_run(
+        user_id, session_id, generation, "pending", {"error_type": "stale_snapshot"}
+    )
+    return "pending", None

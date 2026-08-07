@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from reflexio.server.api_endpoints.request_context import RequestContext
     from reflexio.server.llm.litellm_client import LiteLLMClient
 
+from reflexio.models.api_schema.domain.entities import LineageContext
 from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
 from reflexio.models.api_schema.service_schemas import (
     DowngradeProfilesResponse,
@@ -23,10 +24,13 @@ from reflexio.models.api_schema.service_schemas import (
     UserProfile,
 )
 from reflexio.models.config_schema import ProfileExtractorConfig
+from reflexio.server.error_reporting import capture_anomaly, error_tags
+from reflexio.server.llm._litellm_types import ModelProvenance
 from reflexio.server.services.base_generation_service import (
     BaseGenerationService,
     StatusChangeOperation,
 )
+from reflexio.server.services.deferred_learning_plan import ProfileWritePlan
 from reflexio.server.services.profile.components.extractor import ProfileExtractor
 from reflexio.server.services.profile.profile_generation_service_utils import (
     ProfileGenerationRequest,
@@ -35,7 +39,6 @@ from reflexio.server.services.profile.profile_generation_service_utils import (
 from reflexio.server.services.service_utils import (
     format_sessions_to_history_string,
 )
-from reflexio.server.tracing import capture_anomaly, sentry_tags
 
 logger = logging.getLogger(__name__)
 
@@ -123,9 +126,10 @@ class ProfileGenerationService(
         else:
             existing_profiles = self.storage.get_user_profile(request.user_id)  # type: ignore[reportOptionalMemberAccess]
 
+        generation_request_id = request.request_id
         return ProfileGenerationServiceConfig(
             user_id=request.user_id,
-            request_id=request.request_id,
+            request_id=generation_request_id,
             source=request.source,
             existing_data=existing_profiles,
             allow_manual_trigger=self.allow_manual_trigger,
@@ -147,96 +151,209 @@ class ProfileGenerationService(
             [p for result in results if result for p in result]
         )
 
-    def _finalize_extracted_items(self, all_new_profiles: list[UserProfile]) -> None:
-        """Deduplicate, persist, and changelog extracted profile items."""
+    def _resolve_write_plan(
+        self, results: list[list[UserProfile]]
+    ) -> ProfileWritePlan | None:
+        """Compute-half of profile finalization — NO learning DB write.
+
+        Flattens the extractor results, runs the deduplicator (the 2nd LLM call
+        + reads of existing rows), assigns ``source``/``status``, resolves the
+        missing-``request_id`` guard (dropping unreconstructable supersede ids),
+        and **precomputes embeddings** on the new rows. Returns a
+        :class:`ProfileWritePlan` for the persist half, or ``None`` when there is
+        nothing to write. Issues no ``add_user_profile``/``supersede_*`` — the
+        write is the persist half's job (compute is write-free).
+        """
         user_id = self.service_config.user_id  # type: ignore[reportOptionalMemberAccess]
         source = self.service_config.source  # type: ignore[reportOptionalMemberAccess]
-        request_id = self.service_config.request_id  # type: ignore[reportOptionalMemberAccess]
+        generation_request_id = self.service_config.request_id  # type: ignore[reportOptionalMemberAccess]
 
+        all_new_profiles = [p for result in results if result for p in result]
         existing_ids_to_delete: list[str] = []
+        consolidation_provenance = None
+        consolidation_sources: dict[str, list[str]] = {}
+        consolidated_output_indices: set[int] = set()
 
-        # Always run deduplicator when enabled and there are new profiles
+        # Always run deduplicator when there are new profiles
         if all_new_profiles:
-            from reflexio.server.site_var.feature_flags import is_deduplicator_enabled
+            from reflexio.server.services.profile.components.consolidator import (
+                ProfileConsolidator,
+            )
 
-            if is_deduplicator_enabled(self.org_id):
-                from reflexio.server.services.profile.components.consolidator import (
-                    ProfileConsolidator,
+            consolidator = ProfileConsolidator(
+                request_context=self.request_context,
+                llm_client=self.client,
+                output_pending_status=self.output_pending_status,
+            )
+            all_new_profiles, existing_ids_to_delete, _superseded_profiles = (
+                consolidator.deduplicate(
+                    all_new_profiles, user_id, generation_request_id
                 )
-
-                consolidator = ProfileConsolidator(
-                    request_context=self.request_context,
-                    llm_client=self.client,
-                    output_pending_status=self.output_pending_status,
-                )
-                all_new_profiles, existing_ids_to_delete, _superseded_profiles = (
-                    consolidator.deduplicate(all_new_profiles, user_id, request_id)
-                )
-                logger.info(
-                    "Profile updates after deduplication: %d profiles, %d existing to delete",
-                    len(all_new_profiles),
-                    len(existing_ids_to_delete),
-                )
+            )
+            consolidation_provenance = consolidator.model_provenance
+            consolidation_sources = consolidator.lineage_sources_by_profile_id
+            consolidated_output_indices = consolidator.consolidated_output_indices
+            logger.info(
+                "Profile updates after deduplication: %d profiles, %d existing to delete",
+                len(all_new_profiles),
+                len(existing_ids_to_delete),
+            )
 
         # Set source and status for all profiles
         for profile in all_new_profiles:
             profile.source = source
             profile.status = Status.PENDING if self.output_pending_status else None
 
-        # Save new profiles
+        # Missing-request_id guard (moved here, in compute). An empty request_id
+        # makes the supersede unreconstructable (the lineage events are keyed on
+        # it). Fail loud and drop those ids entirely — never silently
+        # hard-delete. Persist then only supersedes with a non-empty request_id.
+        if existing_ids_to_delete and not generation_request_id:
+            capture_anomaly(
+                "lineage.dedup.missing_request_id",
+                level="error",
+                org_id=self.org_id,
+                user_id=user_id,
+            )
+            existing_ids_to_delete = []
+
+        if not all_new_profiles and not existing_ids_to_delete:
+            return None
+
+        # Precompute embeddings on the new rows (compute-side, NO DB write). The
+        # persist half passes skip_embedding=True so no embedding runs in the fence.
         if all_new_profiles:
+            self.storage.precompute_profile_embeddings(all_new_profiles)  # type: ignore[reportOptionalMemberAccess]
+
+        lineage_contexts: list[LineageContext] = []
+        for index, profile in enumerate(all_new_profiles):
+            provenance = (
+                consolidation_provenance
+                if index in consolidated_output_indices
+                else self._last_model_provenance
+            )
+            lineage_contexts.append(
+                LineageContext(
+                    op_kind="create",
+                    actor=(
+                        "consolidator"
+                        if index in consolidated_output_indices
+                        else "extractor"
+                    ),
+                    request_id=generation_request_id,
+                    source_ids=consolidation_sources.get(profile.profile_id, []),
+                    model_name=provenance.model_name if provenance else None,
+                    provider=provenance.provider if provenance else None,
+                )
+            )
+
+        return ProfileWritePlan(
+            user_id=user_id,
+            request_id=generation_request_id,
+            new_profiles=all_new_profiles,
+            superseded_ids=existing_ids_to_delete,
+            lineage_contexts=lineage_contexts,
+        )
+
+    def _persist_write_plan(self, plan: ProfileWritePlan) -> None:
+        """Persist-half of profile finalization — apply the resolved write-plan.
+
+        Issues only the fence-critical row writes: inserts the new profiles
+        (``skip_embedding=True`` — embeddings were precomputed in compute) then
+        soft-supersedes the dedup'd existing ids. NO LLM / embedding / dedup.
+        The soft-supersede emits the lineage events the profile change log is
+        reconstructed from (the legacy ``profile_change_logs`` table is no longer
+        written — see reconstruct_profile_change_log).
+
+        On a write failure this **re-raises** (symmetric with playbook
+        ``_persist_write_plan``): on the durable path the raise rolls back the
+        fenced ``commit_scope`` so the rows AND the extractor bookmark advance
+        (applied by ``persist_generation`` only if persist returns) are discarded
+        together — never a "write failed but bookmark advanced" window. On the
+        synchronous ``.run()`` path ``_run_generation`` catches it, records
+        ``generation_failed``, and leaves the bookmark un-advanced so the next
+        publish retries the window.
+        """
+        user_id = plan.user_id
+        generation_request_id = plan.request_id
+
+        # Save new profiles (embeddings already set → skip re-embedding).
+        if plan.new_profiles:
             try:
-                self.storage.add_user_profile(user_id, all_new_profiles)  # type: ignore[reportOptionalMemberAccess]
+                self.storage.add_user_profile(  # type: ignore[reportOptionalMemberAccess]
+                    user_id,
+                    plan.new_profiles,
+                    skip_embedding=True,
+                    lineage_contexts=plan.lineage_contexts,
+                )
             except Exception as e:
-                with sentry_tags(
+                with error_tags(
                     subsystem="profile_generation",
                     op="save_profiles",
                     org_id=self.org_id,
                     user_id=user_id,
-                    request_id=request_id,
+                    request_id=generation_request_id,
                     error_type=type(e).__name__,
                 ):
                     logger.exception(
                         "Failed to save profiles for user id: %s",
                         user_id,
                     )
-                return
+                # Re-raise so the bookmark advance is skipped / the fence rolls
+                # back (F1 symmetry with playbook persist) — never advance the
+                # extractor bookmark over a window whose rows failed to write.
+                raise
 
-        # Always soft-supersede superseded existing profiles (never hard-delete on
-        # the dedup path). This emits the lineage events that the profile change log
-        # is reconstructed from (the legacy `profile_change_logs` table is no longer
-        # written — see reconstruct_profile_change_log).
-        if existing_ids_to_delete:
-            if not request_id:
-                # An empty request_id makes the removal unreconstructable (the lineage
-                # events are keyed on it). Fail loud and skip removal entirely — never
-                # silently hard-delete.
-                capture_anomaly(
-                    "lineage.dedup.missing_request_id",
-                    level="error",
+        # Always soft-supersede superseded existing profiles (never hard-delete
+        # on the dedup path). Compute already dropped these when request_id was
+        # empty, so any ids here carry a valid lineage key.
+        if plan.superseded_ids:
+            try:
+                self.storage.supersede_profiles_by_ids(  # type: ignore[reportOptionalMemberAccess]
+                    user_id=user_id,
+                    profile_ids=plan.superseded_ids,
+                    request_id=generation_request_id,
+                )
+            except Exception as e:
+                with error_tags(
+                    subsystem="profile_generation",
+                    op="supersede_profiles",
                     org_id=self.org_id,
                     user_id=user_id,
-                )
-            else:
-                try:
-                    self.storage.supersede_profiles_by_ids(  # type: ignore[reportOptionalMemberAccess]
-                        user_id=user_id,
-                        profile_ids=existing_ids_to_delete,
-                        request_id=request_id,
+                    request_id=generation_request_id,
+                    error_type=type(e).__name__,
+                ):
+                    logger.exception(
+                        "Failed to soft-delete superseded profiles for user %s",
+                        user_id,
                     )
-                except Exception as e:
-                    with sentry_tags(
-                        subsystem="profile_generation",
-                        op="supersede_profiles",
-                        org_id=self.org_id,
-                        user_id=user_id,
-                        request_id=request_id,
-                        error_type=type(e).__name__,
-                    ):
-                        logger.exception(
-                            "Failed to soft-delete superseded profiles for user %s",
-                            user_id,
-                        )
+                # Re-raise for the same reason: a half-applied persist (new rows
+                # in, supersede failed) must not advance the bookmark. Playbook's
+                # _apply_consolidation_lineage raises here too.
+                raise
+
+    def _finalize_extracted_items(
+        self,
+        all_new_profiles: list[UserProfile],
+        *,
+        model_provenance: ModelProvenance | None = None,
+    ) -> list[UserProfile]:
+        """Permanent V3 wrapper: compute-then-persist together (no external fence).
+
+        Kept for the synchronous resume/manual callers
+        (``ExtractionResumeWorker`` calls this directly). Routes them through the
+        same ``_resolve_write_plan`` (compute) + ``_persist_write_plan``
+        (persist) split the durable worker uses — with no external
+        ``commit_scope`` — so the result is identical to the pre-split monolith.
+        """
+        if model_provenance is not None:
+            self._last_model_provenance = model_provenance
+        plan = self._resolve_write_plan([all_new_profiles])
+        if plan is None:
+            return []
+        with self.storage.commit_scope():  # type: ignore[reportOptionalMemberAccess]
+            self._persist_write_plan(plan)
+        return plan.new_profiles
 
     def check_and_update_profiles(self, profiles: list[UserProfile]) -> None:
         """check if the profiles are expired and update them if they are"""
@@ -436,9 +553,10 @@ class ProfileGenerationService(
         """
         # Handle rerun requests (have start_time/end_time datetime objects)
         if isinstance(request, RerunProfileGenerationRequest):
+            operation_request_id = f"rerun_{uuid.uuid4().hex[:8]}"
             return ProfileGenerationRequest(
                 user_id=user_id,
-                request_id=f"rerun_{uuid.uuid4().hex[:8]}",
+                request_id=operation_request_id,
                 source=request.source,
                 rerun_start_time=(
                     int(request.start_time.timestamp()) if request.start_time else None
@@ -449,9 +567,10 @@ class ProfileGenerationService(
                 auto_run=False,
             )
         # Handle manual requests (ManualProfileGenerationRequest)
+        operation_request_id = f"manual_{uuid.uuid4().hex[:8]}"
         return ProfileGenerationRequest(
             user_id=user_id,
-            request_id=f"manual_{uuid.uuid4().hex[:8]}",
+            request_id=operation_request_id,
             source=request.source,
             auto_run=False,
         )
@@ -477,29 +596,43 @@ class ProfileGenerationService(
 
     def _get_generated_count(
         self,
-        request: RerunProfileGenerationRequest,
+        request: RerunProfileGenerationRequest | ManualProfileGenerationRequest,
         processed_user_ids: list[str] | None = None,
     ) -> int:
-        """Get the count of profiles generated during rerun.
+        """Get the count of profiles generated during batch generation.
 
-        Counts profiles with PENDING status for each processed user.
+        Counts PENDING profiles for rerun requests and CURRENT profiles for manual
+        regular requests, scoped to users the batch runner actually processed.
 
         Args:
-            request: The rerun request object
+            request: The rerun or manual generation request object
             processed_user_ids: List of user IDs processed in the batch
 
         Returns:
             Number of profiles generated
         """
-        user_ids = processed_user_ids or ([request.user_id] if request.user_id else [])
-        total = 0
-        for user_id in user_ids:
-            profiles = self.storage.get_user_profile(  # type: ignore[reportOptionalMemberAccess]
-                user_id=user_id,
-                status_filter=[Status.PENDING],
+        if isinstance(request, ManualProfileGenerationRequest):
+            return self._count_manual_generated(
+                request, processed_user_ids=processed_user_ids
             )
-            total += len(profiles)
-        return total
+
+        user_ids = self._count_user_ids(request.user_id, processed_user_ids)
+        if not user_ids:
+            return 0
+        return self.storage.count_user_profiles_by_status(  # type: ignore[reportOptionalMemberAccess]
+            user_ids=user_ids,
+            status=Status.PENDING,
+        )
+
+    @staticmethod
+    def _count_user_ids(
+        request_user_id: str | None, processed_user_ids: list[str] | None
+    ) -> list[str]:
+        """Resolve users to count without treating an empty processed batch as missing."""
+
+        if processed_user_ids is not None:
+            return processed_user_ids
+        return [request_user_id] if request_user_id else []
 
     # ===============================
     # Upgrade/Downgrade hook implementations (override base class methods)
@@ -676,15 +809,14 @@ class ProfileGenerationService(
                 "source": request.source,
                 "mode": "manual_regular",
             }
-            users_processed, _ = self._run_batch_with_progress(
+            # total_profiles is computed inside the batch runner via
+            # _get_generated_count(processed_user_ids=...).
+            users_processed, total_profiles = self._run_batch_with_progress(
                 user_ids=user_ids,
                 request=request,  # type: ignore[reportArgumentType]
                 request_params=request_params,
                 state_manager=state_manager,
             )
-
-            # 3. Count generated profiles (CURRENT status = None)
-            total_profiles = self._count_manual_generated(request)
 
             return ManualProfileGenerationResponse(
                 success=True,
@@ -700,20 +832,29 @@ class ProfileGenerationService(
                 profiles_generated=0,
             )
 
-    def _count_manual_generated(self, request: ManualProfileGenerationRequest) -> int:
+    def _count_manual_generated(
+        self,
+        request: ManualProfileGenerationRequest,
+        processed_user_ids: list[str] | None = None,
+    ) -> int:
         """
         Count profiles generated during manual regular generation.
 
-        Counts profiles with CURRENT status (None), optionally filtered by user_id.
+        Counts profiles with CURRENT status (None) for each processed user.
 
         Args:
             request: The manual generation request object
+            processed_user_ids: User IDs processed by the manual batch. When
+                the request omitted user_id, this prevents passing None through
+                to storage methods that require a concrete user.
 
         Returns:
             Number of profiles with CURRENT status
         """
-        profiles = self.storage.get_user_profile(  # type: ignore[reportOptionalMemberAccess]
-            user_id=request.user_id,  # type: ignore[reportArgumentType]
-            status_filter=[None],  # CURRENT profiles
+        user_ids = self._count_user_ids(request.user_id, processed_user_ids)
+        if not user_ids:
+            return 0
+        return self.storage.count_user_profiles_by_status(  # type: ignore[reportOptionalMemberAccess]
+            user_ids=user_ids,
+            status=None,
         )
-        return len(profiles)

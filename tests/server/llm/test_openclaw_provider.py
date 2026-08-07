@@ -197,9 +197,7 @@ class TestRegisterIfEnabled:
         monkeypatch.delenv(ocp.ENV_ENABLE, raising=False)
         assert ocp.register_if_enabled() is False
 
-    def test_skips_when_cli_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_skips_when_cli_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(ocp.ENV_ENABLE, "1")
         monkeypatch.delenv(ocp.ENV_CLI_PATH, raising=False)
         with patch("shutil.which", return_value=None):
@@ -216,9 +214,7 @@ class TestRegisterIfEnabled:
         assert ocp.register_if_enabled() is True
         assert ocp._REGISTERED is True
 
-    def test_idempotent(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path
-    ) -> None:
+    def test_idempotent(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         fake = tmp_path / "openclaw"
         fake.write_text("#!/bin/sh")
         fake.chmod(0o755)

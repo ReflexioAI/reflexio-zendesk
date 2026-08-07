@@ -1,13 +1,20 @@
 from abc import abstractmethod
+from typing import cast
 
 from reflexio.models.api_schema.braintrust_schema import (
     BraintrustConnection,
     ImportedScore,
 )
 from reflexio.models.api_schema.domain import (
+    CitationKind,
     Interaction,
 )
 from reflexio.models.api_schema.internal_schema import SessionCitation
+
+# Stored citation dicts are untyped JSON; only these kinds are valid.
+CITATION_KINDS: frozenset[str] = frozenset(
+    {"playbook", "profile", "user_playbook", "agent_playbook"}
+)
 from reflexio.models.api_schema.retriever_schema import PlaybookApplicationStat
 
 
@@ -29,10 +36,10 @@ class ExtrasMixin:
             dict: Dictionary containing:
                 - current_period: Stats for the current period (days_back)
                 - previous_period: Stats for the previous period (for trend calculation)
-                - interactions_time_series: List of time series data points (raw, ungrouped)
-                - profiles_time_series: List of time series data points (raw, ungrouped)
-                - playbooks_time_series: List of time series data points (raw, ungrouped)
-                - evaluations_time_series: List of time series data points (raw, ungrouped)
+                - interactions_time_series: Daily bucketed interaction counts
+                - profiles_time_series: Daily bucketed profile counts
+                - playbooks_time_series: Daily bucketed playbook counts
+                - evaluations_time_series: Daily bucketed success rates with optional counts
         """
         raise NotImplementedError
 
@@ -142,12 +149,12 @@ class ExtrasMixin:
                         kind = getattr(cite, "kind", None)
                         real_id = getattr(cite, "real_id", None)
                         title = getattr(cite, "title", "") or ""
-                    if kind and real_id:
+                    if str(kind) in CITATION_KINDS and real_id:
                         out.append(
                             SessionCitation(
                                 user_id="",
                                 session_id=session_id,
-                                kind=str(kind),
+                                kind=cast("CitationKind", str(kind)),
                                 real_id=str(real_id),
                                 title=str(title),
                             )

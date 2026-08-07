@@ -7,8 +7,8 @@ from reflexio.lib._generation import GenerationMixin
 from reflexio.lib._interactions import InteractionsMixin
 from reflexio.lib._operations import OperationsMixin
 from reflexio.lib._profiles import ProfilesMixin
-from reflexio.lib._reflection import ReflectionMixin
 from reflexio.lib._search import SearchMixin
+from reflexio.lib._session_outcome import SessionOutcomeMixin
 from reflexio.lib._user_playbook import UserPlaybookMixin
 
 
@@ -19,9 +19,9 @@ class Reflexio(
     UserPlaybookMixin,
     ConfigMixin,
     GenerationMixin,
-    ReflectionMixin,
     OperationsMixin,
     DashboardMixin,
     SearchMixin,
+    SessionOutcomeMixin,
 ):
     """Synchronous facade providing a unified API for all Reflexio operations."""

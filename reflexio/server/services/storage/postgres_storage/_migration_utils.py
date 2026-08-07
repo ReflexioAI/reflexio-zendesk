@@ -175,6 +175,9 @@ def response_to_request(item: Mapping[str, Any]) -> Request:
         source=item.get("source", ""),
         agent_version=item.get("agent_version", ""),
         session_id=require_non_empty_session_id(item.get("session_id")),
+        evaluation_only=bool(item.get("evaluation_only", False)),
+        retrieval_experiment_id=item.get("retrieval_experiment_id"),
+        retrieval_experiment_arm=item.get("retrieval_experiment_arm"),
     )
 
 
@@ -195,6 +198,9 @@ def request_to_data(request: Request) -> dict[str, Any]:
         "source": request.source,
         "agent_version": request.agent_version,
         "session_id": request.session_id or None,
+        "evaluation_only": request.evaluation_only,
+        "retrieval_experiment_id": request.retrieval_experiment_id,
+        "retrieval_experiment_arm": request.retrieval_experiment_arm,
     }
 
 

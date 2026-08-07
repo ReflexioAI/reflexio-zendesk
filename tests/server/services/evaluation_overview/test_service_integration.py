@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
 from reflexio.models.api_schema.domain.entities import AgentSuccessEvaluationResult
 from reflexio.models.api_schema.eval_overview_schema import (
     EvaluationSourceSetRequest,
@@ -27,6 +29,7 @@ def _eval_result(
     is_success: bool,
     user_id: str = "u1",
     corrections: int = 0,
+    failure_type: str | None = None,
     created_at: int = 1700000000,
 ) -> AgentSuccessEvaluationResult:
     return AgentSuccessEvaluationResult(
@@ -35,6 +38,7 @@ def _eval_result(
         agent_version="v_e2e",
         session_id=session_id,
         is_success=is_success,
+        failure_type=failure_type,
         evaluation_name="overall",
         created_at=created_at,
         number_of_correction_per_session=corrections,
@@ -137,32 +141,99 @@ def test_service_reports_single_recent_success_as_100_percent() -> None:
         GetEvaluationOverviewRequest(from_ts=now - 3600, to_ts=now, bucket="day")
     )
 
+    assert response.hero.state == "shadow_off"
     assert response.hero.regular_success_rate_pp == 100.0
     assert response.context_tiles.success.current == 100.0
 
 
-def test_service_uses_first_ever_eval_for_hero_age() -> None:
-    """A narrow window should not make a mature org look newly onboarded."""
+def test_service_reports_task_and_behavior_success_separately() -> None:
     now = int(time.time())
     storage = _storage_with_results(
         [
             _eval_result(
                 result_id=1,
-                session_id="old",
+                session_id="success",
                 is_success=True,
-                created_at=now - 10 * 24 * 60 * 60,
+                created_at=now - 60,
             ),
             _eval_result(
-                result_id=2, session_id="current", is_success=True, created_at=now
+                result_id=2,
+                session_id="agent-failure",
+                is_success=False,
+                failure_type="wrong_answer",
+                created_at=now - 60,
+            ),
+            _eval_result(
+                result_id=3,
+                session_id="system-failure",
+                is_success=False,
+                failure_type="system_error",
+                created_at=now - 60,
             ),
         ]
     )
     config = Config(storage_config=StorageConfigSQLite())
 
+    response = EvaluationOverviewService(storage=storage, config=config).run(
+        GetEvaluationOverviewRequest(from_ts=now - 3600, to_ts=now, bucket="day")
+    )
+
+    assert response.hero.regular_success_rate_pp == pytest.approx(100 / 3)
+    assert response.context_tiles.success.current == pytest.approx(100 / 3)
+    assert response.context_tiles.behavior_success.current == 50.0
+    assert response.context_tiles.behavior_success.eligible_sessions == 2
+    assert response.context_tiles.behavior_success.excluded_system_errors == 1
+
+
+def test_behavior_success_is_null_when_all_rows_are_system_errors() -> None:
+    now = int(time.time())
+    storage = _storage_with_results(
+        [
+            _eval_result(
+                result_id=1,
+                session_id="system-failure",
+                is_success=False,
+                failure_type="SYSTEM_ERROR",
+                created_at=now - 60,
+            )
+        ]
+    )
+    config = Config(storage_config=StorageConfigSQLite())
+
+    response = EvaluationOverviewService(storage=storage, config=config).run(
+        GetEvaluationOverviewRequest(from_ts=now - 3600, to_ts=now)
+    )
+
+    assert response.context_tiles.success.current == 0.0
+    assert response.context_tiles.behavior_success.current is None
+    assert response.context_tiles.behavior_success.delta_pp is None
+    assert response.context_tiles.behavior_success.eligible_sessions == 0
+    assert response.context_tiles.behavior_success.excluded_system_errors == 1
+
+
+def test_service_shows_recent_evaluations_immediately() -> None:
+    """A new org with results should render its available trend immediately."""
+    now = int(time.time())
+    storage = _storage_with_results(
+        [
+            _eval_result(
+                result_id=1,
+                session_id="recent",
+                is_success=True,
+                created_at=now,
+            )
+        ]
+    )
+    config = Config(storage_config=StorageConfigSQLite())
+
     svc = EvaluationOverviewService(storage=storage, config=config)
-    response = svc.run(GetEvaluationOverviewRequest(from_ts=now - 60, to_ts=now))
+    response = svc.run(
+        GetEvaluationOverviewRequest(from_ts=now - 3600, to_ts=now, bucket="day")
+    )
 
     assert response.hero.state == "shadow_off"
+    assert response.hero.regular_success_rate_pp == 100.0
+    assert sum(bucket.regular_n for bucket in response.hero.buckets) == 1
 
 
 def test_service_honors_day_bucket_for_hero_trend() -> None:
@@ -193,6 +264,7 @@ def test_service_honors_day_bucket_for_hero_trend() -> None:
 
     assert [bucket.ts for bucket in response.hero.buckets] == [day, 2 * day]
     assert [bucket.regular_n for bucket in response.hero.buckets] == [2, 1]
+    assert [bucket.regular_rate for bucket in response.hero.buckets] == [0.5, 1.0]
 
 
 def test_service_uses_bulk_storage_methods_without_per_session_reads() -> None:

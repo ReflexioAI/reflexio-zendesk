@@ -2,6 +2,7 @@
 
 import csv
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -24,15 +25,34 @@ from reflexio.models.config_schema import (
     ToolUseConfig,
 )
 from reflexio.server.services.configurator.configurator import DefaultConfigurator
+from reflexio.server.services.tagging.tagging_scheduler import drain_tagging
+from reflexio.test_support.llm_mock import patched_litellm
 
 _TEST_DATA_DIR = Path(__file__).resolve().parent.parent / "test_data"
 _SCENARIO_DIR = _TEST_DATA_DIR / "scenarios" / "e2e"
-
-pytestmark = pytest.mark.e2e
+_CUSTOMER_SUPPORT_WINDOW_SIZE = 20
+_CUSTOMER_SUPPORT_PROFILE_DEFINITION = """
+name, occupation, location, membership tier, order context, communication preferences,
+formatting preferences, timeline preferences, and other durable customer-support
+personalization facts from the conversation
+"""
 
 
 @pytest.fixture(autouse=True)
-def _zero_group_evaluation_delay():
+def mock_llm(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Keep the standard E2E tier deterministic and credential-free."""
+    if request.node.get_closest_marker("requires_credentials"):
+        monkeypatch.delenv("MOCK_LLM_RESPONSE", raising=False)
+        yield
+        return
+    with patched_litellm():
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _zero_group_evaluation_delay() -> Iterator[None]:
     """Remove the 600s completion-delay gate in group evaluation for e2e tests.
 
     `run_group_evaluation` skips a session if its latest request is newer than
@@ -46,6 +66,26 @@ def _zero_group_evaluation_delay():
         0,
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _zero_tagging_delay() -> Iterator[None]:
+    """Fire deferred tagging promptly so E2E teardown can drain it deterministically."""
+    with patch(
+        "reflexio.server.services.tagging.tagging_scheduler._EFFECTIVE_DELAY_SECONDS",
+        0,
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _drain_background_tagging_callbacks(
+    _zero_tagging_delay: None, mock_llm: None
+) -> Iterator[None]:
+    yield
+    assert drain_tagging(timeout_seconds=10.0), (
+        "background tagging callbacks did not drain before test teardown"
+    )
 
 
 @pytest.fixture
@@ -78,6 +118,8 @@ def reflexio_instance(
     config = Config(
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
+        skip_should_run_check=True,
+        window_size=_CUSTOMER_SUPPORT_WINDOW_SIZE,
         # Single configured profile extractor (the list-valued field is retired and
         # the Config constructor would ignore it, dropping tagging_definition_prompt).
         profile_extractor_config=ProfileExtractorConfig(
@@ -85,9 +127,7 @@ def reflexio_instance(
             context_prompt="""
 Conversation between sales agent and user, extract any information from the interaction if contains any information listed under definition
 """,
-            extraction_definition_prompt="""
-name, age, intent of the conversations
-""",
+            extraction_definition_prompt=_CUSTOMER_SUPPORT_PROFILE_DEFINITION,
             tagging_definition_prompt="""
 choice of ['basic_info', 'conversation_intent']
 """,
@@ -128,15 +168,15 @@ def reflexio_instance_profile_only(
     config = Config(
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
+        skip_should_run_check=True,
+        window_size=_CUSTOMER_SUPPORT_WINDOW_SIZE,
         user_playbook_extractor_config=None,
         profile_extractor_config=ProfileExtractorConfig(
             extractor_name="test_profile_extractor",
             context_prompt="""
 Conversation between sales agent and user, extract any information from the interaction if contains any information listed under definition
 """,
-            extraction_definition_prompt="""
-name, age, intent of the conversations
-""",
+            extraction_definition_prompt=_CUSTOMER_SUPPORT_PROFILE_DEFINITION,
             tagging_definition_prompt="""
 choice of ['basic_info', 'conversation_intent']
 """,
@@ -295,6 +335,7 @@ def save_user_playbooks(reflexio_instance: Reflexio):
                 agent_version=row["agent_version"],
                 request_id=row["request_id"],
                 content=row["content"],
+                trigger=row["trigger"],
                 playbook_name=row["playbook_name"],
             )
             for row in reader
@@ -320,6 +361,7 @@ def _get_playbook_names(instance: Reflexio) -> list[str]:
 
 def _cleanup_storage(instance: Reflexio):
     """Helper function to cleanup storage for an Reflexio instance."""
+    tagging_drained = drain_tagging(timeout_seconds=10.0)
     try:
         storage = instance.request_context.storage
         assert storage is not None
@@ -334,6 +376,9 @@ def _cleanup_storage(instance: Reflexio):
         storage.delete_all_operation_states()
     except Exception as e:
         print(f"Error during cleanup: {str(e)}")
+    assert tagging_drained, (
+        "background tagging callbacks did not drain before storage cleanup"
+    )
 
 
 @pytest.fixture

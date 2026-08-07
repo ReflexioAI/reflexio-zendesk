@@ -15,6 +15,8 @@ from reflexio.models.api_schema.service_schemas import (
     UserActionType,
     UserProfile,
 )
+from reflexio.server.billing_signals import count_input_tokens
+from reflexio.server.services.storage.error import StorageError
 from reflexio.server.services.storage.storage_base import BaseStorage
 
 pytestmark = pytest.mark.integration
@@ -134,6 +136,41 @@ class TestProfileCRUD:
         profiles = storage.get_all_profiles(limit=2)
         assert len(profiles) == 2
 
+    def test_get_all_profiles_filters_before_limit(self, storage: BaseStorage) -> None:
+        newer = _make_profile("u-new", "p-new", "newer nonmatch")
+        newer.last_modified_timestamp = 1_700_000_200
+        older_match = _make_profile("u-old", "p-old", "older needle")
+        older_match.last_modified_timestamp = 1_700_000_100
+        storage.add_user_profile("u-new", [newer])
+        storage.add_user_profile("u-old", [older_match])
+
+        profiles = storage.get_all_profiles(limit=1, query="needle")
+
+        assert [p.profile_id for p in profiles] == ["p-old"]
+
+    def test_profile_query_treats_like_metacharacters_as_literals(
+        self, storage: BaseStorage
+    ) -> None:
+        storage.add_user_profile(
+            "u-like",
+            [
+                _make_profile("u-like", "p-percent-literal", "progress is 100%"),
+                _make_profile("u-like", "p-percent-word", "progress is 100 percent"),
+                _make_profile("u-like", "p-underscore-literal", "uses _tmp files"),
+                _make_profile("u-like", "p-underscore-word", "uses xtmp files"),
+            ],
+        )
+
+        all_percent = storage.get_all_profiles(query="100%")
+        user_percent = storage.get_user_profile("u-like", query="100%")
+        all_underscore = storage.get_all_profiles(query="_tmp")
+        user_underscore = storage.get_user_profile("u-like", query="_tmp")
+
+        assert {p.profile_id for p in all_percent} == {"p-percent-literal"}
+        assert {p.profile_id for p in user_percent} == {"p-percent-literal"}
+        assert {p.profile_id for p in all_underscore} == {"p-underscore-literal"}
+        assert {p.profile_id for p in user_underscore} == {"p-underscore-literal"}
+
     def test_delete_profile(self, storage: BaseStorage) -> None:
         storage.add_user_profile("u1", [_make_profile("u1", "p1", "likes sushi")])
         assert len(storage.get_user_profile("u1")) == 1
@@ -185,9 +222,28 @@ class TestProfileCRUD:
         )
         assert storage.count_all_profiles() == 2
 
+    def test_count_user_profiles_by_status_filters_users_and_status(
+        self, storage: BaseStorage
+    ) -> None:
+        current_1 = _make_profile("u1", "p-current-1", "likes sushi")
+        current_2 = _make_profile("u2", "p-current-2", "likes ramen")
+        pending = _make_profile("u2", "p-pending", "likes pizza")
+        pending.status = Status.PENDING
+        outside_user = _make_profile("u3", "p-current-3", "likes tacos")
+        expired = _make_profile("u1", "p-expired", "old preference")
+        expired.expiration_timestamp = 1
+
+        storage.add_user_profile("u1", [current_1, expired])
+        storage.add_user_profile("u2", [current_2, pending])
+        storage.add_user_profile("u3", [outside_user])
+
+        assert storage.count_user_profiles_by_status(["u1", "u2"], None) == 2
+        assert storage.count_user_profiles_by_status(["u1", "u2"], Status.PENDING) == 1
+        assert storage.count_user_profiles_by_status([], None) == 0
+
 
 class TestGetProfilesByIds:
-    """Contract tests for get_profiles_by_ids (used by ReflectionService)."""
+    """Contract tests for the shared get_profiles_by_ids lookup."""
 
     def test_returns_only_requested_ids(self, storage: BaseStorage) -> None:
         storage.add_user_profile(
@@ -243,9 +299,33 @@ class TestGetProfilesByIds:
         assert len(result) == 1
         assert result[0].profile_id == "p1"
 
+    def test_include_inactive_returns_archived(self, storage: BaseStorage) -> None:
+        storage.add_user_profile("u1", [_make_profile("u1", "p1", "x")])
+        storage.archive_profile_by_id("u1", "p1")
+        result = storage.get_profiles_by_ids("u1", ["p1"], include_inactive=True)
+        assert [p.profile_id for p in result] == ["p1"]
+
+    def test_include_inactive_still_filters_by_user_id(
+        self, storage: BaseStorage
+    ) -> None:
+        """user_id is the only predicate left standing under include_inactive."""
+        storage.add_user_profile("u2", [_make_profile("u2", "p2", "b")])
+        storage.archive_profile_by_id("u2", "p2")
+        assert storage.get_profiles_by_ids("u1", ["p2"], include_inactive=True) == []
+
+    def test_include_inactive_with_status_filter_is_rejected(
+        self, storage: BaseStorage
+    ) -> None:
+        """The two are contradictory — fail loud rather than drop the filter."""
+        storage.add_user_profile("u1", [_make_profile("u1", "p1", "x")])
+        with pytest.raises(StorageError):
+            storage.get_profiles_by_ids(
+                "u1", ["p1"], status_filter=[Status.ARCHIVED], include_inactive=True
+            )
+
 
 class TestArchiveProfileById:
-    """Contract tests for archive_profile_by_id (used by ReflectionService)."""
+    """Contract tests for the shared archive_profile_by_id mutation."""
 
     def test_archives_current_profile(self, storage: BaseStorage) -> None:
         storage.add_user_profile("u1", [_make_profile("u1", "p1", "old content")])
@@ -282,6 +362,7 @@ class TestInteractionCRUD:
         result = storage.get_user_interaction("u1")
         assert len(result) == 1
         assert result[0].content == "clicked item"
+        assert result[0].token_count == count_input_tokens("clicked item")
 
     def test_add_interactions_bulk(self, storage: BaseStorage) -> None:
         interactions = [
@@ -291,6 +372,9 @@ class TestInteractionCRUD:
 
         result = storage.get_user_interaction("u1")
         assert len(result) == 3
+        assert {item.token_count for item in result} == {
+            count_input_tokens(f"action {i}") for i in range(1, 4)
+        }
 
     def test_get_all_interactions(self, storage: BaseStorage) -> None:
         storage.add_user_interaction("u1", _make_interaction("u1", 1, "a1", "req1"))
@@ -300,6 +384,15 @@ class TestInteractionCRUD:
         assert len(result) == 2
         ids = {i.interaction_id for i in result}
         assert ids == {1, 2}
+
+    def test_get_all_user_ids_returns_distinct_interaction_users(
+        self, storage: BaseStorage
+    ) -> None:
+        storage.add_user_interaction("u2", _make_interaction("u2", 1, "a1", "req1"))
+        storage.add_user_interaction("u1", _make_interaction("u1", 2, "a2", "req2"))
+        storage.add_user_interaction("u2", _make_interaction("u2", 3, "a3", "req3"))
+
+        assert storage.get_all_user_ids() == ["u1", "u2"]
 
     def test_count_all_interactions(self, storage: BaseStorage) -> None:
         for i in range(1, 4):
@@ -449,3 +542,35 @@ class TestInteractionCRUD:
             sources=["api"],
         )
         assert new_groups[0].interactions[0].image_encoding == "base64-image-data"
+
+
+def test_expire_active_profiles_contract(storage: BaseStorage) -> None:
+    """Contract: expire_active_profiles tombstones TTL-expired active profiles.
+
+    Enforces that the backend TOMBSTONES (status → EXPIRED), not hard-deletes,
+    so that the tombstone GC can later reclaim the row after the grace window.
+    """
+    storage.add_user_profile(
+        "u1",
+        [
+            UserProfile(
+                profile_id="c1",
+                user_id="u1",
+                content="c",
+                last_modified_timestamp=1,
+                generated_from_request_id="r1",
+                expiration_timestamp=100,
+            )
+        ],
+    )
+    assert storage.expire_active_profiles(now=1000) == 1
+    # Hidden from default reads (expiry-filtered).
+    assert storage.get_profile_by_id("c1", include_tombstones=False) is None
+    # But the tombstone must still exist with status EXPIRED — not hard-deleted.
+    tombstone = storage.get_profile_by_id("c1", include_tombstones=True)
+    assert tombstone is not None, (
+        "expire_active_profiles must TOMBSTONE the row (status=EXPIRED), not hard-delete it"
+    )
+    assert tombstone.status == Status.EXPIRED, (
+        f"expected status=EXPIRED after sweep, got {tombstone.status!r}"
+    )

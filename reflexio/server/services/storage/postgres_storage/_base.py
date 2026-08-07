@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
@@ -33,6 +34,7 @@ from reflexio.server.llm.model_defaults import ModelRole, resolve_model_name
 from reflexio.server.llm.providers.embedding_service_provider import (
     EmbeddingUnavailableError,
 )
+from reflexio.server.services.embedding_text import embedding_input
 from reflexio.server.services.storage.error import (
     StorageError,
     require_non_empty_session_id,
@@ -74,12 +76,12 @@ def _rows(response: Any) -> list[dict[str, Any]]:
 
 
 _PROFILE_COLUMNS = "profile_id, user_id, content, last_modified_timestamp, generated_from_request_id, profile_time_to_live, expiration_timestamp, custom_features, created_at, source, status, extractor_names, expanded_terms, tags, source_interaction_ids, source_span, notes, reader_angle, merged_into, superseded_by"
-_INTERACTION_COLUMNS = "interaction_id, user_id, content, request_id, created_at, role, user_action, user_action_description, interacted_image_url, shadow_content, expert_content, tools_used, citations"
-_REQUEST_COLUMNS = "request_id, user_id, created_at, source, agent_version, session_id"
+_INTERACTION_COLUMNS = "interaction_id, user_id, content, request_id, created_at, role, token_count, user_action, user_action_description, interacted_image_url, shadow_content, expert_content, tools_used, citations, retrieved_learnings"
+_REQUEST_COLUMNS = "request_id, user_id, created_at, source, agent_version, session_id, evaluation_only, retrieval_experiment_id, retrieval_experiment_arm"
 _USER_PLAYBOOK_COLUMNS = 'user_playbook_id, user_id, playbook_name, created_at, request_id, agent_version, content, "trigger", rationale, blocking_issue, status, source, source_interaction_ids, expanded_terms, tags, source_span, notes, reader_angle, merged_into, superseded_by'
 _USER_PLAYBOOK_COLUMNS_WITH_EMBEDDING = _USER_PLAYBOOK_COLUMNS + ", embedding"
 _AGENT_PLAYBOOK_COLUMNS = 'agent_playbook_id, playbook_name, created_at, agent_version, content, "trigger", rationale, blocking_issue, playbook_status, playbook_metadata, expanded_terms, tags, status, merged_into, superseded_by'
-_EVAL_RESULT_COLUMNS = "result_id, session_id, agent_version, evaluation_name, is_success, failure_type, failure_reason, created_at, regular_vs_shadow, number_of_correction_per_session, user_turns_to_resolution, is_escalated"
+_EVAL_RESULT_COLUMNS = "result_id, user_id, session_id, agent_version, evaluation_name, is_success, failure_type, failure_reason, created_at, regular_vs_shadow, number_of_correction_per_session, user_turns_to_resolution, is_escalated, tags"
 _OPERATION_STATE_COLUMNS = "service_name, operation_state, updated_at"
 
 
@@ -238,6 +240,7 @@ class PostgresStorageBase(RetentionMixin, BaseStorage):
         self._interaction_columns = _INTERACTION_COLUMNS
         self._table_columns_cache: dict[str, set[str]] = {}
         self._opensearch: PostgresOpenSearch | None = None
+        self._transaction_state = threading.local()
 
         if not self.db_url:
             raise StorageError(f"Postgres Storage for org {org_id} missing db_url")
@@ -285,6 +288,58 @@ class PostgresStorageBase(RetentionMixin, BaseStorage):
 
     def close(self) -> None:
         self.pool.closeall()
+
+    @contextlib.contextmanager
+    def commit_scope(self) -> Generator[None, None, None]:
+        """Group Postgres writes and OpenSearch side effects atomically.
+
+        Nested scopes join the outer transaction. OpenSearch mutations are
+        deferred until the database commit succeeds so a rollback cannot
+        publish search documents for rows that do not exist in Postgres.
+        """
+        depth = int(getattr(self._transaction_state, "depth", 0))
+        if depth:
+            self._transaction_state.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._transaction_state.depth -= 1
+            return
+
+        conn = self.pool.getconn()
+        self._transaction_state.depth = 1
+        self._transaction_state.connection = conn
+        self._transaction_state.search_operations = []
+        try:
+            yield
+            conn.commit()
+            operations = list(self._transaction_state.search_operations)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._transaction_state.depth = 0
+            self._transaction_state.connection = None
+            self._transaction_state.search_operations = []
+            self.pool.putconn(conn)
+
+        self._transaction_state.flushing_search = True
+        try:
+            for method_name, args, kwargs in operations:
+                if self._opensearch is not None:
+                    getattr(self._opensearch, method_name)(*args, **kwargs)
+        finally:
+            self._transaction_state.flushing_search = False
+
+    def _defer_opensearch_operation(
+        self, method_name: str, *args: Any, **kwargs: Any
+    ) -> bool:
+        if not getattr(self._transaction_state, "depth", 0) or getattr(
+            self._transaction_state, "flushing_search", False
+        ):
+            return False
+        self._transaction_state.search_operations.append((method_name, args, kwargs))
+        return True
 
     def _ensure_migrated(self) -> None:
         target = (self.db_url, self.schema_name)
@@ -350,16 +405,20 @@ class PostgresStorageBase(RetentionMixin, BaseStorage):
     def _fetch_all(
         self, query: sql.Composable, params: list[Any] | None = None
     ) -> list[dict[str, Any]]:
-        conn = self.pool.getconn()
+        scoped_conn = getattr(self._transaction_state, "connection", None)
+        conn = scoped_conn or self.pool.getconn()
         try:
             rows = execute_fetch_all(conn, query, params or [], self.schema_name)
-            conn.commit()
+            if scoped_conn is None:
+                conn.commit()
             return rows
         except Exception:
-            conn.rollback()
+            if scoped_conn is None:
+                conn.rollback()
             raise
         finally:
-            self.pool.putconn(conn)
+            if scoped_conn is None:
+                self.pool.putconn(conn)
 
     def _table_columns(self, table_name: str) -> set[str]:
         cached = self._table_columns_cache.get(table_name)
@@ -493,10 +552,15 @@ class PostgresStorageBase(RetentionMixin, BaseStorage):
     def _get_embedding(
         self, text: str, purpose: Literal["document", "query"] = "document"
     ) -> list[float]:
-        prefix = "search_document: " if purpose == "document" else "search_query: "
         try:
             return self.llm_client.get_embedding(
-                prefix + text, self.embedding_model_name, self.embedding_dimensions
+                embedding_input(
+                    text,
+                    model_name=self.embedding_model_name,
+                    purpose=purpose,
+                ),
+                self.embedding_model_name,
+                self.embedding_dimensions,
             )
         except EmbeddingUnavailableError as exc:
             logger.warning(

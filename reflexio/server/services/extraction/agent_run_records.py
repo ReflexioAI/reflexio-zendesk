@@ -47,14 +47,26 @@ def build_extractor_agent_run_record(
     org_id: str,
     extractor_kind: str,
     user_id: str | None,
-    request_id: str,
     agent_version: str | None,
     source: str | None,
     request_interaction_data_models: list[RequestInteractionDataModel],
     extractor_config: BaseModel,
     service_config: Any,
     agent_context: str,
+    output_schema_name: str | None = None,
+    generation_request_id: str | None = None,
+    request_id: str | None = None,
 ) -> AgentRunRecord:
+    if generation_request_id is not None:
+        if request_id is not None and request_id != generation_request_id:
+            raise TypeError(
+                "generation_request_id and request_id must match when both are provided"
+            )
+    elif request_id is not None:
+        generation_request_id = request_id
+    else:
+        raise TypeError("generation_request_id is required")
+
     source_interaction_ids = extract_source_interaction_ids(
         request_interaction_data_models
     )
@@ -66,7 +78,9 @@ def build_extractor_agent_run_record(
             org_id=org_id,
             extractor_kind=extractor_kind,
             user_id=user_id,
-            request_id=request_id,
+            # The durable storage boundary still uses the legacy ``request_id``
+            # field name for run provenance.
+            request_id=generation_request_id,
             agent_version=agent_version,
             source=source,
             source_interaction_ids=source_interaction_ids,
@@ -80,11 +94,17 @@ def build_extractor_agent_run_record(
         ),
         status=AgentRunStatus.RUNNING,
         generation_request_snapshot={
-            "request_id": request_id,
+            # Snapshot payloads also keep the legacy ``request_id`` key so
+            # existing storage readers do not need a migration.
+            "request_id": generation_request_id,
             "source": source,
             "source_interaction_ids": source_interaction_ids,
             "session_count": len(request_interaction_data_models),
             "extractor_config": extractor_config_snapshot,
+            # Resume/finalization must parse the committed payload with the
+            # schema selected when this run started, even if prompt activation
+            # changes before a pending tool call is resolved.
+            "output_schema_name": output_schema_name,
         },
         service_config_snapshot=_jsonable(service_config),
         agent_context_snapshot=agent_context,

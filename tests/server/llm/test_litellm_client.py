@@ -26,8 +26,10 @@ from reflexio.server.llm.litellm_client import (
     LiteLLMClient,
     LiteLLMClientError,
     LiteLLMConfig,
+    _sanitize_json_string,
     create_litellm_client,
 )
+from reflexio.test_support.llm_credentials import real_provider_key
 from tests.server.test_utils import skip_in_precommit, skip_low_priority
 
 # Skip all tests if neither API key is set
@@ -35,7 +37,8 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.requires_credentials,
     pytest.mark.skipif(
-        not os.getenv("OPENAI_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"),
+        not real_provider_key("OPENAI_API_KEY")
+        and not real_provider_key("ANTHROPIC_API_KEY"),
         reason="Neither OPENAI_API_KEY nor ANTHROPIC_API_KEY environment variable is set",
     ),
 ]
@@ -112,7 +115,7 @@ class ColorAnalysis(BaseModel):
 @pytest.fixture
 def openai_client() -> LiteLLMClient:
     """Create an OpenAI-based LiteLLM client."""
-    if not os.getenv("OPENAI_API_KEY"):
+    if not real_provider_key("OPENAI_API_KEY"):
         pytest.skip("OPENAI_API_KEY not set")
     # GPT-5 models use reasoning tokens internally, so we need more max_tokens
     return create_litellm_client(
@@ -126,7 +129,7 @@ def openai_client() -> LiteLLMClient:
 @pytest.fixture
 def claude_client() -> LiteLLMClient:
     """Create a Claude-based LiteLLM client."""
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not real_provider_key("ANTHROPIC_API_KEY"):
         pytest.skip("ANTHROPIC_API_KEY not set")
     return create_litellm_client(
         model=_get_claude_test_model(),
@@ -487,7 +490,9 @@ class TestLiteLLMClientModelSwitching:
     @skip_low_priority
     def test_switch_from_openai_to_claude(self):
         """Test that we can create clients for different providers."""
-        if not os.getenv("OPENAI_API_KEY") or not os.getenv("ANTHROPIC_API_KEY"):
+        if not real_provider_key("OPENAI_API_KEY") or not real_provider_key(
+            "ANTHROPIC_API_KEY"
+        ):
             pytest.skip("Both OPENAI_API_KEY and ANTHROPIC_API_KEY required")
 
         # Create OpenAI client (GPT-5 needs more tokens due to reasoning)
@@ -761,7 +766,7 @@ class TestLiteLLMClientAPIKeyOverride:
     @skip_low_priority
     def test_generate_response_with_api_key_override_openai(self):
         """Test generating response using OpenAI API key from config override."""
-        openai_key = os.getenv("OPENAI_API_KEY")
+        openai_key = real_provider_key("OPENAI_API_KEY")
         if not openai_key:
             pytest.skip("OPENAI_API_KEY not set")
 
@@ -784,7 +789,7 @@ class TestLiteLLMClientAPIKeyOverride:
     @skip_low_priority
     def test_generate_response_with_api_key_override_anthropic(self):
         """Test generating response using Anthropic API key from config override."""
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        anthropic_key = real_provider_key("ANTHROPIC_API_KEY")
         if not anthropic_key:
             pytest.skip("ANTHROPIC_API_KEY not set")
 
@@ -807,7 +812,7 @@ class TestLiteLLMClientAPIKeyOverride:
     @skip_low_priority
     def test_embeddings_with_api_key_override(self):
         """Test embedding generation with API key override."""
-        openai_key = os.getenv("OPENAI_API_KEY")
+        openai_key = real_provider_key("OPENAI_API_KEY")
         if not openai_key:
             pytest.skip("OPENAI_API_KEY not set")
 
@@ -827,7 +832,7 @@ class TestLiteLLMClientAPIKeyOverride:
     @skip_low_priority
     def test_structured_output_with_api_key_override(self):
         """Test structured output with API key override."""
-        openai_key = os.getenv("OPENAI_API_KEY")
+        openai_key = real_provider_key("OPENAI_API_KEY")
         if not openai_key:
             pytest.skip("OPENAI_API_KEY not set")
 
@@ -875,7 +880,7 @@ class TestLiteLLMClientAPIKeyOverride:
     @skip_low_priority
     def test_chat_response_with_api_key_override(self):
         """Test multi-turn chat response with API key override."""
-        openai_key = os.getenv("OPENAI_API_KEY")
+        openai_key = real_provider_key("OPENAI_API_KEY")
         if not openai_key:
             pytest.skip("OPENAI_API_KEY not set")
 
@@ -902,7 +907,7 @@ class TestLiteLLMClientAPIKeyOverride:
     @skip_low_priority
     def test_image_analysis_with_api_key_override(self, test_image_bytes: bytes):
         """Test image analysis with API key override."""
-        openai_key = os.getenv("OPENAI_API_KEY")
+        openai_key = real_provider_key("OPENAI_API_KEY")
         if not openai_key:
             pytest.skip("OPENAI_API_KEY not set")
 
@@ -974,75 +979,67 @@ class TestLiteLLMClientAPIKeyOverride:
 
 
 class TestSanitizeJsonString:
-    """Unit tests for LiteLLMClient._sanitize_json_string."""
+    """Unit tests for the module-level _sanitize_json_string helper."""
 
-    @pytest.fixture
-    def client(self):
-        config = LiteLLMConfig(
-            model="gpt-5.4-mini",
-            api_key_config=APIKeyConfig(openai=OpenAIConfig(api_key="test")),
-        )
-        return LiteLLMClient(config)
-
-    def test_single_quotes_to_double(self, client):
+    def test_single_quotes_to_double(self):
         """Single-quoted JSON keys and values are converted to double quotes."""
-        result = client._sanitize_json_string("{'key': 'value'}")
+        result = _sanitize_json_string("{'key': 'value'}")
         assert result == '{"key": "value"}'
 
-    def test_python_booleans(self, client):
+    def test_python_booleans(self):
         """Python True/False/None are converted to JSON true/false/null."""
-        result = client._sanitize_json_string('{"a": True, "b": False, "c": None}')
+        result = _sanitize_json_string('{"a": True, "b": False, "c": None}')
         assert result == '{"a": true, "b": false, "c": null}'
 
-    def test_python_booleans_inside_strings_preserved(self, client):
+    def test_python_booleans_inside_strings_preserved(self):
         """True/False/None inside quoted strings are NOT converted."""
-        result = client._sanitize_json_string('{"msg": "True story about None"}')
+        result = _sanitize_json_string('{"msg": "True story about None"}')
         assert result == '{"msg": "True story about None"}'
 
-    def test_trailing_commas(self, client):
+    def test_trailing_commas(self):
         """Trailing commas before } or ] are removed."""
-        result = client._sanitize_json_string('{"a": 1, "b": 2,}')
+        result = _sanitize_json_string('{"a": 1, "b": 2,}')
         assert result == '{"a": 1, "b": 2}'
 
-    def test_trailing_comma_in_array(self, client):
+    def test_trailing_comma_in_array(self):
         """Trailing commas in arrays are removed."""
-        result = client._sanitize_json_string("[1, 2, 3,]")
+        result = _sanitize_json_string("[1, 2, 3,]")
         assert result == "[1, 2, 3]"
 
-    def test_escaped_apostrophe_in_single_quoted_string(self, client):
+    def test_escaped_apostrophe_in_single_quoted_string(self):
         """Escaped apostrophes inside single-quoted strings are handled."""
         import json
 
-        result = client._sanitize_json_string("{'text': 'didn\\'t work'}")
+        result = _sanitize_json_string("{'text': 'didn\\'t work'}")
         parsed = json.loads(result)
         assert parsed["text"] == "didn't work"
 
-    def test_double_quotes_inside_single_quoted_string(self, client):
+    def test_double_quotes_inside_single_quoted_string(self):
         """Double quotes inside single-quoted strings are escaped."""
         import json
 
-        result = client._sanitize_json_string("{'text': 'he said \"hello\"'}")
+        result = _sanitize_json_string("{'text': 'he said \"hello\"'}")
         parsed = json.loads(result)
         assert parsed["text"] == 'he said "hello"'
 
-    def test_mixed_all_issues(self, client):
+    def test_mixed_all_issues(self):
         """Combined: single quotes, Python booleans, trailing comma."""
         import json
 
-        result = client._sanitize_json_string(
+        result = _sanitize_json_string(
             "{'is_success': True, 'failure_type': None, 'reason': 'ok',}"
         )
         parsed = json.loads(result)
         assert parsed == {"is_success": True, "failure_type": None, "reason": "ok"}
 
-    def test_valid_json_passthrough(self, client):
+    def test_valid_json_passthrough(self):
         """Already-valid JSON passes through unchanged."""
         original = '{"is_success": true, "count": 42}'
-        result = client._sanitize_json_string(original)
+        result = _sanitize_json_string(original)
         assert result == original
 
-    def test_word_boundary_prevents_partial_replacement(self, client):
+    def test_word_boundary_prevents_partial_replacement(self):
         """Words containing True/False as substrings are not replaced."""
-        result = client._sanitize_json_string('{"TrueValue": 1, "isFalsey": 2}')
+        result = _sanitize_json_string('{"TrueValue": 1, "isFalsey": 2}')
         assert '"TrueValue"' in result
         assert '"isFalsey"' in result

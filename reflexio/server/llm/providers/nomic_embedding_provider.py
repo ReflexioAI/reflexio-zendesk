@@ -63,10 +63,62 @@ _MAX_CHARS = 32_000
 _DEFAULT_ENCODE_BATCH_SIZE = 4
 _ENV_BATCH_SIZE = "REFLEXIO_EMBED_BATCH_SIZE"
 
+# D7 (Phase 2 prep): optionally pin torch intra-op thread count so the embedder
+# does not oversubscribe CPU under bounded concurrency. Unset (the default) =
+# leave torch untouched, i.e. zero behaviour change. Applies at Nomic model load
+# (both the in-process fallback and the shared daemon run NomicEmbedder). Note the
+# chromadb/minilm LocalEmbedder path uses onnxruntime, not torch, so this knob does
+# not affect it.
+_ENV_TORCH_THREADS = "REFLEXIO_EMBED_TORCH_THREADS"
+_torch_threads_pinned = False
+_torch_threads_lock = threading.Lock()
+
 
 def _encode_batch_size() -> int:
     """Resolve the encode mini-batch size from env, defaulting to 4."""
     return positive_int_env(_ENV_BATCH_SIZE, _DEFAULT_ENCODE_BATCH_SIZE, _LOGGER)
+
+
+def _maybe_pin_torch_threads() -> None:
+    """Pin torch intra-op threads to ``REFLEXIO_EMBED_TORCH_THREADS`` if set.
+
+    Dormant by default: when the env var is unset (or blank) this is a no-op and
+    ``torch.set_num_threads`` is never called, so torch keeps its default
+    autodetected thread count. When set to a positive int it is applied exactly
+    once per process (guarded against re-calling). A non-positive or non-integer
+    value is ignored with a warning.
+    """
+    global _torch_threads_pinned
+    if _torch_threads_pinned:
+        return
+    raw = os.environ.get(_ENV_TORCH_THREADS)
+    if not raw:
+        return
+    try:
+        n = int(raw)
+    except ValueError:
+        _LOGGER.warning(
+            "%s must be a positive integer; got %r — leaving torch threads at "
+            "their default.",
+            _ENV_TORCH_THREADS,
+            raw,
+        )
+        return
+    if n < 1:
+        _LOGGER.warning(
+            "%s must be >= 1; got %d — leaving torch threads at their default.",
+            _ENV_TORCH_THREADS,
+            n,
+        )
+        return
+    with _torch_threads_lock:
+        if _torch_threads_pinned:
+            return
+        import torch
+
+        torch.set_num_threads(n)
+        _torch_threads_pinned = True
+        _LOGGER.info("Pinned torch intra-op threads to %d (%s)", n, _ENV_TORCH_THREADS)
 
 
 class NomicEmbedderError(RuntimeError):
@@ -118,6 +170,7 @@ class NomicEmbedder:
                     "sentence-transformers is required for the Nomic local "
                     "embedder. Install with `uv add sentence-transformers`."
                 ) from exc
+            _maybe_pin_torch_threads()
             _LOGGER.info(
                 "Loading Nomic embedding model %s — first call may download "
                 "~550 MB to %s",
@@ -157,15 +210,30 @@ class NomicEmbedder:
         """
         model = self._load()
         safe = [(t or "")[:_MAX_CHARS] for t in texts]
-        # show_progress_bar=False so server logs stay clean during ingest
-        # batches. convert_to_numpy=True returns a numpy ndarray; we slice
-        # and renormalise per-row before converting to plain Python lists.
-        raw = model.encode(
-            safe,
-            batch_size=_encode_batch_size(),
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
+        # The sentence-transformers model is NOT thread-safe: nomic-bert's
+        # rotary-embedding code mutates instance attrs (``_cos_cached`` /
+        # ``_sin_cached``) on every forward pass, so two concurrent
+        # ``encode()`` calls on this shared singleton corrupt each other's
+        # buffers (observed in prod as "size of tensor a (N) must match tensor
+        # b (M)" and "'NoneType' object is not subscriptable"). Serialize the
+        # encode so every caller — daemon, in-process fallback, prewarm,
+        # regeneration — is safe by construction. ``_load()`` acquires and
+        # releases ``_model_lock`` and returns before we re-acquire it here, so
+        # there is no nesting/deadlock. NOTE: ``threading.Lock`` is not FIFO-fair
+        # — do not "improve" this into a fairness queue without measuring; the
+        # micro-batch coalescing in ``embedding_service`` is where throughput
+        # comes from, not parallel encodes on one model.
+        with self._model_lock:
+            # show_progress_bar=False so server logs stay clean during ingest
+            # batches. convert_to_numpy=True returns a numpy ndarray; we slice
+            # and renormalise per-row (below, outside the lock) before
+            # converting to plain Python lists.
+            raw = model.encode(
+                safe,
+                batch_size=_encode_batch_size(),
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
         return [_truncate_and_renormalise(vec.tolist()) for vec in raw]
 
 

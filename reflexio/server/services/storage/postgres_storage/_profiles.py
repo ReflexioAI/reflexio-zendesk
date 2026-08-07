@@ -1,6 +1,8 @@
 """Profile and Interaction CRUD + search methods for Supabase storage."""
 
+import json
 import logging
+import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -16,12 +18,19 @@ from reflexio.models.api_schema.service_schemas import (
     DeleteUserInteractionRequest,
     DeleteUserProfileRequest,
     Interaction,
+    LineageContext,
     Status,
     UserProfile,
 )
+from reflexio.server.billing_signals import count_input_tokens
 from reflexio.server.llm.providers.embedding_service_provider import (
     EmbeddingUnavailableError,
 )
+from reflexio.server.services.embedding_text import (
+    embedding_input,
+    resolve_retrieval_threshold,
+)
+from reflexio.server.services.storage.lifecycle_filters import validate_include_inactive
 from reflexio.server.services.storage.postgres_storage._opensearch import (
     status_filter_terms,
 )
@@ -87,11 +96,33 @@ class ProfileMixin(SchemaScopedClient):
         self,
         limit: int = 100,
         status_filter: list[Status | None] | None = None,
+        user_id: str | None = None,
+        profile_id: str | None = None,
+        query: str | None = None,
+        source: str | None = None,
+        profile_time_to_live: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
     ) -> list[UserProfile]:
         if status_filter is None:
             status_filter = [None]  # Default to current profiles (status=None)
 
-        query = self._table("profiles").select(_PROFILE_COLUMNS)
+        db_query = self._table("profiles").select(_PROFILE_COLUMNS)
+
+        if user_id:
+            db_query = db_query.eq("user_id", user_id)
+        if profile_id:
+            db_query = db_query.eq("profile_id", profile_id)
+        if source is not None:
+            db_query = db_query.eq("source", source)
+        if profile_time_to_live:
+            db_query = db_query.eq("profile_time_to_live", profile_time_to_live)
+        if start_time is not None:
+            db_query = db_query.gte("last_modified_timestamp", start_time)
+        if end_time is not None:
+            db_query = db_query.lte("last_modified_timestamp", end_time)
+        if query:
+            db_query = db_query.search_text(["content", "profile_id", "user_id"], query)
 
         # Convert Status enum values to strings for database query
         # Handle None values and Status.CURRENT (which has value None)
@@ -108,16 +139,18 @@ class ProfileMixin(SchemaScopedClient):
         # Build status filter: handle None and string values
         if has_none and status_strings:
             # Mix of None and other statuses: (status IS NULL OR status IN (...))
-            query = query.or_(f"status.is.null,status.in.({','.join(status_strings)})")
+            db_query = db_query.or_(
+                f"status.is.null,status.in.({','.join(status_strings)})"
+            )
         elif has_none:
             # Only None: status IS NULL
-            query = query.is_("status", "null")
+            db_query = db_query.is_("status", "null")
         else:
             # Only non-None statuses: status IN (...)
-            query = query.in_("status", status_strings)
+            db_query = db_query.in_("status", status_strings)
 
         response = (
-            query.order("last_modified_timestamp", desc=True).limit(limit).execute()
+            db_query.order("last_modified_timestamp", desc=True).limit(limit).execute()
         )
         return response_list_to_user_profiles(_rows(response))
 
@@ -127,17 +160,36 @@ class ProfileMixin(SchemaScopedClient):
         user_id: str,
         status_filter: list[Status | None] | None = None,
         tags: list[str] | None = None,
+        profile_id: str | None = None,
+        query: str | None = None,
+        source: str | None = None,
+        profile_time_to_live: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        include_expired: bool = False,
     ) -> list[UserProfile]:
         if status_filter is None:
             status_filter = [None]  # Default to current profiles (status=None)
 
-        current_timestamp = int(datetime.now(UTC).timestamp())
-        query = (
-            self._table("profiles")
-            .select(_PROFILE_COLUMNS)
-            .eq("user_id", user_id)
-            .gte("expiration_timestamp", current_timestamp)
+        db_query = (
+            self._table("profiles").select(_PROFILE_COLUMNS).eq("user_id", user_id)
         )
+        if not include_expired:
+            db_query = db_query.gte(
+                "expiration_timestamp", int(datetime.now(UTC).timestamp())
+            )
+        if profile_id:
+            db_query = db_query.eq("profile_id", profile_id)
+        if source is not None:
+            db_query = db_query.eq("source", source)
+        if profile_time_to_live:
+            db_query = db_query.eq("profile_time_to_live", profile_time_to_live)
+        if start_time is not None:
+            db_query = db_query.gte("last_modified_timestamp", start_time)
+        if end_time is not None:
+            db_query = db_query.lte("last_modified_timestamp", end_time)
+        if query:
+            db_query = db_query.search_text(["content", "profile_id", "user_id"], query)
 
         # Convert Status enum values to strings for database query
         status_strings = []
@@ -153,22 +205,24 @@ class ProfileMixin(SchemaScopedClient):
         # Build status filter: handle None and string values
         if has_none and status_strings:
             # Mix of None and other statuses: (status IS NULL OR status IN (...))
-            query = query.or_(f"status.is.null,status.in.({','.join(status_strings)})")
+            db_query = db_query.or_(
+                f"status.is.null,status.in.({','.join(status_strings)})"
+            )
         elif has_none:
             # Only None: status IS NULL
-            query = query.is_("status", "null")
+            db_query = db_query.is_("status", "null")
         else:
             # Only non-None statuses: status IN (...)
-            query = query.in_("status", status_strings)
+            db_query = db_query.in_("status", status_strings)
         if tags:
-            query = query.contains("tags", tags)
+            db_query = db_query.contains("tags", tags)
 
-        response = query.execute()
+        response = db_query.execute()
         return response_list_to_user_profiles(_rows(response))
 
     @handle_exceptions
-    def add_user_profile(self, user_id: str, user_profiles: list[UserProfile]) -> None:  # noqa: ARG002
-        for profile in user_profiles:
+    def precompute_profile_embeddings(self, profiles: list[UserProfile]) -> None:
+        for profile in profiles:
             embedding_text = "\n".join([profile.content, str(profile.custom_features)])
             if self._should_expand_documents():
                 with ThreadPoolExecutor(max_workers=2) as executor:
@@ -178,19 +232,71 @@ class ProfileMixin(SchemaScopedClient):
                     profile.expanded_terms = exp_future.result(timeout=15)
             else:
                 profile.embedding = self._get_embedding(embedding_text)
-            response = (
-                self._table("profiles").upsert(user_profile_to_data(profile)).execute()
-            )
-            if self._opensearch:
-                self._opensearch.index_rows("profiles", _rows(response))
-            self._record_profile_event(
-                event_name="profile_created",
-                outcome="created",
-                entity_id=profile.profile_id,
-                user_id=profile.user_id or user_id,
-                request_id=profile.generated_from_request_id,
-                source=profile.source,
-            )
+
+    @handle_exceptions
+    def add_user_profile(
+        self,
+        user_id: str,
+        user_profiles: list[UserProfile],
+        *,
+        skip_embedding: bool = False,
+        lineage_contexts: list[LineageContext] | None = None,
+    ) -> None:
+        if lineage_contexts is not None and len(lineage_contexts) != len(user_profiles):
+            raise ValueError("lineage_contexts must match user_profiles length")
+        if any(context.op_kind != "create" for context in lineage_contexts or []):
+            raise ValueError("profile lineage_contexts must use op_kind='create'")
+        if not skip_embedding:
+            self.precompute_profile_embeddings(user_profiles)
+        with self.commit_scope():
+            for index, profile in enumerate(user_profiles):
+                subject_ref = self._subject_ref_for_user_id(profile.user_id or user_id)
+                self._assert_subject_writable_locked(subject_ref)
+                data = user_profile_to_data(profile)
+                data["governance_subject_ref"] = subject_ref
+                context = (
+                    lineage_contexts[index]
+                    if lineage_contexts is not None
+                    else LineageContext(
+                        op_kind="create",
+                        actor="profile_extractor",
+                        request_id=profile.generated_from_request_id,
+                    )
+                )
+                response = self._table("profiles").upsert(data).execute()
+                self._fetch_all(
+                    sql.SQL(
+                        """INSERT INTO {} (
+                               org_id, entity_type, entity_id, op, prov_relation,
+                               source_ids, actor, request_id, reason, created_at,
+                               model_name, provider
+                           ) VALUES (%s, 'profile', %s, 'create', 'wasGeneratedBy',
+                                     %s::jsonb, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
+                           DO NOTHING RETURNING 1"""
+                    ).format(self._table_identifier("lineage_event")),
+                    [
+                        self.org_id,
+                        profile.profile_id,
+                        json.dumps(context.source_ids),
+                        context.actor,
+                        context.request_id or profile.generated_from_request_id or "",
+                        context.reason,
+                        int(datetime.now(UTC).timestamp()),
+                        context.model_name,
+                        context.provider,
+                    ],
+                )
+                if self._opensearch:
+                    self._opensearch.index_rows("profiles", _rows(response))
+                self._record_profile_event(
+                    event_name="profile_created",
+                    outcome="created",
+                    entity_id=profile.profile_id,
+                    user_id=profile.user_id or user_id,
+                    request_id=profile.generated_from_request_id,
+                    source=profile.source,
+                )
 
     @handle_exceptions
     def update_user_profile_by_id(
@@ -322,6 +428,8 @@ class ProfileMixin(SchemaScopedClient):
         user_id: str,
         profile_ids: list[str],
         status_filter: list[Status | None] | None = None,
+        *,
+        include_inactive: bool = False,
     ) -> list[UserProfile]:
         """Fetch selected current/non-current profiles for a user by id.
 
@@ -331,8 +439,20 @@ class ProfileMixin(SchemaScopedClient):
         matching the SQLite implementation — expired rows are not
         returned even when explicitly asking for archived statuses.
         """
+        validate_include_inactive(
+            include_inactive=include_inactive, status_filter=status_filter
+        )
         if not profile_ids:
             return []
+        if include_inactive:
+            response = (
+                self._table("profiles")
+                .select(_PROFILE_COLUMNS)
+                .eq("user_id", user_id)
+                .in_("profile_id", profile_ids)
+                .execute()
+            )
+            return response_list_to_user_profiles(_rows(response))
         if status_filter is None:
             status_filter = [None]
 
@@ -398,7 +518,14 @@ class ProfileMixin(SchemaScopedClient):
                 RETURNING profile_id
                 """
             ).format(self._table_identifier("profiles")),
-            [Status.SUPERSEDED.value, now, now, user_id, profile_ids, Status.PENDING.value],
+            [
+                Status.SUPERSEDED.value,
+                now,
+                now,
+                user_id,
+                profile_ids,
+                Status.PENDING.value,
+            ],
         )
         changed = {str(row["profile_id"]) for row in rows}
         for profile_id in changed:
@@ -589,16 +716,83 @@ class ProfileMixin(SchemaScopedClient):
         return response_list_to_interactions(_rows(response))
 
     @handle_exceptions
+    def get_all_user_ids(self) -> list[str]:
+        rows = self._fetch_all(
+            sql.SQL("SELECT DISTINCT user_id FROM {} ORDER BY user_id").format(
+                self._table_identifier("interactions")
+            )
+        )
+        return [str(row["user_id"]) for row in rows]
+
+    @handle_exceptions
+    def expire_active_profiles(self, *, now: int, limit: int = 1000) -> int:
+        if limit <= 0:
+            return 0
+        request_id = uuid.uuid4().hex
+        with self.commit_scope():
+            affected = self._fetch_all(
+                sql.SQL(
+                    """SELECT profile_id, user_id, governance_subject_ref FROM {}
+                       WHERE status IS NULL AND expiration_timestamp < %s
+                       ORDER BY expiration_timestamp LIMIT %s
+                       FOR UPDATE SKIP LOCKED"""
+                ).format(self._table_identifier("profiles")),
+                [now, limit],
+            )
+            for row in affected:
+                subject_ref = row.get("governance_subject_ref") or (
+                    self._subject_ref_for_user_id(str(row["user_id"]))
+                )
+                self._assert_subject_writable_locked(subject_ref)
+            ids = [str(row["profile_id"]) for row in affected]
+            if not ids:
+                return 0
+            changed = self._fetch_all(
+                sql.SQL(
+                    """UPDATE {} SET status = %s, retired_at = %s,
+                           last_modified_timestamp = %s
+                       WHERE profile_id = ANY(%s) AND status IS NULL
+                       RETURNING *"""
+                ).format(self._table_identifier("profiles")),
+                [Status.EXPIRED.value, now, now, ids],
+            )
+            for row in changed:
+                self._fetch_all(
+                    sql.SQL(
+                        """INSERT INTO {} (
+                               org_id, entity_type, entity_id, op, prov_relation,
+                               source_ids, actor, request_id, reason, created_at,
+                               from_status, to_status, status_namespace
+                           ) VALUES (%s, 'profile', %s, 'status_change',
+                                     'wasInvalidatedBy', '[]'::jsonb, 'system', %s,
+                                     'ttl_expired', %s, NULL, %s, 'lifecycle_status')
+                           ON CONFLICT (org_id, entity_type, entity_id, op, request_id)
+                           DO NOTHING RETURNING 1"""
+                    ).format(self._table_identifier("lineage_event")),
+                    [
+                        self.org_id,
+                        str(row["profile_id"]),
+                        request_id,
+                        now,
+                        Status.EXPIRED.value,
+                    ],
+                )
+            if self._opensearch:
+                self._opensearch.index_rows("profiles", changed)
+        return len(changed)
+
+    @handle_exceptions
     def add_user_interaction(self, user_id: str, interaction: Interaction) -> None:  # noqa: ARG002
         embedding = self._get_embedding(
             f"{interaction.content}\n{interaction.user_action_description}"
         )
         interaction.embedding = embedding
-        response = (
-            self._table("interactions")
-            .upsert(interaction_to_data(interaction))
-            .execute()
-        )
+        interaction.token_count = count_input_tokens(interaction.content)
+        subject_ref = self._subject_ref_for_user_id(interaction.user_id)
+        self._assert_subject_writable_locked(subject_ref)
+        data = interaction_to_data(interaction)
+        data["governance_subject_ref"] = subject_ref
+        response = self._table("interactions").upsert(data).execute()
         if self._opensearch:
             self._opensearch.index_rows("interactions", _rows(response))
 
@@ -607,6 +801,8 @@ class ProfileMixin(SchemaScopedClient):
         self,
         user_id: str,  # noqa: ARG002
         interactions: list[Interaction],
+        *,
+        embeddings_prepared: bool = False,
     ) -> None:
         """
         Add multiple user interactions with batched embedding generation.
@@ -622,36 +818,51 @@ class ProfileMixin(SchemaScopedClient):
         if not interactions:
             return
 
-        # Prepare texts for batch embedding
+        if not embeddings_prepared:
+            self.prepare_interaction_embeddings(interactions)
+        with self.commit_scope():
+            data_list = []
+            for interaction in interactions:
+                interaction.token_count = count_input_tokens(interaction.content)
+                subject_ref = self._subject_ref_for_user_id(interaction.user_id)
+                self._assert_subject_writable_locked(subject_ref)
+                data = interaction_to_data(interaction)
+                data["governance_subject_ref"] = subject_ref
+                data_list.append(data)
+            response = self._table("interactions").upsert(data_list).execute()
+            if self._opensearch:
+                self._opensearch.index_rows("interactions", _rows(response))
+
+    def prepare_interaction_embeddings(self, interactions: list[Interaction]) -> None:
+        to_embed = [
+            interaction for interaction in interactions if not interaction.embedding
+        ]
+        if not to_embed:
+            return
         texts = [
             "\n".join(
                 [interaction.content or "", interaction.user_action_description or ""]
             )
-            for interaction in interactions
+            for interaction in to_embed
         ]
-
-        # Get all embeddings in a single API call
         try:
             embeddings = self.llm_client.get_embeddings(
-                texts, self.embedding_model_name, self.embedding_dimensions
+                [
+                    embedding_input(text, model_name=self.embedding_model_name)
+                    for text in texts
+                ],
+                self.embedding_model_name,
+                self.embedding_dimensions,
             )
         except EmbeddingUnavailableError as exc:
             logger.warning(
-                "Embedding unavailable for interaction bulk insert; "
+                "Embedding unavailable during interaction preparation; "
                 "continuing without vectors: %s",
                 exc,
             )
             embeddings = [[] for _ in texts]
-
-        # Assign embeddings to interactions
-        for interaction, embedding in zip(interactions, embeddings, strict=False):
+        for interaction, embedding in zip(to_embed, embeddings, strict=False):
             interaction.embedding = embedding
-
-        # Bulk upsert all interactions
-        data_list = [interaction_to_data(interaction) for interaction in interactions]
-        response = self._table("interactions").upsert(data_list).execute()
-        if self._opensearch:
-            self._opensearch.index_rows("interactions", _rows(response))
 
     @handle_exceptions
     def delete_user_interaction(self, request: DeleteUserInteractionRequest) -> None:
@@ -795,7 +1006,8 @@ class ProfileMixin(SchemaScopedClient):
             ids = self._opensearch.search_ids(
                 entity="interactions",
                 query_text=query_text,
-                query_embedding=query_embedding or self._get_embedding(query_text),
+                query_embedding=query_embedding
+                or self._get_embedding(query_text, purpose="query"),
                 search_mode=effective_mode,
                 top_k=search_interaction_request.most_recent_k
                 or search_interaction_request.top_k
@@ -808,7 +1020,7 @@ class ProfileMixin(SchemaScopedClient):
         response = self._rpc(
             "hybrid_match_interactions",
             {
-                "p_query_embedding": self._get_embedding(query_text),
+                "p_query_embedding": self._get_embedding(query_text, purpose="query"),
                 "p_query_text": query_text,
                 "p_match_threshold": 0.1,
                 "p_match_count": search_interaction_request.most_recent_k or 10,
@@ -873,10 +1085,14 @@ class ProfileMixin(SchemaScopedClient):
             ids = self._opensearch.search_ids(
                 entity="profiles",
                 query_text=query_text,
-                query_embedding=query_embedding or self._get_embedding(query_text),
+                query_embedding=query_embedding
+                or self._get_embedding(query_text, purpose="query"),
                 search_mode=effective_mode,
                 top_k=search_user_profile_request.top_k or 10,
-                threshold=search_user_profile_request.threshold or 0.7,
+                threshold=resolve_retrieval_threshold(
+                    search_user_profile_request.threshold,
+                    model_name=self.embedding_model_name,
+                ),
                 filters=filters,
             )
             profiles = self.get_profiles_by_ids(
@@ -896,9 +1112,13 @@ class ProfileMixin(SchemaScopedClient):
         response = self._rpc(
             "hybrid_match_profiles",
             {
-                "p_query_embedding": query_embedding or self._get_embedding(query_text),
+                "p_query_embedding": query_embedding
+                or self._get_embedding(query_text, purpose="query"),
                 "p_query_text": query_text,
-                "p_match_threshold": search_user_profile_request.threshold or 0.7,
+                "p_match_threshold": resolve_retrieval_threshold(
+                    search_user_profile_request.threshold,
+                    model_name=self.embedding_model_name,
+                ),
                 "p_match_count": search_user_profile_request.top_k or 10,
                 "p_current_epoch": current_timestamp,
                 "p_filter_user_id": search_user_profile_request.user_id,

@@ -7,6 +7,7 @@ are available.
 
 """
 
+import contextlib
 import functools
 import json
 import logging
@@ -14,7 +15,8 @@ import math
 import re
 import sqlite3
 import threading
-from collections.abc import Callable, Sequence
+import unicodedata
+from collections.abc import Callable, Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -29,6 +31,7 @@ from reflexio.models.api_schema.service_schemas import (
     ProfileTimeToLive,
     RegularVsShadow,
     Request,
+    RetrievedLearning,
     Status,
     ToolUsed,
     UserActionType,
@@ -48,17 +51,14 @@ from reflexio.server.llm.model_defaults import (
 )
 from reflexio.server.llm.providers.embedding_service_provider import (
     EmbeddingUnavailableError,
+    resolve_service_configured_model,
 )
+from reflexio.server.services.embedding_text import embedding_input
 from reflexio.server.services.storage.error import (
     StorageError,
     require_non_empty_session_id,
 )
-from reflexio.server.services.storage.retention import RetentionTarget
-from reflexio.server.services.storage.retention_mixin import (
-    RETENTION_DELETE_CHUNK,
-    RetentionMixin,
-    chunked,
-)
+from reflexio.server.services.storage.retention_mixin import RetentionMixin
 from reflexio.server.services.storage.storage_base import BaseStorage
 from reflexio.server.site_var.site_var_manager import SiteVarManager
 
@@ -67,10 +67,24 @@ from ._stall_state import init_stall_state_table
 
 logger = logging.getLogger(__name__)
 
+_MINIMUM_SQLITE_VERSION = (3, 35, 0)
+_SQLITE_INITIALIZATION_LOCK_STRIPES = 64
+_sqlite_initialization_locks = tuple(
+    threading.Lock() for _ in range(_SQLITE_INITIALIZATION_LOCK_STRIPES)
+)
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_sqlite_initialization_lock(db_path: str) -> threading.Lock:
+    """Return a bounded process-local lock for one SQLite database path."""
+    normalized_path = str(Path(db_path).resolve())
+    return _sqlite_initialization_locks[
+        hash(normalized_path) % _SQLITE_INITIALIZATION_LOCK_STRIPES
+    ]
 
 
 def _json_dumps(obj: Any) -> str | None:
@@ -89,7 +103,117 @@ def _json_loads(text: str | None) -> Any:
 
 _FTS5_OPERATORS = frozenset({"OR", "AND", "NOT"})
 _FTS5_RESERVED = _FTS5_OPERATORS | {"NEAR"}
-_TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_UNICODE_LEXICAL_MAX_TERMS = 16
+_UNICODE_LEXICAL_MAX_CANDIDATES = 250
+_UNICODE_LEXICAL_INDEX_VERSION = 1
+
+
+def _normalize_lexical_text(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _unicode_lexical_runs(text: str) -> tuple[str, ...]:
+    """Split normalized text at punctuation and ASCII/non-ASCII boundaries."""
+    normalized = _normalize_lexical_text(text)
+    runs: list[str] = []
+    current: list[str] = []
+    current_is_ascii: bool | None = None
+    for char in normalized:
+        if not char.isalnum():
+            if current:
+                runs.append("".join(current))
+                current = []
+            current_is_ascii = None
+            continue
+        is_ascii = char.isascii()
+        if current and is_ascii != current_is_ascii:
+            runs.append("".join(current))
+            current = []
+        current.append(char)
+        current_is_ascii = is_ascii
+    if current:
+        runs.append("".join(current))
+    return tuple(runs)
+
+
+@functools.lru_cache(maxsize=512)
+def _unicode_lexical_terms(query: str) -> tuple[str, ...]:
+    """Return bounded Unicode-aware terms used for query coverage scoring."""
+    terms: list[str] = []
+    for run in _unicode_lexical_runs(query):
+        if run.isascii() or len(run) == 1:
+            terms.append(run)
+        else:
+            terms.extend(run[index : index + 2] for index in range(len(run) - 1))
+    return tuple(dict.fromkeys(terms))[:_UNICODE_LEXICAL_MAX_TERMS]
+
+
+def _unicode_lexical_index_text(document: str | None) -> str:
+    """Build normalized unigram/bigram tokens for the Unicode FTS sidecars."""
+    if not document:
+        return ""
+    terms: list[str] = []
+    for run in _unicode_lexical_runs(document):
+        if run.isascii():
+            terms.append(run)
+            continue
+        terms.extend(run)
+        terms.extend(run[index : index + 2] for index in range(len(run) - 1))
+    return " ".join(dict.fromkeys(terms))
+
+
+def register_unicode_lexical_index_function(conn: sqlite3.Connection) -> None:
+    """Register the Unicode lexical trigger function on a writer connection."""
+    conn.create_function(
+        "reflexio_unicode_lexical_index",
+        1,
+        _unicode_lexical_index_text,
+        deterministic=True,
+    )
+
+
+def _unicode_lexical_fts_query(query: str) -> str:
+    """Return an OR query over normalized Unicode lexical terms."""
+    return " OR ".join(f'"{term}"' for term in _unicode_lexical_terms(query))
+
+
+def _unicode_lexical_candidate_limit(result_limit: int) -> int:
+    """Bound the indexed candidate pool before Python-side coverage scoring."""
+    return min(max(result_limit * 5, 50), _UNICODE_LEXICAL_MAX_CANDIDATES)
+
+
+def _uses_unicode_lexical_fallback(query: str) -> bool:
+    return any(char.isalnum() and not char.isascii() for char in query)
+
+
+def _unicode_lexical_score(document: str | None, query: str | None) -> float:
+    """Score query-term coverage in a Unicode-normalized document."""
+    if not document or not query:
+        return 0.0
+    terms = _unicode_lexical_terms(query)
+    if not terms:
+        return 0.0
+    normalized_document = _normalize_lexical_text(document)
+    matched = sum(term in normalized_document for term in terms)
+    return matched / len(terms)
+
+
+def _rank_unicode_lexical_rows(
+    rows: Sequence[Any],
+    query: str,
+    text_columns: Sequence[str],
+    limit: int,
+) -> list[Any]:
+    """Rank an already-bounded indexed candidate set by query-term coverage."""
+    scored: list[tuple[float, int, Any]] = []
+    for index, row in enumerate(rows):
+        document = " ".join(str(row[column] or "") for column in text_columns)
+        score = _unicode_lexical_score(document, query)
+        if score > 0:
+            scored.append((score, index, row))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [row for _score, _index, row in scored[:limit]]
 
 
 def _sanitize_fts_query(text: str) -> str:
@@ -105,7 +229,7 @@ def _sanitize_fts_query(text: str) -> str:
     Returns:
         FTS5-safe query string with stemming enabled and OR default
     """
-    tokens = _TOKEN_RE.findall(text)
+    tokens = _TOKEN_RE.findall(unicodedata.normalize("NFKC", text))
     if not tokens:
         return '""'
 
@@ -185,6 +309,8 @@ def _vector_rank_rows(
     rows: Sequence[Any],
     query_embedding: list[float],
     match_count: int,
+    *,
+    threshold: float,
 ) -> list[Any]:
     """Rank rows by cosine similarity to the query embedding.
 
@@ -192,6 +318,7 @@ def _vector_rank_rows(
         rows: Candidate rows with stored embeddings.
         query_embedding: The query's embedding vector.
         match_count: Number of results to return.
+        threshold: Strict minimum cosine similarity for the vector arm.
 
     Returns:
         Top ``match_count`` rows sorted by cosine similarity descending.
@@ -215,13 +342,18 @@ def _vector_rank_rows(
     # per vector search call (~200 bytes).
     if scored:
         top = [round(s, 3) for _, s in scored[:10]]
+        passing = [(row, score) for row, score in scored if score > threshold]
         logger.info(
-            "vector_rank: candidates=%d match_count=%d top_scores=%s",
+            "vector_rank: candidates=%d passing=%d threshold=%.3f "
+            "match_count=%d top_scores=%s",
             len(scored),
+            len(passing),
+            threshold,
             match_count,
             top,
         )
-    return [row for row, _ in scored[:match_count]]
+        return [row for row, _ in passing[:match_count]]
+    return []
 
 
 def _true_rrf_merge(
@@ -287,6 +419,42 @@ def _true_rrf_merge(
 # explicitly requested via include_tombstones=True on by-id getters, or an
 # explicit status_filter on list/count methods.
 _TOMBSTONE_STATUS_VALUES = (Status.MERGED.value, Status.SUPERSEDED.value)
+
+# Profile reads also treat EXPIRED (TTL-expired tombstone) as non-current. Kept
+# separate from _TOMBSTONE_STATUS_VALUES because that tuple is shared with playbook
+# queries (which never carry EXPIRED) via hardcoded placeholders.
+_PROFILE_TOMBSTONE_STATUS_VALUES = (
+    Status.MERGED.value,
+    Status.SUPERSEDED.value,
+    Status.EXPIRED.value,
+)
+
+
+def parse_status(value: str | None) -> Status | None:
+    """Parse a stored status string into a Status, tolerating unknown values.
+
+    Unknown non-null values (e.g. a status written by a newer build after a
+    rollback) map to a non-current tombstone sentinel and log an anomaly, rather
+    than raising ValueError. Never maps to None (which models CURRENT/live).
+
+    Args:
+        value: Raw status string from the database, or None/empty for CURRENT.
+
+    Returns:
+        The matching Status enum member, Status.SUPERSEDED for unknown values,
+        or None for falsy input (representing the CURRENT/live state).
+    """
+    if not value:
+        return None
+    try:
+        return Status(value)
+    except ValueError:
+        from reflexio.server.error_reporting import capture_anomaly
+
+        capture_anomaly(
+            "storage.status.unknown_value", level="warning", status_value=value
+        )
+        return Status.SUPERSEDED
 
 
 def _status_value(status: Status | None) -> str | None:
@@ -363,14 +531,19 @@ def _iso_to_epoch(iso_str: str | None) -> int:
 # stored row) with a valid value.
 _MAX_SAFE_EPOCH_TS = 253_402_300_799  # 9999-12-31T23:59:59Z
 _MIN_SAFE_EPOCH_TS = 0  # 1970-01-01T00:00:00Z
+_MIN_CONTEMPORARY_MILLISECOND_EPOCH_TS = 1_500_000_000_000
 
 
 def _epoch_to_iso(ts: int) -> str:
     """Convert a Unix timestamp (seconds) to an ISO 8601 string.
 
-    Out-of-range sentinel bounds are clamped to the representable range so that
-    callers passing "open" window bounds never trigger a ``ValueError``.
+    Plausible contemporary millisecond timestamps are normalized to seconds.
+    Lower values stay in seconds-space so documented sentinel bounds such as
+    ``to_ts=10**12`` still clamp to the representable range instead of being
+    treated as a 2001 millisecond timestamp.
     """
+    if _MIN_CONTEMPORARY_MILLISECOND_EPOCH_TS <= ts <= _MAX_SAFE_EPOCH_TS * 1000:
+        ts = ts // 1000
     clamped = max(_MIN_SAFE_EPOCH_TS, min(ts, _MAX_SAFE_EPOCH_TS))
     return datetime.fromtimestamp(clamped, tz=UTC).isoformat()
 
@@ -392,7 +565,7 @@ def _row_to_profile(row: sqlite3.Row) -> UserProfile:
         expiration_timestamp=d["expiration_timestamp"],
         custom_features=_json_loads(d.get("custom_features")),
         source=d.get("source") or "",
-        status=Status(d["status"]) if d.get("status") else None,
+        status=parse_status(d.get("status")),
         extractor_names=_json_loads(d.get("extractor_names")),
         expanded_terms=d.get("expanded_terms"),
         source_span=d.get("source_span"),
@@ -419,6 +592,12 @@ def _row_to_interaction(row: sqlite3.Row) -> Interaction:
         if citations_raw and isinstance(citations_raw, list)
         else []
     )
+    retrieved_learnings_raw = _json_loads(d.get("retrieved_learnings"))
+    retrieved_learnings = (
+        [RetrievedLearning(**c) for c in retrieved_learnings_raw if isinstance(c, dict)]
+        if retrieved_learnings_raw and isinstance(retrieved_learnings_raw, list)
+        else []
+    )
     return Interaction(
         interaction_id=d["interaction_id"],
         user_id=d["user_id"],
@@ -426,6 +605,7 @@ def _row_to_interaction(row: sqlite3.Row) -> Interaction:
         request_id=d["request_id"],
         created_at=_iso_to_epoch(d["created_at"]),
         role=d.get("role") or "User",
+        token_count=d.get("token_count"),
         user_action=UserActionType(d["user_action"]),
         user_action_description=d["user_action_description"],
         interacted_image_url=d["interacted_image_url"],
@@ -434,6 +614,7 @@ def _row_to_interaction(row: sqlite3.Row) -> Interaction:
         expert_content=d.get("expert_content") or "",
         tools_used=tools_used,
         citations=citations,
+        retrieved_learnings=retrieved_learnings,
     )
 
 
@@ -447,6 +628,8 @@ def _row_to_request(row: sqlite3.Row) -> Request:
         agent_version=d.get("agent_version") or "",
         session_id=require_non_empty_session_id(d.get("session_id")),
         evaluation_only=bool(d.get("evaluation_only", 0)),
+        retrieval_experiment_id=d.get("retrieval_experiment_id"),
+        retrieval_experiment_arm=d.get("retrieval_experiment_arm"),
     )
 
 
@@ -472,7 +655,7 @@ def _row_to_user_playbook(
         blocking_issue=BlockingIssue(**json.loads(d["blocking_issue"]))
         if d.get("blocking_issue")
         else None,
-        status=Status(d["status"]) if d.get("status") else None,
+        status=parse_status(d.get("status")),
         source=d.get("source"),
         source_interaction_ids=_json_loads(d.get("source_interaction_ids")) or [],
         tags=_json_loads(d.get("tags")),
@@ -505,7 +688,7 @@ def _row_to_agent_playbook(row: sqlite3.Row) -> AgentPlaybook:
         playbook_metadata=d.get("playbook_metadata") or "",
         tags=_json_loads(d.get("tags")),
         embedding=[],
-        status=Status(d["status"]) if d.get("status") else None,
+        status=parse_status(d.get("status")),
         expanded_terms=d.get("expanded_terms"),
         merged_into=d.get("merged_into"),
         superseded_by=d.get("superseded_by"),
@@ -532,6 +715,7 @@ def _row_to_eval_result(row: sqlite3.Row) -> AgentSuccessEvaluationResult:
         number_of_correction_per_session=d.get("number_of_correction_per_session") or 0,
         user_turns_to_resolution=d.get("user_turns_to_resolution"),
         is_escalated=bool(d.get("is_escalated", False)),
+        tags=_json_loads(d.get("tags")),
         embedding=[],
     )
 
@@ -545,6 +729,17 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
     """SQLite-backed storage base class for local/self-hosted deployments."""
 
     supports_embedding: ClassVar[bool] = True
+
+    # Chunked bulk-delete helpers provided by SQLiteDeletionMixin via the
+    # composed SQLiteStorage MRO; declared here for clear_user_data's benefit.
+    _delete_in_chunks: Any
+    _delete_source_windows_for_user_playbook_ids: Any
+    _subject_ref_for_user_id: Callable[[str], str]
+
+    # FTS/vec index helpers provided by SQLiteFtsVecMixin via the composed
+    # SQLiteStorage MRO; declared here for _migrate_vec_tables's benefit.
+    _vec_upsert: Any
+    _flush_index_op: Any
 
     @staticmethod
     def handle_exceptions(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -588,29 +783,59 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
 
         self.db_path = db_path
         self._lock = threading.RLock()
+        self._scope_depth = 0
+        self._deferred_index_ops: list[
+            tuple[str, Any]
+        ] = []  # (kind, args) flushed post-commit
 
         logger.info("SQLite Storage for org %s using db_path: %s", org_id, db_path)
 
+        if sqlite3.sqlite_version_info < _MINIMUM_SQLITE_VERSION:
+            detected_version = ".".join(map(str, sqlite3.sqlite_version_info))
+            raise RuntimeError(
+                f"SQLite 3.35.0 or newer is required; detected {detected_version}"
+            )
+
         # Ensure parent directory exists
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        initialization_lock = _get_sqlite_initialization_lock(db_path)
 
-        # Open connection
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        # SQLite's journal-mode negotiation can fail immediately when another
+        # connection is cold-starting the same file. Serialize that setup by
+        # database path while allowing unrelated SQLite files to initialize in
+        # parallel.
+        with initialization_lock:
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            register_unicode_lexical_index_function(self.conn)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
         # LLM client for embeddings
         model_setting = SiteVarManager().get_site_var("llm_model_setting")
         site_var = model_setting if isinstance(model_setting, dict) else {}
 
-        self.embedding_model_name = resolve_model_name(
-            ModelRole.EMBEDDING,
-            site_var_value=site_var.get("embedding_model_name"),
-            config_override=llm_config.embedding_model_name if llm_config else None,
-            api_key_config=self.api_key_config,
+        self.embedding_model_name = resolve_service_configured_model(
+            resolve_model_name(
+                ModelRole.EMBEDDING,
+                site_var_value=site_var.get("embedding_model_name"),
+                config_override=(
+                    llm_config.embedding_model_name if llm_config else None
+                ),
+                api_key_config=self.api_key_config,
+            )
         )
         self.embedding_dimensions = EMBEDDING_DIMENSIONS
+        # Text-generation model for storage-time document expansion. The
+        # shared self.llm_client is pinned to the EMBEDDING model, which is
+        # not a chat model — expansion calls must override the model or they
+        # fail (e.g. local/minilm-l6-v2 cannot serve completions).
+        self._expansion_model_name = resolve_model_name(
+            ModelRole.GENERATION,
+            site_var_value=site_var.get("default_generation_model_name"),
+            config_override=llm_config.generation_model_name if llm_config else None,
+            api_key_config=self.api_key_config,
+        )
 
         litellm_config = LiteLLMConfig(
             model=self.embedding_model_name,
@@ -622,14 +847,59 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         # Optionally load sqlite-vec for native KNN vector search
         self._has_sqlite_vec = self._try_load_sqlite_vec()
 
-        # Create tables
-        self.migrate()
+        # Migrations use an instance-local lock, so separate storage instances
+        # for the same file also need the shared path lock.
+        with initialization_lock:
+            self.migrate()
+
+    # ------------------------------------------------------------------
+    # Transaction scope
+    # ------------------------------------------------------------------
+
+    def _own_transaction(self) -> bool:
+        """True when the caller is NOT inside a commit_scope (owns its BEGIN/commit)."""
+        return self._scope_depth == 0
+
+    @contextlib.contextmanager
+    def commit_scope(self) -> Generator[None, None, None]:
+        """Group writes into one atomic commit; defer FTS/vec index ops.
+
+        Nested scopes join the outermost: only the outer scope commits. On
+        exception the whole transaction rolls back and deferred index ops
+        are discarded.
+        """
+        with self._lock:
+            if self._scope_depth > 0:
+                self._scope_depth += 1
+                try:
+                    yield
+                finally:
+                    self._scope_depth -= 1
+                return
+            self.conn.execute("BEGIN IMMEDIATE")
+            self._scope_depth = 1
+            try:
+                yield
+                self.conn.commit()
+                ops, self._deferred_index_ops = self._deferred_index_ops, []
+                for kind, args in ops:
+                    self._flush_index_op(kind, args)  # self-commits — fine post-commit
+            except Exception:
+                self.conn.rollback()
+                self._deferred_index_ops = []
+                raise
+            finally:
+                self._scope_depth = 0
 
     # ------------------------------------------------------------------
     # DDL / migration
     # ------------------------------------------------------------------
 
     def migrate(self) -> bool:
+        # Import lazily: the aggregation mixin shares this base and importing its
+        # package while ``_base`` is still initializing would create a cycle.
+        from .playbook._aggregation import init_playbook_aggregation_tables
+
         self._migrate_feedback_schema()
         self._migrate_interactions_schema()
         # Backfill columns that _DDL indexes depend on BEFORE running _DDL.
@@ -640,18 +910,27 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         # permanently stuck. The helper is guarded (no-ops when the table is
         # absent), so running it before _DDL is safe on fresh databases too.
         self._migrate_eval_result_user_id()
+        self._migrate_retrieved_learning_interaction_identity()
+        self._migrate_playbook_optimization_job_columns()
+        # _DDL creates an index over these columns. Upgrade legacy request tables
+        # before executescript so index creation cannot fail on missing columns.
+        self._migrate_request_retrieval_experiment()
+        self._migrate_session_outcomes_schema()
         with self._lock:
             cur = self.conn.cursor()
             cur.executescript(_DDL)
             init_governance_tables(self.conn)
+            init_playbook_aggregation_tables(self.conn)
             self.conn.commit()
         if self._has_sqlite_vec:
             self._create_vec_tables()
             self._migrate_vec_tables()
+            self._migrate_playbook_aggregation_agent_centroids()
         # Run after DDL so tables exist on fresh databases
         self._migrate_agent_runs_schema()
         self._migrate_pending_tool_calls_schema()
         self._migrate_expanded_terms()
+        self._migrate_unicode_lexical_indexes()
         self._migrate_tags()
         self._migrate_profile_source_interaction_ids()
         self._migrate_interaction_window_indexes()
@@ -666,243 +945,194 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         self._migrate_retired_at()
         self._migrate_lineage_event_table()
         self._migrate_playbook_optimization_candidate_metadata()
+        self._migrate_user_playbook_publication_staging_columns()
+        self._classify_legacy_playbook_optimization_jobs()
+        self._enforce_playbook_optimization_job_constraints()
         self._migrate_retire_profile_change_logs()
         self._migrate_retire_playbook_aggregation_change_logs()
         init_stall_state_table(self.conn)
+        self._migrate_learning_jobs()
         return True
 
-    # -- Retention hooks (see RetentionMixin) --
-
-    @handle_exceptions
-    def _retention_table_exists(self, table_name: str) -> bool:
-        row = self._fetchone(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-            (table_name,),
-        )
-        return row is not None
-
-    @handle_exceptions
-    def _retention_count_rows(self, target: RetentionTarget) -> int:
-        row = self._fetchone(f"SELECT COUNT(*) as cnt FROM {target.table_name}")  # noqa: S608
-        return int(row["cnt"]) if row else 0
-
-    @handle_exceptions
-    def _retention_select_oldest_keys(
-        self, target: RetentionTarget, count: int
-    ) -> list[tuple[Any, ...]]:
-        id_sql = ", ".join(target.id_columns)
-        tiebreak_sql = id_sql
-        rows = self._fetchall(
-            f"SELECT {id_sql} FROM {target.table_name} "  # noqa: S608
-            f"ORDER BY {target.order_column} ASC, {tiebreak_sql} ASC LIMIT ?",
-            (count,),
-        )
-        return [tuple(row[col] for col in target.id_columns) for row in rows]
-
-    @handle_exceptions
-    def _retention_perform_delete(
-        self, target: RetentionTarget, keys: list[tuple[Any, ...]]
-    ) -> None:
-        # Wrap dependency + target deletes in a single critical section so
-        # concurrent writers see either both or neither.
+    def _migrate_unicode_lexical_indexes(self) -> None:
+        """Backfill the trigger-maintained Unicode FTS sidecars exactly once."""
+        version_sentinel_rowid = -_UNICODE_LEXICAL_INDEX_VERSION
         with self._lock:
+            version_row = self.conn.execute(
+                "SELECT rowid FROM interactions_unicode_fts WHERE rowid = ?",
+                (version_sentinel_rowid,),
+            ).fetchone()
+            if version_row is not None:
+                return
+
+            self.conn.execute("BEGIN IMMEDIATE")
             try:
-                self._retention_delete_dependencies(target, keys)
-                self._retention_delete_target_rows(target, keys)
+                for index_table in (
+                    "interactions_unicode_fts",
+                    "profiles_unicode_fts",
+                    "user_playbooks_unicode_fts",
+                    "agent_playbooks_unicode_fts",
+                ):
+                    self.conn.execute(f"DELETE FROM {index_table}")  # noqa: S608
+
+                self.conn.execute(
+                    """INSERT INTO interactions_unicode_fts(rowid, search_ngrams)
+                       SELECT i.rowid, reflexio_unicode_lexical_index(
+                           COALESCE(i.content, '') || ' ' ||
+                           COALESCE(i.user_action_description, '')
+                       )
+                       FROM interactions i"""
+                )
+                self.conn.execute(
+                    """INSERT INTO profiles_unicode_fts(rowid, search_ngrams)
+                       SELECT p.rowid, reflexio_unicode_lexical_index(
+                           COALESCE(p.content, '') || ' ' ||
+                           COALESCE(p.expanded_terms, '')
+                       )
+                       FROM profiles p"""
+                )
+                self.conn.execute(
+                    """INSERT INTO user_playbooks_unicode_fts(rowid, search_ngrams)
+                       SELECT up.rowid, reflexio_unicode_lexical_index(
+                           COALESCE(up.trigger, '') || ' ' ||
+                           COALESCE(up.content, '') || ' ' ||
+                           COALESCE(up.rationale, '') || ' ' ||
+                           COALESCE(up.source, '')
+                       )
+                       FROM user_playbooks up"""
+                )
+                self.conn.execute(
+                    """INSERT INTO agent_playbooks_unicode_fts(rowid, search_ngrams)
+                       SELECT ap.rowid, reflexio_unicode_lexical_index(
+                           COALESCE(ap.trigger, '') || ' ' ||
+                           COALESCE(ap.content, '') || ' ' ||
+                           COALESCE(ap.rationale, '')
+                       )
+                       FROM agent_playbooks ap"""
+                )
+                self.conn.execute(
+                    "INSERT INTO interactions_unicode_fts(rowid, search_ngrams) "
+                    "VALUES (?, '')",
+                    (version_sentinel_rowid,),
+                )
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()
                 raise
 
-    def _retention_delete_dependencies(
-        self, target: RetentionTarget, keys: list[tuple[Any, ...]]
-    ) -> None:
-        ids = [key[0] for key in keys]
-        target_name = target.name
-        if target_name == "requests":
-            self._delete_interactions_for_request_ids([str(v) for v in ids])
-        elif target_name == "interactions":
-            self._delete_interaction_search_rows([int(v) for v in ids])
-        elif target_name == "profiles":
-            self._delete_profile_search_rows([str(v) for v in ids])
-        elif target_name == "user_playbooks":
-            self._delete_source_windows_for_user_playbook_ids([int(v) for v in ids])
-            self._delete_playbook_search_rows(
-                "user", [int(v) for v in ids], commit=False
-            )
-        elif target_name == "agent_playbooks":
-            self._delete_source_windows_for_agent_playbook_ids([int(v) for v in ids])
-            self._delete_playbook_search_rows(
-                "agent", [int(v) for v in ids], commit=False
-            )
-        elif target_name == "playbook_optimization_jobs":
-            self._delete_optimizer_rows_for_job_ids([int(v) for v in ids])
-        elif target_name == "playbook_optimization_candidates":
-            self._delete_optimizer_evaluations_for_candidate_ids([int(v) for v in ids])
-
-    def _retention_delete_target_rows(
-        self, target: RetentionTarget, keys: list[tuple[Any, ...]]
-    ) -> None:
-        if len(target.id_columns) == 1:
-            self._delete_in_chunks(
-                target.table_name,
-                target.id_columns[0],
-                [key[0] for key in keys],
-            )
-            return
-        # Composite-key delete: chunk by row to bound parameter count.
-        params_per_key = len(target.id_columns)
-        rows_per_chunk = max(1, RETENTION_DELETE_CHUNK // params_per_key)
-        for chunk in chunked(keys, rows_per_chunk):
-            where = " OR ".join(
-                "("
-                + " AND ".join(f"{column} = ?" for column in target.id_columns)
-                + ")"
-                for _ in chunk
-            )
-            params = [value for key in chunk for value in key]
-            self.conn.execute(
-                f"DELETE FROM {target.table_name} WHERE {where}",  # noqa: S608
-                params,
-            )
-
-    # -- Chunked-delete primitives shared by the cascade helpers --
-
-    def _delete_in_chunks(
-        self, table_name: str, column_name: str, values: list[Any]
-    ) -> None:
-        """Chunked ``DELETE FROM table WHERE col IN (...)``.
-
-        Chunking keeps parameter count under ``SQLITE_MAX_VARIABLE_NUMBER``
-        on older sqlite builds (default 999) and avoids degenerate plans
-        on very large IN lists.
-        """
-        if not values:
-            return
-        for chunk in chunked(values):
-            placeholders = ",".join("?" for _ in chunk)
-            self.conn.execute(
-                f"DELETE FROM {table_name} WHERE {column_name} IN ({placeholders})",  # noqa: S608
-                chunk,
-            )
-
-    def _select_in_chunks(self, sql_template: str, values: list[Any]) -> list[Any]:
-        """Run ``sql_template`` (containing ``{placeholders}``) over chunks of
-        ``values`` and aggregate the result rows."""
-        results: list[Any] = []
-        for chunk in chunked(values):
-            placeholders = ",".join("?" for _ in chunk)
-            stmt = sql_template.format(placeholders=placeholders)
-            results.extend(self.conn.execute(stmt, chunk).fetchall())
-        return results
-
-    def _delete_interactions_for_request_ids(self, request_ids: list[str]) -> None:
-        if not request_ids:
-            return
-        rows = self._select_in_chunks(
-            "SELECT interaction_id FROM interactions WHERE request_id IN ({placeholders})",
-            request_ids,
-        )
-        self._delete_interaction_search_rows(
-            [int(row["interaction_id"]) for row in rows]
-        )
-        self._delete_in_chunks("interactions", "request_id", request_ids)
-
-    def _delete_interaction_search_rows(self, interaction_ids: list[int]) -> None:
-        """Remove fts + vec index rows for the given interaction IDs.
-
-        Non-committing: participates in the caller's transaction.  Only called
-        from inside the retention atomic block (_retention_perform_delete).
-        """
-        if not interaction_ids:
-            return
-        self._delete_in_chunks("interactions_fts", "rowid", interaction_ids)
-        if self._has_sqlite_vec:
-            self._delete_in_chunks("interactions_vec", "rowid", interaction_ids)
-
-    def _delete_profile_search_rows(self, profile_ids: list[str]) -> None:
-        """Remove fts + vec index rows for the given profile IDs.
-
-        Non-committing: participates in the caller's transaction.  Only called
-        from inside the retention atomic block (_retention_perform_delete).
-        profiles_fts is keyed by profile_id (TEXT); profiles_vec by rowid (INT).
-        """
-        if not profile_ids:
-            return
-        self._delete_in_chunks("profiles_fts", "profile_id", profile_ids)
-        if self._has_sqlite_vec:
-            rows = self._select_in_chunks(
-                "SELECT rowid FROM profiles WHERE profile_id IN ({placeholders})",
-                profile_ids,
-            )
-            rowids = [row["rowid"] for row in rows]
-            if rowids:
-                self._delete_in_chunks("profiles_vec", "rowid", rowids)
-
-    def _delete_playbook_search_rows(
-        self, kind: str, ids: list[int], *, commit: bool = True
-    ) -> None:
-        """Remove fts + vec index rows for the given playbook IDs.
-
-        Args:
-            kind: ``"user"`` or ``"agent"``.
-            ids: Playbook row IDs to remove from the search indexes.
-            commit: When ``True`` (default) commits after the deletes so the
-                after-commit callers in ``_playbook.py`` get a clean, durable
-                cleanup.  Pass ``commit=False`` from inside the retention atomic
-                block so the deletes participate in the single block-level commit
-                (``_retention_perform_delete``).
-
-        Note: callers may already hold ``self._lock`` when calling this (the
-        ``commit=False`` retention/atomic-delete call sites do). The internal
-        ``with self._lock:`` re-acquire is safe ONLY because ``self._lock`` is a
-        reentrant ``threading.RLock``; a non-reentrant lock would deadlock here.
-        """
-        if not ids:
-            return
+    def _migrate_session_outcomes_schema(self) -> None:
+        """Restore the pre-identity outcome schema after downgrading #407."""
         with self._lock:
-            self._delete_in_chunks(f"{kind}_playbooks_fts", "rowid", ids)
-            if self._has_sqlite_vec:
-                self._delete_in_chunks(f"{kind}_playbooks_vec", "rowid", ids)
-            if commit:
+            table_info = self.conn.execute(
+                "PRAGMA table_info(session_outcomes)"
+            ).fetchall()
+            if not table_info:
+                return
+            expected_columns = {
+                "user_id",
+                "session_id",
+                "outcome",
+                "occurred_at",
+                "source",
+                "label",
+                "value",
+                "metadata",
+                "governance_subject_ref",
+                "created_at",
+            }
+            columns = {str(row["name"]): row for row in table_info}
+            table = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'session_outcomes'"
+            ).fetchone()
+            table_sql = str(table["sql"] or "") if table is not None else ""
+            governance_column = columns.get("governance_subject_ref")
+            has_empty_subject_default = (
+                governance_column is not None
+                and governance_column["dflt_value"] in ("''", '""')
+            )
+            identity_columns = {
+                "outcome_id",
+                "outcome_revision",
+                "outcome_contract_digest",
+                "finalized_trajectory_digest",
+            }
+            if (
+                expected_columns.issubset(columns)
+                and not identity_columns.intersection(columns)
+                and governance_column is not None
+                and int(governance_column["notnull"]) == 1
+                and not has_empty_subject_default
+                and "'unknown'" not in table_sql
+            ):
+                return
+
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                legacy_rows = self.conn.execute(
+                    "SELECT * FROM session_outcomes"
+                ).fetchall()
+                self.conn.execute(
+                    "ALTER TABLE session_outcomes RENAME TO session_outcomes_legacy"
+                )
+                self.conn.execute(
+                    """CREATE TABLE session_outcomes (
+                        user_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),
+                        occurred_at INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        label TEXT,
+                        value REAL,
+                        metadata TEXT,
+                        governance_subject_ref TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        PRIMARY KEY (user_id, session_id)
+                    )"""
+                )
+                compatible_rows = [
+                    row
+                    for row in legacy_rows
+                    if row["outcome"] in ("success", "failure")
+                ]
+                for row in compatible_rows:
+                    subject_ref = (
+                        row["governance_subject_ref"]
+                        if "governance_subject_ref" in columns
+                        else None
+                    )
+                    if subject_ref is None or not str(subject_ref).strip():
+                        subject_ref = self._subject_ref_for_user_id(str(row["user_id"]))
+                    self.conn.execute(
+                        """INSERT INTO session_outcomes (
+                               user_id, session_id, outcome, occurred_at, source,
+                               label, value, metadata, governance_subject_ref, created_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            row["user_id"],
+                            row["session_id"],
+                            row["outcome"],
+                            row["occurred_at"],
+                            row["source"],
+                            row["label"] if "label" in columns else None,
+                            row["value"] if "value" in columns else None,
+                            row["metadata"] if "metadata" in columns else None,
+                            subject_ref,
+                            row["created_at"],
+                        ),
+                    )
+                dropped_unknown = len(legacy_rows) - len(compatible_rows)
+                if dropped_unknown:
+                    logger.warning(
+                        "Dropped %d unrepresentable 'unknown' session outcomes while "
+                        "restoring the pre-#407 schema",
+                        dropped_unknown,
+                    )
+                self.conn.execute("DROP TABLE session_outcomes_legacy")
                 self.conn.commit()
-
-    def _delete_source_windows_for_agent_playbook_ids(
-        self, agent_playbook_ids: list[int]
-    ) -> None:
-        self._delete_in_chunks(
-            "agent_playbook_source_user_playbooks",
-            "agent_playbook_id",
-            agent_playbook_ids,
-        )
-
-    def _delete_source_windows_for_user_playbook_ids(
-        self, user_playbook_ids: list[int]
-    ) -> None:
-        self._delete_in_chunks(
-            "agent_playbook_source_user_playbooks",
-            "user_playbook_id",
-            user_playbook_ids,
-        )
-
-    def _delete_optimizer_rows_for_job_ids(self, job_ids: list[int]) -> None:
-        if not job_ids:
-            return
-        for table in (
-            "playbook_optimization_evaluations",
-            "playbook_optimization_events",
-            "playbook_optimization_candidates",
-        ):
-            self._delete_in_chunks(table, "job_id", job_ids)
-
-    def _delete_optimizer_evaluations_for_candidate_ids(
-        self, candidate_ids: list[int]
-    ) -> None:
-        self._delete_in_chunks(
-            "playbook_optimization_evaluations",
-            "candidate_id",
-            candidate_ids,
-        )
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def _try_load_sqlite_vec(self) -> bool:
         """Attempt to load the sqlite-vec extension for native KNN search.
@@ -941,9 +1171,50 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             CREATE VIRTUAL TABLE IF NOT EXISTS agent_playbooks_vec USING vec0(
                 embedding float[{dim}]
             );
+            CREATE VIRTUAL TABLE IF NOT EXISTS playbook_aggregation_clusters_vec USING vec0(
+                embedding float[{dim}] distance_metric=cosine
+            );
         """
         with self._lock:
             self.conn.executescript(vec_ddl)
+            self.conn.commit()
+
+    def _migrate_playbook_aggregation_agent_centroids(self) -> None:
+        """Replace legacy user-vector means with canonical agent embeddings."""
+        rows = self.conn.execute(
+            "SELECT c.cluster_id, c.index_rowid, a.embedding "
+            "FROM playbook_aggregation_cluster c JOIN agent_playbooks a "
+            "ON a.agent_playbook_id=c.agent_playbook_id "
+            "WHERE c.vector_sum IS NOT NULL AND c.index_rowid IS NOT NULL "
+            "AND a.embedding IS NOT NULL "
+            "AND trim(a.embedding) NOT IN ('', '[]')"
+        ).fetchall()
+        with self._lock:
+            for row in rows:
+                try:
+                    embedding = json.loads(row[2])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (
+                    not isinstance(embedding, list)
+                    or len(embedding) != self.embedding_dimensions
+                    or not all(isinstance(value, int | float) for value in embedding)
+                ):
+                    continue
+                self.conn.execute(
+                    "UPDATE playbook_aggregation_cluster SET centroid=?, "
+                    "vector_sum=NULL, embedding_dimension=? WHERE cluster_id=?",
+                    (json.dumps(embedding), len(embedding), str(row[0])),
+                )
+                self.conn.execute(
+                    "DELETE FROM playbook_aggregation_clusters_vec WHERE rowid=?",
+                    (int(row[1]),),
+                )
+                self.conn.execute(
+                    "INSERT INTO playbook_aggregation_clusters_vec(rowid, embedding) "
+                    "VALUES (?, ?)",
+                    (int(row[1]), json.dumps(embedding)),
+                )
             self.conn.commit()
 
     def _migrate_vec_tables(self) -> None:
@@ -994,6 +1265,22 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             with self._lock:
                 self.conn.execute(
                     "ALTER TABLE interactions ADD COLUMN image_encoding TEXT NOT NULL DEFAULT ''"
+                )
+                self.conn.commit()
+
+        if "retrieved_learnings" not in columns:
+            logger.info("Adding retrieved_learnings column to interactions table.")
+            with self._lock:
+                self.conn.execute(
+                    "ALTER TABLE interactions ADD COLUMN retrieved_learnings TEXT"
+                )
+                self.conn.commit()
+
+        if "token_count" not in columns:
+            logger.info("Adding token_count column to interactions table.")
+            with self._lock:
+                self.conn.execute(
+                    "ALTER TABLE interactions ADD COLUMN token_count INTEGER"
                 )
                 self.conn.commit()
 
@@ -1161,7 +1448,12 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
 
     def _migrate_tags(self) -> None:
         """Add tags column if missing."""
-        for table in ("profiles", "user_playbooks", "agent_playbooks"):
+        for table in (
+            "profiles",
+            "user_playbooks",
+            "agent_playbooks",
+            "agent_success_evaluation_result",
+        ):
             cols = {
                 row["name"]
                 for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -1326,6 +1618,8 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                     request_id       TEXT NOT NULL DEFAULT '',
                     reason           TEXT NOT NULL DEFAULT '',
                     created_at       INTEGER NOT NULL,
+                    model_name       TEXT,
+                    provider         TEXT,
                     UNIQUE (org_id, entity_type, entity_id, op, request_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_lineage_entity
@@ -1337,7 +1631,13 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                     "PRAGMA table_info(lineage_event)"
                 ).fetchall()
             }
-            for col in ("from_status", "to_status", "status_namespace"):
+            for col in (
+                "from_status",
+                "to_status",
+                "status_namespace",
+                "model_name",
+                "provider",
+            ):
                 if col not in existing_cols:
                     self.conn.execute(
                         f"ALTER TABLE lineage_event ADD COLUMN {col} TEXT"  # noqa: S608
@@ -1364,6 +1664,367 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                 "Added metadata_json column to playbook_optimization_candidates"
             )
         self.conn.commit()
+
+    def _migrate_playbook_optimization_job_columns(self) -> None:
+        """Add durable optimizer identity, lease, stage, and digest columns."""
+        existing_cols = {
+            row["name"]
+            for row in self.conn.execute(
+                "PRAGMA table_info(playbook_optimization_jobs)"
+            ).fetchall()
+        }
+        if not existing_cols:
+            return
+        columns = {
+            "optimizer_kind": "TEXT",
+            "discovery_key": "TEXT",
+            "attempt_key": "TEXT",
+            "lease_owner": "TEXT",
+            "lease_fence": "INTEGER NOT NULL DEFAULT 0",
+            "lease_expires_at": "INTEGER",
+            "stage": "TEXT",
+            "terminal_outcome": "TEXT",
+            "expected_population_manifest_digest": "TEXT",
+            "generation_selection_manifest_digest": "TEXT",
+            "replay_manifest_digest": "TEXT",
+            "candidate_content_digest": "TEXT",
+            "search_projection_digest": "TEXT",
+            "publication_scope_digest": "TEXT",
+        }
+        for column, definition in columns.items():
+            if column not in existing_cols:
+                self.conn.execute(
+                    f"ALTER TABLE playbook_optimization_jobs "
+                    f"ADD COLUMN {column} {definition}"  # noqa: S608
+                )
+        self.conn.commit()
+
+    def _migrate_user_playbook_publication_staging_columns(self) -> None:
+        """Add frozen incumbent CAS fields to legacy publication staging."""
+        existing_cols = {
+            row["name"]
+            for row in self.conn.execute(
+                "PRAGMA table_info(user_playbook_publication_staging)"
+            ).fetchall()
+        }
+        if not existing_cols:
+            return
+        columns = {
+            "incumbent_content_digest": "TEXT",
+            "incumbent_trigger": "TEXT",
+            "incumbent_semantic_digest": "TEXT",
+        }
+        for column, definition in columns.items():
+            if column not in existing_cols:
+                self.conn.execute(
+                    "ALTER TABLE user_playbook_publication_staging "
+                    f"ADD COLUMN {column} {definition}"  # noqa: S608
+                )
+        self.conn.commit()
+
+    def _classify_legacy_playbook_optimization_jobs(self) -> None:
+        """Classify legacy optimizer history without choosing ambiguous rule order."""
+        columns = {
+            row["name"]
+            for row in self.conn.execute(
+                "PRAGMA table_info(playbook_optimization_jobs)"
+            ).fetchall()
+        }
+        if "optimizer_kind" not in columns:
+            return
+        for index_name in (
+            "uq_poj_active_discovery",
+            "uq_poj_active_attempt",
+            "uq_poj_active_target",
+        ):
+            self.conn.execute(f"DROP INDEX IF EXISTS {index_name}")  # noqa: S608
+        self.conn.execute(
+            """
+            WITH signatures AS (
+                SELECT
+                    jobs.job_id,
+                    (
+                        EXISTS (
+                            SELECT 1
+                            FROM playbook_optimization_events AS events
+                            WHERE events.job_id = jobs.job_id
+                              AND events.event_type LIKE 'offline_tuner_%'
+                        )
+                        OR (
+                            json_valid(jobs.metadata_json)
+                            AND json_type(jobs.metadata_json, '$.offline_tuner')
+                                IS NOT NULL
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM playbook_optimization_candidates AS candidates
+                            WHERE candidates.job_id = jobs.job_id
+                              AND json_valid(candidates.metadata_json)
+                              AND (
+                                  json_type(
+                                      candidates.metadata_json,
+                                      '$.offline_tuner_metrics'
+                                  ) IS NOT NULL
+                                  OR json_type(
+                                      candidates.metadata_json,
+                                      '$.rollback_baseline'
+                                  ) IS NOT NULL
+                                  OR json_type(
+                                      candidates.metadata_json,
+                                      '$.frozen_selection_set'
+                                  ) IS NOT NULL
+                                  OR json_type(
+                                      candidates.metadata_json,
+                                      '$.proposed_edit'
+                                  ) IS NOT NULL
+                              )
+                        )
+                    ) AS tuner_signature,
+                    (
+                        json_valid(jobs.metadata_json)
+                        AND json_type(jobs.metadata_json, '$.source_window_count')
+                            IS NOT NULL
+                        AND json_type(jobs.metadata_json, '$.train_window_count')
+                            IS NOT NULL
+                        AND json_type(
+                            jobs.metadata_json,
+                            '$.validation_window_count'
+                        ) IS NOT NULL
+                    ) AS gepa_signature
+                FROM playbook_optimization_jobs AS jobs
+                WHERE jobs.optimizer_kind IS NULL
+            )
+            UPDATE playbook_optimization_jobs
+            SET optimizer_kind = CASE
+                WHEN tuner_signature AND NOT gepa_signature
+                    THEN 'offline_tuner_legacy'
+                WHEN gepa_signature AND NOT tuner_signature THEN 'gepa'
+                ELSE 'optimizer_legacy_unknown'
+            END
+            FROM signatures
+            WHERE playbook_optimization_jobs.job_id = signatures.job_id
+            """
+        )
+        self.conn.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    job_id,
+                    row_number() OVER (
+                        PARTITION BY optimizer_kind, target_kind, target_id
+                        ORDER BY created_at, job_id
+                    ) AS target_rank,
+                    CASE WHEN discovery_key IS NOT NULL THEN row_number() OVER (
+                        PARTITION BY optimizer_kind, discovery_key
+                        ORDER BY created_at, job_id
+                    ) END AS discovery_rank,
+                    CASE WHEN attempt_key IS NOT NULL THEN row_number() OVER (
+                        PARTITION BY optimizer_kind, attempt_key
+                        ORDER BY created_at, job_id
+                    ) END AS attempt_rank
+                FROM playbook_optimization_jobs
+                WHERE status IN ('pending', 'running')
+            )
+            UPDATE playbook_optimization_jobs
+            SET status = 'skipped',
+                decision_reason = 'retired_duplicate_legacy_active_job',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE job_id IN (
+                SELECT job_id
+                FROM ranked
+                WHERE target_rank > 1
+                   OR discovery_rank > 1
+                   OR attempt_rank > 1
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            UPDATE playbook_optimization_jobs
+            SET status = 'skipped',
+                decision_reason = 'retired_by_replay_redesign',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE optimizer_kind IN (
+                    'offline_tuner_legacy',
+                    'optimizer_legacy_unknown'
+                )
+              AND status IN ('pending', 'running')
+            """
+        )
+        self.conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_poj_active_discovery
+               ON playbook_optimization_jobs(optimizer_kind, discovery_key)
+               WHERE status IN ('pending', 'running')
+                 AND discovery_key IS NOT NULL"""
+        )
+        self.conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_poj_active_attempt
+               ON playbook_optimization_jobs(optimizer_kind, attempt_key)
+               WHERE status IN ('pending', 'running')
+                 AND attempt_key IS NOT NULL"""
+        )
+        self.conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_poj_active_target
+               ON playbook_optimization_jobs(optimizer_kind, target_kind, target_id)
+               WHERE status IN ('pending', 'running')"""
+        )
+        self.conn.commit()
+
+    def _enforce_playbook_optimization_job_constraints(self) -> None:
+        """Rebuild upgraded optimizer tables so legacy values receive fresh checks."""
+        table_sql_row = self.conn.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type = 'table' AND name = 'playbook_optimization_jobs'"""
+        ).fetchone()
+        if table_sql_row is None:
+            return
+        table_sql = table_sql_row["sql"]
+        required_checks = (
+            "CHECK (optimizer_kind IN",
+            "CHECK (stage IS NULL OR stage IN",
+            "CHECK (terminal_outcome IS NULL OR terminal_outcome IN",
+            "'governance_erased'",
+        )
+        if all(check in table_sql for check in required_checks):
+            return
+        foreign_keys_enabled = bool(
+            self.conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        )
+        self.conn.commit()
+        if foreign_keys_enabled:
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute("DROP TABLE IF EXISTS playbook_optimization_jobs_new")
+            self.conn.execute(
+                """
+            CREATE TABLE playbook_optimization_jobs_new (
+                job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                optimizer_kind TEXT NOT NULL DEFAULT 'optimizer_legacy_unknown'
+                    CHECK (optimizer_kind IN (
+                        'gepa',
+                        'offline_tuner_replay',
+                        'offline_tuner_legacy',
+                        'optimizer_legacy_unknown'
+                    )),
+                target_kind TEXT NOT NULL,
+                target_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                best_candidate_id INTEGER,
+                successor_target_id INTEGER,
+                decision_reason TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                discovery_key TEXT,
+                attempt_key TEXT,
+                lease_owner TEXT,
+                lease_fence INTEGER NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+                lease_expires_at INTEGER,
+                stage TEXT CHECK (stage IS NULL OR stage IN (
+                    'evidence_frozen',
+                    'candidate_generated',
+                    'replay_running',
+                    'replay_evaluated',
+                    'publishing',
+                    'applied',
+                    'abstained',
+                    'failed'
+                )),
+                terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN (
+                    'applied',
+                    'insufficient_negative_evidence',
+                    'insufficient_positive_evidence',
+                    'insufficient_coverage',
+                    'replay_unsupported',
+                    'deployment_unsupported',
+                    'incomplete_replay_scope',
+                    'insufficient_replay_cases',
+                    'replay_inconclusive',
+                    'candidate_regressed',
+                    'candidate_did_not_improve',
+                    'incumbent_changed',
+                    'generation_failed',
+                    'replay_failed',
+                    'publication_failed',
+                    'governance_erased'
+                )),
+                expected_population_manifest_digest TEXT,
+                generation_selection_manifest_digest TEXT,
+                replay_manifest_digest TEXT,
+                candidate_content_digest TEXT,
+                search_projection_digest TEXT,
+                publication_scope_digest TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+            )
+            self.conn.execute(
+                """
+            INSERT INTO playbook_optimization_jobs_new (
+                job_id, optimizer_kind, target_kind, target_id, status,
+                best_candidate_id, successor_target_id, decision_reason,
+                metadata_json, discovery_key, attempt_key, lease_owner,
+                lease_fence, lease_expires_at, stage, terminal_outcome,
+                expected_population_manifest_digest,
+                generation_selection_manifest_digest, replay_manifest_digest,
+                candidate_content_digest, search_projection_digest,
+                publication_scope_digest, created_at, updated_at
+            ) SELECT
+                job_id, optimizer_kind, target_kind, target_id, status,
+                best_candidate_id, successor_target_id, decision_reason,
+                metadata_json, discovery_key, attempt_key, lease_owner,
+                lease_fence, lease_expires_at, stage, terminal_outcome,
+                expected_population_manifest_digest,
+                generation_selection_manifest_digest, replay_manifest_digest,
+                candidate_content_digest, search_projection_digest,
+                publication_scope_digest, created_at, updated_at
+            FROM playbook_optimization_jobs;
+            """
+            )
+            self.conn.execute("DROP TABLE playbook_optimization_jobs")
+            self.conn.execute(
+                "ALTER TABLE playbook_optimization_jobs_new "
+                "RENAME TO playbook_optimization_jobs"
+            )
+            self.conn.execute(
+                "CREATE INDEX idx_poj_target "
+                "ON playbook_optimization_jobs(target_kind, target_id)"
+            )
+            self.conn.execute(
+                "CREATE INDEX idx_poj_status ON playbook_optimization_jobs(status)"
+            )
+            self.conn.execute(
+                """CREATE UNIQUE INDEX uq_poj_active_discovery
+                ON playbook_optimization_jobs(optimizer_kind, discovery_key)
+                WHERE status IN ('pending', 'running') AND discovery_key IS NOT NULL"""
+            )
+            self.conn.execute(
+                """CREATE UNIQUE INDEX uq_poj_active_attempt
+                ON playbook_optimization_jobs(optimizer_kind, attempt_key)
+                WHERE status IN ('pending', 'running') AND attempt_key IS NOT NULL"""
+            )
+            self.conn.execute(
+                """CREATE UNIQUE INDEX uq_poj_active_target
+                ON playbook_optimization_jobs(optimizer_kind, target_kind, target_id)
+                WHERE status IN ('pending', 'running')"""
+            )
+            violations = self.conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(
+                    f"foreign key check failed after optimizer migration: {violations}"
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            self.conn.execute(
+                f"PRAGMA foreign_keys={'ON' if foreign_keys_enabled else 'OFF'}"
+            )
 
     def _migrate_retire_profile_change_logs(self) -> None:
         """Retire the frozen ``profile_change_logs`` table via a reversible RENAME.
@@ -1449,6 +2110,70 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             )
             self.conn.commit()
 
+    def _migrate_learning_jobs(self) -> None:
+        """Create the learning_jobs table + partial indexes if missing (idempotent).
+
+        Runs ``CREATE TABLE IF NOT EXISTS`` and ``CREATE INDEX IF NOT EXISTS`` only —
+        both are no-ops when the table / indexes already exist.  New columns added in
+        subsequent tasks are backfilled via ``PRAGMA table_info`` + ``ALTER TABLE … ADD
+        COLUMN`` (mirroring ``_migrate_lineage_event_table``), because
+        ``CREATE TABLE IF NOT EXISTS`` silently skips the DDL on existing databases.
+
+        Called at the end of migrate() so the table is always present on startup.
+        """
+        with self._lock:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS learning_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    job_type TEXT NOT NULL DEFAULT 'learning',
+                    latest_request_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    claimed_by TEXT,
+                    claim_token TEXT,
+                    claim_expires_at TEXT,
+                    covers_through TEXT,
+                    force_extraction INTEGER NOT NULL DEFAULT 0,
+                    skip_aggregation INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS learning_jobs_coalesce
+                    ON learning_jobs (org_id, user_id, job_type) WHERE status = 'pending';
+                -- Recreate the poll index with 'failed' in the predicate. CREATE
+                -- INDEX IF NOT EXISTS is a no-op on an existing index with the old
+                -- ('pending','claimed') predicate, so DROP first to migrate it.
+                DROP INDEX IF EXISTS learning_jobs_poll;
+                CREATE INDEX IF NOT EXISTS learning_jobs_poll
+                    ON learning_jobs (created_at) WHERE status IN ('pending','failed','claimed');
+            """)
+            # Backfill columns added after the initial release (existing DBs skip
+            # CREATE TABLE IF NOT EXISTS so these must be applied separately).
+            existing_cols = {
+                row["name"]
+                for row in self.conn.execute(
+                    "PRAGMA table_info(learning_jobs)"
+                ).fetchall()
+            }
+            if "force_extraction" not in existing_cols:
+                self.conn.execute(
+                    "ALTER TABLE learning_jobs ADD COLUMN force_extraction INTEGER NOT NULL DEFAULT 0"
+                )
+            if "skip_aggregation" not in existing_cols:
+                self.conn.execute(
+                    "ALTER TABLE learning_jobs ADD COLUMN skip_aggregation INTEGER NOT NULL DEFAULT 0"
+                )
+            self.conn.commit()
+
+    def learning_jobs_columns(self) -> list[str]:
+        """Return the column names of the learning_jobs table."""
+        with self._lock:
+            rows = self.conn.execute("PRAGMA table_info(learning_jobs)").fetchall()
+        return [row["name"] for row in rows]
+
     def _migrate_agent_playbook_source_windows(self) -> None:
         """Add source window snapshots to existing agent source mappings."""
         cols = {
@@ -1489,6 +2214,28 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             logger.info("Added evaluation_only column to requests")
         self.conn.commit()
 
+    def _migrate_request_retrieval_experiment(self) -> None:
+        """Add nullable retrieval experiment attribution to existing requests."""
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(requests)").fetchall()
+        }
+        if not cols:
+            return
+        if "retrieval_experiment_id" not in cols:
+            self.conn.execute(
+                "ALTER TABLE requests ADD COLUMN retrieval_experiment_id TEXT"
+            )
+        if "retrieval_experiment_arm" not in cols:
+            self.conn.execute(
+                "ALTER TABLE requests ADD COLUMN retrieval_experiment_arm TEXT"
+            )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_requests_retrieval_experiment "
+            "ON requests(retrieval_experiment_id, user_id, session_id, created_at, request_id)"
+        )
+        self.conn.commit()
+
     def _migrate_request_session_id_required(self) -> None:
         """Require non-empty session ids on ``requests``.
 
@@ -1521,6 +2268,12 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         evaluation_only_expr = (
             "COALESCE(evaluation_only, 0)" if "evaluation_only" in cols else "0"
         )
+        retrieval_experiment_id_expr = (
+            "retrieval_experiment_id" if "retrieval_experiment_id" in cols else "NULL"
+        )
+        retrieval_experiment_arm_expr = (
+            "retrieval_experiment_arm" if "retrieval_experiment_arm" in cols else "NULL"
+        )
         # NOTE: this rebuild hardcodes the full `requests` column set. If a
         # future migration adds a column to `requests`, it MUST be added here
         # too (and to the SELECT below) or the rebuild will silently drop it.
@@ -1533,7 +2286,9 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                 source TEXT NOT NULL DEFAULT '',
                 agent_version TEXT NOT NULL DEFAULT '',
                 session_id TEXT NOT NULL CHECK (trim(session_id) != ''),
-                evaluation_only INTEGER NOT NULL DEFAULT 0
+                evaluation_only INTEGER NOT NULL DEFAULT 0,
+                retrieval_experiment_id TEXT,
+                retrieval_experiment_arm TEXT
             );
             INSERT INTO requests_new
                 (
@@ -1543,7 +2298,9 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                     source,
                     agent_version,
                     session_id,
-                    evaluation_only
+                    evaluation_only,
+                    retrieval_experiment_id,
+                    retrieval_experiment_arm
                 )
             SELECT
                 request_id,
@@ -1556,13 +2313,17 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                     THEN 'legacy-' || lower(hex(randomblob(16)))
                     ELSE trim(session_id)
                 END,
-                {evaluation_only_expr}
+                {evaluation_only_expr},
+                {retrieval_experiment_id_expr},
+                {retrieval_experiment_arm_expr}
             FROM requests;
             DROP TABLE requests;
             ALTER TABLE requests_new RENAME TO requests;
             CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id);
             CREATE INDEX IF NOT EXISTS idx_requests_session_id ON requests(session_id);
             CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
+            CREATE INDEX IF NOT EXISTS idx_requests_retrieval_experiment
+                ON requests(retrieval_experiment_id, user_id, session_id, created_at, request_id);
             """
         )
         self.conn.commit()
@@ -1630,6 +2391,72 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
         self.conn.commit()
         logger.info("Created shadow_comparison_verdicts table (F1 migration)")
 
+    def _migrate_retrieved_learning_interaction_identity(self) -> None:
+        """Rebuild legacy session-learning verdicts for occurrence identity.
+
+        Existing rows are preserved with nullable interaction fields. Fresh
+        evaluator runs replace a session snapshot with fully attributed rows.
+        """
+        columns = {
+            row["name"]
+            for row in self.conn.execute(
+                "PRAGMA table_info(retrieved_learning_evaluation)"
+            ).fetchall()
+        }
+        if not columns or {
+            "interaction_id",
+            "interaction_created_at",
+        }.issubset(columns):
+            return
+        self.conn.executescript("""
+            CREATE TABLE retrieved_learning_evaluation_new (
+                result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                agent_version TEXT NOT NULL DEFAULT '',
+                interaction_id INTEGER,
+                interaction_created_at INTEGER,
+                kind TEXT NOT NULL,
+                learning_id TEXT NOT NULL,
+                is_relevant INTEGER,
+                relevance_reason TEXT NOT NULL DEFAULT '',
+                impact TEXT,
+                impact_reason TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                governance_subject_ref TEXT,
+                UNIQUE (
+                    user_id, session_id, interaction_id, kind, learning_id
+                )
+            );
+            INSERT INTO retrieved_learning_evaluation_new (
+                result_id, user_id, session_id, agent_version, kind,
+                learning_id, is_relevant, relevance_reason, impact,
+                impact_reason, created_at, governance_subject_ref
+            )
+            SELECT
+                result_id, user_id, session_id, agent_version, kind,
+                learning_id, is_relevant, relevance_reason, impact,
+                impact_reason, created_at, governance_subject_ref
+            FROM retrieved_learning_evaluation;
+            DROP TABLE retrieved_learning_evaluation;
+            ALTER TABLE retrieved_learning_evaluation_new
+                RENAME TO retrieved_learning_evaluation;
+            CREATE INDEX IF NOT EXISTS idx_rle_created_at_result_id
+                ON retrieved_learning_evaluation(created_at DESC, result_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_rle_interaction_created_at
+                ON retrieved_learning_evaluation(
+                    interaction_created_at DESC, interaction_id DESC, result_id DESC
+                );
+            CREATE INDEX IF NOT EXISTS idx_rle_session_id
+                ON retrieved_learning_evaluation(session_id);
+            CREATE INDEX IF NOT EXISTS idx_rle_subject_ref
+                ON retrieved_learning_evaluation(governance_subject_ref);
+        """)
+        self.conn.commit()
+        logger.info(
+            "Migrated retrieved-learning verdicts to interaction occurrence identity"
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -1639,7 +2466,8 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
     ) -> sqlite3.Cursor:
         with self._lock:
             cur = self.conn.execute(sql, params)
-            self.conn.commit()
+            if self._own_transaction():
+                self.conn.commit()
             return cur
 
     def _fetchone(
@@ -1657,21 +2485,25 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
     def _get_embedding(
         self, text: str, purpose: Literal["document", "query"] = "document"
     ) -> list[float]:
-        """Generate an embedding with a purpose-specific prefix.
+        """Generate an embedding with model-specific input formatting.
 
         Args:
             text: The text to embed.
             purpose: Either ``"document"`` (stored embeddings) or ``"query"``
-                (search-time embeddings).  The prefix improves asymmetric
-                retrieval quality for models that support it.
+                (search-time embeddings).
 
         Returns:
             The embedding vector as a list of floats.
         """
-        prefix = "search_document: " if purpose == "document" else "search_query: "
         try:
             return self.llm_client.get_embedding(
-                prefix + text, self.embedding_model_name, self.embedding_dimensions
+                embedding_input(
+                    text,
+                    model_name=self.embedding_model_name,
+                    purpose=purpose,
+                ),
+                self.embedding_model_name,
+                self.embedding_dimensions,
             )
         except EmbeddingUnavailableError as exc:
             logger.warning(
@@ -1707,6 +2539,7 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             expander = DocumentExpander(
                 llm_client=self.llm_client,
                 prompt_manager=PromptManager(),
+                model_name=self._expansion_model_name,
             )
             result = expander.expand(content)
             return result.expanded_text or None
@@ -1716,113 +2549,6 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
 
     def _current_timestamp(self) -> str:
         return datetime.now(UTC).isoformat()
-
-    # FTS helpers
-    def _fts_upsert(self, table: str, rowid: int, **text_fields: str | None) -> None:
-        """Insert or update an FTS row.  Deletes old entry first to avoid duplicates."""
-        with self._lock:
-            self.conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
-            cols = list(text_fields.keys())
-            vals = [text_fields[c] or "" for c in cols]
-            placeholders = ",".join("?" for _ in cols)
-            col_str = ",".join(cols)
-            self.conn.execute(
-                f"INSERT INTO {table}(rowid, {col_str}) VALUES (?, {placeholders})",
-                [rowid, *vals],
-            )
-            self.conn.commit()
-
-    def _fts_delete(self, table: str, rowid: int) -> None:
-        with self._lock:
-            self.conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
-            self.conn.commit()
-
-    def _fts_upsert_profile(self, profile_id: str, content: str) -> None:
-        """FTS for profiles uses profile_id TEXT as key column."""
-        with self._lock:
-            self.conn.execute(
-                "DELETE FROM profiles_fts WHERE profile_id = ?", (profile_id,)
-            )
-            self.conn.execute(
-                "INSERT INTO profiles_fts(profile_id, content) VALUES (?, ?)",
-                (profile_id, content),
-            )
-            self.conn.commit()
-
-    def _fts_delete_profile(self, profile_id: str) -> None:
-        with self._lock:
-            self.conn.execute(
-                "DELETE FROM profiles_fts WHERE profile_id = ?", (profile_id,)
-            )
-            self.conn.commit()
-
-    # Vec helpers (sqlite-vec)
-    def _vec_upsert(self, table: str, rowid: int, embedding: list[float]) -> None:
-        """Insert or update a vec table row. No-op when sqlite-vec is unavailable."""
-        if not self._has_sqlite_vec:
-            return
-        with self._lock:
-            self.conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
-            self.conn.execute(
-                f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)",
-                (rowid, json.dumps(embedding)),
-            )
-            self.conn.commit()
-
-    def _vec_delete(self, table: str, rowid: int) -> None:
-        """Delete a vec table row. No-op when sqlite-vec is unavailable."""
-        if not self._has_sqlite_vec:
-            return
-        with self._lock:
-            self.conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
-            self.conn.commit()
-
-    def _vec_knn_search(
-        self,
-        vec_table: str,
-        main_table: str,
-        query_embedding: list[float],
-        match_count: int,
-        conditions: list[str] | None = None,
-        params: list[Any] | None = None,
-    ) -> list[sqlite3.Row]:
-        """Run a native KNN search via sqlite-vec and join back to the main table.
-
-        Over-fetches from the KNN index (5x ``match_count``) so that post-filter
-        WHERE conditions (org, user, status, etc.) don't silently reduce the
-        result set below the requested count.
-
-        Args:
-            vec_table: Name of the vec0 virtual table.
-            main_table: Name of the main data table.
-            query_embedding: Query embedding vector.
-            match_count: Number of results to return.
-            conditions: Optional WHERE conditions for the main table.
-            params: Parameters for the conditions.
-
-        Returns:
-            Up to ``match_count`` rows from the main table, ordered by vector
-            distance (ascending).
-        """
-        knn_overfetch = match_count * 5
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-        sql = f"""SELECT m.* FROM {main_table} m
-                  JOIN (
-                      SELECT rowid, distance FROM {vec_table}
-                      WHERE embedding MATCH ?
-                      ORDER BY distance
-                      LIMIT ?
-                  ) v ON m.rowid = v.rowid
-                  WHERE {where_clause}
-                  ORDER BY v.distance
-                  LIMIT ?"""
-        all_params = [
-            json.dumps(query_embedding),
-            knn_overfetch,
-            *(params or []),
-            match_count,
-        ]
-        return self._fetchall(sql, all_params)
 
     # ------------------------------------------------------------------
     # Per-user data clear
@@ -1864,8 +2590,8 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             user_id (str): The user id whose rows should be deleted.
 
         Returns:
-            dict[str, int]: Per-entity counts with keys ``interactions``,
-                ``user_playbooks``, ``profiles``, ``requests``,
+            dict[str, int]: Per-entity counts with keys ``session_outcomes``,
+                ``interactions``, ``user_playbooks``, ``profiles``, ``requests``,
                 ``purged_profiles``, and ``purged_user_playbooks``.
                 ``profiles`` and ``user_playbooks`` reflect hard-deleted counts;
                 purged rows are counted separately.
@@ -1892,6 +2618,7 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                 "SELECT rowid, profile_id FROM profiles WHERE user_id = ?",
                 (user_id,),
             ).fetchall()
+            subject_ref = self._subject_ref_for_user_id(user_id)
 
             # Build a rowid lookup for FTS/vec cleanup (SQLite-specific need).
             profile_rowid_by_id: dict[str, int] = {
@@ -1941,6 +2668,11 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
             interactions_cur = self.conn.execute(
                 "DELETE FROM interactions WHERE user_id = ?", (user_id,)
             )
+            session_outcomes_cur = self.conn.execute(
+                """DELETE FROM session_outcomes
+                   WHERE user_id = ? OR governance_subject_ref = ?""",
+                (user_id, subject_ref),
+            )
             requests_cur = self.conn.execute(
                 "DELETE FROM requests WHERE user_id = ?", (user_id,)
             )
@@ -1976,6 +2708,7 @@ class SQLiteStorageBase(RetentionMixin, BaseStorage):
                 self.purge_content(entity_type="user_playbook", entity_id=str(upid))
 
         return {
+            "session_outcomes": session_outcomes_cur.rowcount,
             "interactions": interactions_cur.rowcount,
             "user_playbooks": upb_deleted_count,
             "profiles": profile_deleted_count,
@@ -2024,6 +2757,7 @@ CREATE TABLE IF NOT EXISTS interactions (
     request_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'User',
+    token_count INTEGER,
     user_action TEXT NOT NULL DEFAULT 'none',
     user_action_description TEXT NOT NULL DEFAULT '',
     interacted_image_url TEXT NOT NULL DEFAULT '',
@@ -2032,6 +2766,7 @@ CREATE TABLE IF NOT EXISTS interactions (
     expert_content TEXT NOT NULL DEFAULT '',
     tools_used TEXT,
     citations TEXT,
+    retrieved_learnings TEXT,
     embedding TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_interactions_user_id ON interactions(user_id);
@@ -2047,13 +2782,41 @@ CREATE TABLE IF NOT EXISTS requests (
     source TEXT NOT NULL DEFAULT '',
     agent_version TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL CHECK (trim(session_id) != ''),
-    evaluation_only INTEGER NOT NULL DEFAULT 0
+    evaluation_only INTEGER NOT NULL DEFAULT 0,
+    retrieval_experiment_id TEXT,
+    retrieval_experiment_arm TEXT,
+    CHECK (
+        (retrieval_experiment_id IS NULL AND retrieval_experiment_arm IS NULL)
+        OR
+        (retrieval_experiment_id IS NOT NULL AND retrieval_experiment_arm IN ('treatment', 'holdout'))
+    )
 );
 CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id);
 CREATE INDEX IF NOT EXISTS idx_requests_session_id ON requests(session_id);
 CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_session_created_at_asc
     ON requests(session_id, created_at ASC, request_id ASC);
+CREATE INDEX IF NOT EXISTS idx_requests_retrieval_experiment
+    ON requests(retrieval_experiment_id, user_id, session_id, created_at, request_id);
+
+CREATE TABLE IF NOT EXISTS session_outcomes (
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),
+    occurred_at INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    label TEXT,
+    value REAL,
+    metadata TEXT,
+    governance_subject_ref TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_session_outcomes_occurred_at ON session_outcomes(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_session_outcomes_session_id ON session_outcomes(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_outcomes_source_outcome ON session_outcomes(source, outcome);
+CREATE INDEX IF NOT EXISTS idx_session_outcomes_label ON session_outcomes(label);
+CREATE INDEX IF NOT EXISTS idx_session_outcomes_subject_ref ON session_outcomes(governance_subject_ref);
 
 CREATE TABLE IF NOT EXISTS user_playbooks (
     user_playbook_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2122,6 +2885,7 @@ CREATE TABLE IF NOT EXISTS agent_success_evaluation_result (
     number_of_correction_per_session INTEGER NOT NULL DEFAULT 0,
     user_turns_to_resolution INTEGER,
     is_escalated INTEGER NOT NULL DEFAULT 0,
+    tags TEXT,
     embedding TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eval_agent_version ON agent_success_evaluation_result(agent_version);
@@ -2132,6 +2896,34 @@ CREATE INDEX IF NOT EXISTS idx_eval_agent_version_created_at_desc
     ON agent_success_evaluation_result(agent_version, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_eval_identity_created_at_desc
     ON agent_success_evaluation_result(user_id, session_id, evaluation_name, agent_version, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS retrieved_learning_evaluation (
+    result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    agent_version TEXT NOT NULL DEFAULT '',
+    interaction_id INTEGER,
+    interaction_created_at INTEGER,
+    kind TEXT NOT NULL,
+    learning_id TEXT NOT NULL,
+    is_relevant INTEGER,
+    relevance_reason TEXT NOT NULL DEFAULT '',
+    impact TEXT,
+    impact_reason TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    governance_subject_ref TEXT,
+    UNIQUE (user_id, session_id, interaction_id, kind, learning_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rle_created_at_result_id
+    ON retrieved_learning_evaluation(created_at DESC, result_id DESC);
+CREATE INDEX IF NOT EXISTS idx_rle_interaction_created_at
+    ON retrieved_learning_evaluation(
+        interaction_created_at DESC, interaction_id DESC, result_id DESC
+    );
+CREATE INDEX IF NOT EXISTS idx_rle_session_id
+    ON retrieved_learning_evaluation(session_id);
+CREATE INDEX IF NOT EXISTS idx_rle_subject_ref
+    ON retrieved_learning_evaluation(governance_subject_ref);
 
 CREATE TABLE IF NOT EXISTS agent_playbook_source_user_playbooks (
     agent_playbook_id INTEGER NOT NULL,
@@ -2145,6 +2937,13 @@ CREATE INDEX IF NOT EXISTS idx_apsup_user ON agent_playbook_source_user_playbook
 
 CREATE TABLE IF NOT EXISTS playbook_optimization_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    optimizer_kind TEXT NOT NULL DEFAULT 'optimizer_legacy_unknown'
+        CHECK (optimizer_kind IN (
+            'gepa',
+            'offline_tuner_replay',
+            'offline_tuner_legacy',
+            'optimizer_legacy_unknown'
+        )),
     target_kind TEXT NOT NULL,
     target_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -2152,11 +2951,108 @@ CREATE TABLE IF NOT EXISTS playbook_optimization_jobs (
     successor_target_id INTEGER,
     decision_reason TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    discovery_key TEXT,
+    attempt_key TEXT,
+    lease_owner TEXT,
+    lease_fence INTEGER NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+    lease_expires_at INTEGER,
+    stage TEXT CHECK (stage IS NULL OR stage IN (
+        'evidence_frozen',
+        'candidate_generated',
+        'replay_running',
+        'replay_evaluated',
+        'publishing',
+        'applied',
+        'abstained',
+        'failed'
+    )),
+    terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN (
+        'applied',
+        'insufficient_negative_evidence',
+        'insufficient_positive_evidence',
+        'insufficient_coverage',
+        'replay_unsupported',
+        'deployment_unsupported',
+        'incomplete_replay_scope',
+        'insufficient_replay_cases',
+        'replay_inconclusive',
+        'candidate_regressed',
+        'candidate_did_not_improve',
+        'incumbent_changed',
+        'generation_failed',
+        'replay_failed',
+        'publication_failed',
+        'governance_erased'
+    )),
+    expected_population_manifest_digest TEXT,
+    generation_selection_manifest_digest TEXT,
+    replay_manifest_digest TEXT,
+    candidate_content_digest TEXT,
+    search_projection_digest TEXT,
+    publication_scope_digest TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_poj_target ON playbook_optimization_jobs(target_kind, target_id);
 CREATE INDEX IF NOT EXISTS idx_poj_status ON playbook_optimization_jobs(status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_poj_active_discovery
+    ON playbook_optimization_jobs(optimizer_kind, discovery_key)
+    WHERE status IN ('pending', 'running') AND discovery_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_poj_active_attempt
+    ON playbook_optimization_jobs(optimizer_kind, attempt_key)
+    WHERE status IN ('pending', 'running') AND attempt_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_poj_active_target
+    ON playbook_optimization_jobs(optimizer_kind, target_kind, target_id)
+    WHERE status IN ('pending', 'running');
+
+CREATE TABLE IF NOT EXISTS case_first_exposure (
+    equivalence_group_id TEXT PRIMARY KEY,
+    first_role TEXT NOT NULL CHECK (first_role IN (
+        'generation', 'improvement', 'preservation', 'safety'
+    )),
+    owner_discovery_key TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS case_exposure_uses (
+    job_id INTEGER NOT NULL,
+    equivalence_group_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN (
+        'generation', 'improvement', 'preservation', 'safety'
+    )),
+    ownership TEXT NOT NULL CHECK (ownership IN (
+        'self_generation', 'self_improvement', 'self_preservation',
+        'self_safety', 'foreign'
+    )),
+    content_digest TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (job_id, equivalence_group_id, role),
+    FOREIGN KEY (job_id) REFERENCES playbook_optimization_jobs(job_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_case_exposure_uses_group
+    ON case_exposure_uses(equivalence_group_id);
+
+CREATE TABLE IF NOT EXISTS playbook_optimization_artifacts (
+    artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    artifact_kind TEXT NOT NULL CHECK (artifact_kind IN (
+        'expected_population_manifest',
+        'generation_selection',
+        'replay_manifest',
+        'candidate',
+        'candidate_search_projection'
+    )),
+    content_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (job_id, artifact_kind),
+    FOREIGN KEY (job_id) REFERENCES playbook_optimization_jobs(job_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_poa_job
+    ON playbook_optimization_artifacts(job_id);
 
 CREATE TABLE IF NOT EXISTS playbook_optimization_candidates (
     candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2199,6 +3095,57 @@ CREATE TABLE IF NOT EXISTS playbook_optimization_events (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_poev_job ON playbook_optimization_events(job_id);
+
+CREATE TABLE IF NOT EXISTS user_playbook_publication_claims (
+    optimizer_kind TEXT NOT NULL,
+    job_id INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    publication_fence INTEGER NOT NULL CHECK (publication_fence >= 1),
+    worker_fence INTEGER NOT NULL CHECK (worker_fence >= 1),
+    consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0, 1)),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (optimizer_kind, job_id),
+    FOREIGN KEY (job_id) REFERENCES playbook_optimization_jobs(job_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS user_playbook_publication_staging (
+    optimizer_kind TEXT NOT NULL,
+    job_id INTEGER NOT NULL,
+    attempt_key TEXT NOT NULL,
+    claim_owner TEXT NOT NULL,
+    publication_fence INTEGER NOT NULL,
+    worker_fence INTEGER NOT NULL,
+    incumbent_user_playbook_id INTEGER NOT NULL,
+    incumbent_content_digest TEXT NOT NULL,
+    incumbent_trigger TEXT,
+    incumbent_semantic_digest TEXT NOT NULL,
+    revised_content TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    projection_json TEXT NOT NULL,
+    projection_digest TEXT NOT NULL,
+    proof_json TEXT NOT NULL,
+    proof_digest TEXT NOT NULL,
+    subject_epochs_json TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    staging_digest TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (optimizer_kind, job_id),
+    FOREIGN KEY (job_id) REFERENCES playbook_optimization_jobs(job_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS user_playbook_publication_results (
+    optimizer_kind TEXT NOT NULL,
+    job_id INTEGER NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('applied', 'incumbent_changed')),
+    successor_user_playbook_id INTEGER,
+    staging_digest TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (optimizer_kind, job_id),
+    FOREIGN KEY (job_id) REFERENCES playbook_optimization_jobs(job_id)
+        ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS _operation_state (
     service_name TEXT PRIMARY KEY,
@@ -2300,6 +3247,143 @@ CREATE VIRTUAL TABLE IF NOT EXISTS agent_playbooks_fts USING fts5(
     tokenize="porter unicode61"
 );
 
+-- Unicode lexical candidate indexes. Main-table triggers keep these normalized
+-- n-gram sidecars current so non-ASCII searches never scan every document.
+CREATE VIRTUAL TABLE IF NOT EXISTS interactions_unicode_fts USING fts5(
+    search_ngrams,
+    tokenize="unicode61 remove_diacritics 0"
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS profiles_unicode_fts USING fts5(
+    search_ngrams,
+    tokenize="unicode61 remove_diacritics 0"
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS user_playbooks_unicode_fts USING fts5(
+    search_ngrams,
+    tokenize="unicode61 remove_diacritics 0"
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS agent_playbooks_unicode_fts USING fts5(
+    search_ngrams,
+    tokenize="unicode61 remove_diacritics 0"
+);
+
+CREATE TRIGGER IF NOT EXISTS interactions_unicode_fts_ai
+AFTER INSERT ON interactions BEGIN
+    INSERT INTO interactions_unicode_fts(rowid, search_ngrams)
+    VALUES (
+        new.rowid,
+        reflexio_unicode_lexical_index(
+            COALESCE(new.content, '') || ' ' ||
+            COALESCE(new.user_action_description, '')
+        )
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS interactions_unicode_fts_au
+AFTER UPDATE OF content, user_action_description ON interactions BEGIN
+    DELETE FROM interactions_unicode_fts WHERE rowid = old.rowid;
+    INSERT INTO interactions_unicode_fts(rowid, search_ngrams)
+    VALUES (
+        new.rowid,
+        reflexio_unicode_lexical_index(
+            COALESCE(new.content, '') || ' ' ||
+            COALESCE(new.user_action_description, '')
+        )
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS interactions_unicode_fts_ad
+AFTER DELETE ON interactions BEGIN
+    DELETE FROM interactions_unicode_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS profiles_unicode_fts_ai
+AFTER INSERT ON profiles BEGIN
+    INSERT INTO profiles_unicode_fts(rowid, search_ngrams)
+    VALUES (
+        new.rowid,
+        reflexio_unicode_lexical_index(
+            COALESCE(new.content, '') || ' ' ||
+            COALESCE(new.expanded_terms, '')
+        )
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS profiles_unicode_fts_au
+AFTER UPDATE OF content, expanded_terms ON profiles BEGIN
+    DELETE FROM profiles_unicode_fts WHERE rowid = old.rowid;
+    INSERT INTO profiles_unicode_fts(rowid, search_ngrams)
+    VALUES (
+        new.rowid,
+        reflexio_unicode_lexical_index(
+            COALESCE(new.content, '') || ' ' ||
+            COALESCE(new.expanded_terms, '')
+        )
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS profiles_unicode_fts_ad
+AFTER DELETE ON profiles BEGIN
+    DELETE FROM profiles_unicode_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS user_playbooks_unicode_fts_ai
+AFTER INSERT ON user_playbooks BEGIN
+    INSERT INTO user_playbooks_unicode_fts(rowid, search_ngrams)
+    VALUES (
+        new.rowid,
+        reflexio_unicode_lexical_index(
+            COALESCE(new.trigger, '') || ' ' ||
+            COALESCE(new.content, '') || ' ' ||
+            COALESCE(new.rationale, '') || ' ' ||
+            COALESCE(new.source, '')
+        )
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS user_playbooks_unicode_fts_au
+AFTER UPDATE OF trigger, content, rationale, source ON user_playbooks BEGIN
+    DELETE FROM user_playbooks_unicode_fts WHERE rowid = old.rowid;
+    INSERT INTO user_playbooks_unicode_fts(rowid, search_ngrams)
+    VALUES (
+        new.rowid,
+        reflexio_unicode_lexical_index(
+            COALESCE(new.trigger, '') || ' ' ||
+            COALESCE(new.content, '') || ' ' ||
+            COALESCE(new.rationale, '') || ' ' ||
+            COALESCE(new.source, '')
+        )
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS user_playbooks_unicode_fts_ad
+AFTER DELETE ON user_playbooks BEGIN
+    DELETE FROM user_playbooks_unicode_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_playbooks_unicode_fts_ai
+AFTER INSERT ON agent_playbooks BEGIN
+    INSERT INTO agent_playbooks_unicode_fts(rowid, search_ngrams)
+    VALUES (
+        new.rowid,
+        reflexio_unicode_lexical_index(
+            COALESCE(new.trigger, '') || ' ' ||
+            COALESCE(new.content, '') || ' ' ||
+            COALESCE(new.rationale, '')
+        )
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS agent_playbooks_unicode_fts_au
+AFTER UPDATE OF trigger, content, rationale ON agent_playbooks BEGIN
+    DELETE FROM agent_playbooks_unicode_fts WHERE rowid = old.rowid;
+    INSERT INTO agent_playbooks_unicode_fts(rowid, search_ngrams)
+    VALUES (
+        new.rowid,
+        reflexio_unicode_lexical_index(
+            COALESCE(new.trigger, '') || ' ' ||
+            COALESCE(new.content, '') || ' ' ||
+            COALESCE(new.rationale, '')
+        )
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS agent_playbooks_unicode_fts_ad
+AFTER DELETE ON agent_playbooks BEGIN
+    DELETE FROM agent_playbooks_unicode_fts WHERE rowid = old.rowid;
+END;
+
 CREATE TABLE IF NOT EXISTS share_links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     org_id TEXT NOT NULL,
@@ -2385,8 +3469,37 @@ CREATE TABLE IF NOT EXISTS lineage_event (
     from_status      TEXT,
     to_status        TEXT,
     status_namespace TEXT,
+    model_name       TEXT,
+    provider         TEXT,
     UNIQUE (org_id, entity_type, entity_id, op, request_id)
 );
 CREATE INDEX IF NOT EXISTS idx_lineage_entity ON lineage_event (entity_type, entity_id);
+
+-- ============================================================================
+-- Durable learning pipeline — cross-org job queue
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS learning_jobs (
+    job_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    job_type TEXT NOT NULL DEFAULT 'learning',
+    latest_request_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    claimed_by TEXT,
+    claim_token TEXT,
+    claim_expires_at TEXT,
+    covers_through TEXT,
+    force_extraction INTEGER NOT NULL DEFAULT 0,
+    skip_aggregation INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS learning_jobs_coalesce
+    ON learning_jobs (org_id, user_id, job_type) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS learning_jobs_poll
+    ON learning_jobs (created_at) WHERE status IN ('pending','failed','claimed');
 
 """

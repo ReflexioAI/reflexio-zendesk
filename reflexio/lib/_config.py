@@ -3,6 +3,9 @@ from typing import Any
 from reflexio.lib._base import ReflexioBase
 from reflexio.models.api_schema.retriever_schema import SetConfigResponse
 from reflexio.models.config_schema import Config, StorageConfigManagedSupabase
+from reflexio.server.services.configurator.config_storage import (
+    ConfigWriteConflictError,
+)
 
 
 class ConfigMixin(ReflexioBase):
@@ -18,8 +21,12 @@ class ConfigMixin(ReflexioBase):
         try:
             configurator = self.request_context.configurator
             if isinstance(config, dict):
-                config = configurator.normalize_config_payload(config)
-                config = Config(**config)
+                normalized = configurator.normalize_config_payload(config)
+                config = (
+                    normalized
+                    if isinstance(normalized, Config)
+                    else Config(**normalized)
+                )
 
             # Validate storage connection before setting config.
             # If no storage_config provided, or the caller round-tripped the
@@ -29,37 +36,44 @@ class ConfigMixin(ReflexioBase):
             # security). Without this, the marker reaches the readiness check as
             # an unfillable StorageConfigManagedSupabase and fails with
             # "Storage configuration is incomplete".
+            current_storage_config = configurator.get_current_storage_configuration()
             storage_config = config.storage_config
             if storage_config is None or isinstance(
                 storage_config, StorageConfigManagedSupabase
             ):
-                storage_config = configurator.get_current_storage_configuration()
+                storage_config = current_storage_config
                 config.storage_config = storage_config
 
-            # Check if storage config is ready to test
-            if not configurator.is_storage_config_ready_to_test(
-                storage_config=storage_config
-            ):
-                return SetConfigResponse(
-                    success=False, msg="Storage configuration is incomplete"
+            storage_config_changed = storage_config != current_storage_config
+            if storage_config_changed or current_storage_config is None:
+                # Storage validation initializes the backend and may run
+                # migrations, so only do it when the storage target changes.
+                if not configurator.is_storage_config_ready_to_test(
+                    storage_config=storage_config
+                ):
+                    return SetConfigResponse(
+                        success=False, msg="Storage configuration is incomplete"
+                    )
+
+                (
+                    success,
+                    error_msg,
+                ) = configurator.test_and_init_storage_config(
+                    storage_config=storage_config
                 )
 
-            # Test and initialize storage connection
-            (
-                success,
-                error_msg,
-            ) = configurator.test_and_init_storage_config(storage_config=storage_config)
-
-            if not success:
-                return SetConfigResponse(
-                    success=False,
-                    msg=f"Failed to validate storage connection: {error_msg}",
-                )
+                if not success:
+                    return SetConfigResponse(
+                        success=False,
+                        msg=f"Failed to validate storage connection: {error_msg}",
+                    )
 
             # Only set config if validation passed
             configurator.set_config(config)
 
             return SetConfigResponse(success=True, msg="Configuration set successfully")
+        except ConfigWriteConflictError:
+            raise
         except Exception as e:
             return SetConfigResponse(
                 success=False, msg=f"Failed to set configuration: {str(e)}"

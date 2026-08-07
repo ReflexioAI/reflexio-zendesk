@@ -28,6 +28,7 @@ import subprocess  # noqa: S404 — subprocess is the integration point; inputs 
 import tempfile
 import time
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -62,14 +63,22 @@ _ENV_TIMEOUT = "CLAUDE_SMART_CLI_TIMEOUT"
 _ENV_MODEL = "CLAUDE_SMART_CLI_MODEL"
 _HOST_CODEX = "codex"
 _HOST_CLAUDE_CODE = "claude-code"
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 _CODEX_COMPAT_SCRIPT_NAMES = (
     ("codex-claude-compat.cmd", "codex-claude-compat")
-    if os.name == "nt"
+    if _is_windows()
     else ("codex-claude-compat", "codex-claude-compat.cmd")
 )
 _CODEX_COMPAT_SCRIPT_NAME_SET = set(_CODEX_COMPAT_SCRIPT_NAMES)
 _DEFAULT_TIMEOUT_SECONDS = 120
-_DEFAULT_CLI_MODEL = "claude-sonnet-4-6"
+_DEFAULT_CLI_MODEL = "claude-sonnet-5"
+_WINDOWS_ARGV_SYSTEM_PROMPT_LIMIT = 3_000
+_WINDOWS_CLI_SUFFIXES = (".cmd", ".exe", ".bat")
 
 _TRUTHY_ENV_VALUES = {"1", "true", "yes"}
 _UNSUPPORTED_PARAMS_WARNED: set[str] = set()
@@ -79,6 +88,12 @@ _MULTITURN_WARNED = False
 
 class ClaudeCodeCLIError(RuntimeError):
     """Raised when the claude CLI subprocess fails in a way we cannot recover from."""
+
+
+def _diagnostic_excerpt(text: str, limit: int = 500) -> str:
+    """Return a bounded single-line excerpt for local CLI diagnostics."""
+    compact = " ".join((text or "").split())
+    return compact[:limit]
 
 
 def _env_enabled() -> bool:
@@ -116,6 +131,40 @@ def _candidate_codex_compat_path() -> Path | None:
     return None
 
 
+def _windows_cli_suffixes() -> tuple[str, ...]:
+    suffixes: list[str] = []
+    for suffix in os.environ.get("PATHEXT", "").split(";"):
+        suffix = suffix.strip().lower()
+        if not suffix:
+            continue
+        suffix = suffix if suffix.startswith(".") else f".{suffix}"
+        # PowerShell scripts require a PowerShell host; do not return them as
+        # directly executable CLI shims for subprocess.run([...]).
+        if suffix == ".ps1":
+            continue
+        suffixes.append(suffix)
+    for suffix in _WINDOWS_CLI_SUFFIXES:
+        if suffix not in suffixes:
+            suffixes.append(suffix)
+    return tuple(suffixes)
+
+
+def _resolve_cli_override_path(cli_path: str) -> str:
+    if not _is_windows():
+        return cli_path
+    path = Path(cli_path)
+    if path.suffix:
+        return cli_path
+
+    # Windows package managers expose extensioned shims while users often
+    # configure the extensionless binary name.
+    for suffix in _windows_cli_suffixes():
+        candidate = path.with_suffix(suffix)
+        if candidate.exists():
+            return str(candidate)
+    return cli_path
+
+
 def _resolve_cli_path() -> str | None:
     """Return the path to the active host CLI, or None if unavailable.
 
@@ -129,7 +178,7 @@ def _resolve_cli_path() -> str | None:
     """
     override = os.environ.get(_ENV_CLI_PATH)
     if override:
-        candidate = Path(override)
+        candidate = Path(_resolve_cli_override_path(override))
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
         _LOGGER.warning(
@@ -432,6 +481,9 @@ def _run_claude_stream(
 ) -> ParseResult:
     """Invoke ``claude -p --output-format stream-json`` and return a ParseResult."""
     model = os.environ.get(_ENV_MODEL) or _DEFAULT_CLI_MODEL
+    inline_system_prompt = (
+        _is_windows() and len(system_prompt) > _WINDOWS_ARGV_SYSTEM_PROMPT_LIMIT
+    )
     cmd = [
         cli_path,
         "-p",
@@ -442,8 +494,11 @@ def _run_claude_stream(
         "--model",
         model,
     ]
-    if system_prompt:
+    if system_prompt and not inline_system_prompt:
         cmd.extend(["--append-system-prompt", system_prompt])
+    stdin_text = dialogue
+    if inline_system_prompt:
+        stdin_text = f"{system_prompt}\n\n{dialogue}" if dialogue else system_prompt
 
     # Tag the child process so any hooks it fires (e.g. claude-smart's
     # Stop hook) can detect that this is a reflexio-internal invocation
@@ -460,9 +515,11 @@ def _run_claude_stream(
     try:
         proc = subprocess.run(  # noqa: S603 — cmd is constructed from validated parts.
             cmd,
-            input=dialogue,
+            input=stdin_text,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace" if _is_windows() else "strict",
             timeout=timeout_seconds,
             check=False,
             env=env,
@@ -474,8 +531,11 @@ def _run_claude_stream(
     except FileNotFoundError as exc:
         raise ClaudeCodeCLIError(f"claude CLI not found at {cli_path}") from exc
 
-    return parse_stream_json(
-        proc.stdout, exit_code=proc.returncode, stderr_text=proc.stderr
+    return replace(
+        parse_stream_json(
+            proc.stdout, exit_code=proc.returncode, stderr_text=proc.stderr
+        ),
+        cli_binary=_cli_name(),
     )
 
 
@@ -511,6 +571,8 @@ def _run_codex_stream(
             input=_codex_prompt(prompt=dialogue, system_prompt=system_prompt),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace" if _is_windows() else "strict",
             timeout=timeout_seconds,
             check=False,
             env=env,
@@ -534,6 +596,7 @@ def _run_codex_stream(
         terminal_text=terminal_text,
         stderr_text=proc.stderr,
         raw_lines_parsed=1 if terminal_text else 0,
+        cli_binary="codex",
     )
 
 
@@ -554,6 +617,10 @@ def _build_model_response(
     model: str,
     terminal_text: str,
     elapsed_seconds: float,
+    *,
+    served_model: str | None = None,
+    served_provider: str | None = None,
+    cli_binary: str | None = None,
 ) -> ModelResponse:
     """Wrap the CLI's terminal text in a LiteLLM ``ModelResponse``.
 
@@ -563,9 +630,12 @@ def _build_model_response(
 
     Args:
         model (str): The model string originally requested
-            (e.g. ``claude-code/default``).
+            (e.g. ``claude-code/default``). Populates the public LiteLLM
+            ``ModelResponse.model`` field the same way other providers do.
         terminal_text (str): The terminal ``result`` text from the CLI.
         elapsed_seconds (float): Wall time the subprocess took — for logging only.
+        served_model: Observed served model from stream-json, if any. Stamped on
+            hidden metadata for provenance; not used to overwrite ``model``.
 
     Returns:
         ModelResponse: Shaped to match what callers of ``litellm.completion`` expect.
@@ -581,12 +651,37 @@ def _build_model_response(
         object="chat.completion",
         usage=usage,
     )
+    _set_cli_response_metadata(
+        response,
+        served_model=served_model,
+        served_provider=served_provider,
+        cli_binary=cli_binary,
+    )
     _LOGGER.debug(
         "claude-code provider: model=%s elapsed=%.2fs",
         model,
         elapsed_seconds,
     )
     return response
+
+
+def _set_cli_response_metadata(
+    response: ModelResponse,
+    *,
+    served_model: str | None,
+    served_provider: str | None,
+    cli_binary: str | None,
+) -> None:
+    """Stamp truthful route metadata on a CLI-backed completion response."""
+    hidden = dict(getattr(response, "_hidden_params", {}) or {})
+    hidden["reflexio_provider"] = PROVIDER_KEY
+    if cli_binary:
+        hidden["reflexio_cli_binary"] = cli_binary
+    if served_model:
+        hidden["reflexio_served_model"] = served_model
+    if served_provider:
+        hidden["reflexio_served_provider"] = served_provider
+    response._hidden_params = hidden
 
 
 _TOOL_USE_INSTRUCTION_TEMPLATE = (
@@ -727,6 +822,9 @@ def _build_model_response_with_tool_call(
     terminal_text: str,
     elapsed_seconds: float,
     tool_use: dict[str, Any],
+    served_model: str | None = None,
+    served_provider: str | None = None,
+    cli_binary: str | None = None,
 ) -> ModelResponse:
     """Wrap the CLI terminal text as a ``ModelResponse`` carrying one ``tool_calls`` entry.
 
@@ -736,7 +834,6 @@ def _build_model_response_with_tool_call(
     this — usage is informational, not load-bearing.
 
     Args:
-        model: Model string passed in by LiteLLM.
         terminal_text: The terminal ``result`` text from the CLI (retained
             for signature parity with the plain-text branch; surfaced via
             logging only).
@@ -767,6 +864,12 @@ def _build_model_response_with_tool_call(
         model=model,
         object="chat.completion",
         usage=usage,
+    )
+    _set_cli_response_metadata(
+        response,
+        served_model=served_model,
+        served_provider=served_provider,
+        cli_binary=cli_binary,
     )
     _LOGGER.debug(
         "claude-code provider: tool_call name=%s elapsed=%.2fs",
@@ -960,6 +1063,9 @@ class ClaudeCodeLLM(CustomLLM):
                         terminal_text=result.terminal_text,
                         elapsed_seconds=elapsed,
                         tool_use=tool_use,
+                        served_model=result.served_model,
+                        served_provider=result.served_provider,
+                        cli_binary=result.cli_binary,
                     )
                 # Log a metadata-only warning (no raw payload) — the model
                 # output can carry user content / source code; deferring the
@@ -980,12 +1086,17 @@ class ClaudeCodeLLM(CustomLLM):
                 model=model,
                 terminal_text=result.terminal_text,
                 elapsed_seconds=elapsed,
+                served_model=result.served_model,
+                served_provider=result.served_provider,
+                cli_binary=result.cli_binary,
             )
 
         self._record_stall_safely(result)
         raise ClaudeCodeCLIError(
             f"claude -p stream failed; retry_errors={result.retry_errors}; "
-            f"stderr={result.stderr_text[:200]!r}"
+            f"stderr={_diagnostic_excerpt(result.stderr_text)!r}; "
+            f"stdout={_diagnostic_excerpt(result.terminal_text)!r}; "
+            f"parsed={result.raw_lines_parsed}; failed={result.raw_lines_failed}"
         )
 
     def _record_stall_safely(self, result: ParseResult) -> None:

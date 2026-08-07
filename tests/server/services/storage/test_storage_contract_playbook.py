@@ -60,6 +60,16 @@ def _make_agent_playbook(
 
 
 class TestUserPlaybookCRUD:
+    def test_precompute_without_trigger_clears_stale_search_fields(self, storage):
+        playbook = _make_user_playbook(1, "u1", "fb", "v1")
+        playbook.embedding = [0.1] * 512
+        playbook.expanded_terms = "stale expanded terms"
+
+        storage.precompute_user_playbook_embeddings([playbook])
+
+        assert playbook.embedding == []
+        assert playbook.expanded_terms is None
+
     def test_save_and_get_user_playbooks(self, storage):
         rfs = [
             _make_user_playbook(1, "u1", "fb", "v1"),
@@ -85,6 +95,23 @@ class TestUserPlaybookCRUD:
 
         assert [p.user_playbook_id for p in first_page] == [3, 2]
         assert [p.user_playbook_id for p in second_page] == [1]
+
+    def test_get_user_playbooks_supports_descending_id_keyset(self, storage):
+        playbooks = [
+            _make_user_playbook(1, "u1", "fb", "v1"),
+            _make_user_playbook(2, "u1", "fb", "v1"),
+            _make_user_playbook(3, "u1", "fb", "v1"),
+        ]
+        playbooks[0].created_at = 1_700_000_300
+        playbooks[1].created_at = 1_700_000_200
+        playbooks[2].created_at = 1_700_000_100
+        storage.save_user_playbooks(playbooks)
+
+        page = storage.get_user_playbooks(
+            user_id="u1", limit=2, offset=99, max_user_playbook_id=2
+        )
+
+        assert [playbook.user_playbook_id for playbook in page] == [2, 1]
 
     def test_update_user_playbook_tags_round_trip(self, storage):
         storage.save_user_playbooks([_make_user_playbook(1, "u1", "fb", "v1")])
@@ -149,6 +176,19 @@ class TestUserPlaybookCRUD:
         assert all(rf.playbook_name == "alpha" for rf in alpha)
         assert beta[0].playbook_name == "beta"
 
+    def test_get_user_playbooks_filters_query_before_limit(self, storage):
+        newer = _make_user_playbook(1, "u1", "alpha", "v1")
+        newer.content = "newer nonmatch"
+        newer.created_at = 1_700_000_200
+        older_match = _make_user_playbook(2, "u2", "beta", "v1")
+        older_match.content = "older needle"
+        older_match.created_at = 1_700_000_100
+        storage.save_user_playbooks([newer, older_match])
+
+        result = storage.get_user_playbooks(limit=1, query="needle")
+
+        assert [p.content for p in result] == ["older needle"]
+
     def test_delete_all_user_playbooks_by_playbook_name(self, storage):
         storage.save_user_playbooks(
             [
@@ -165,7 +205,7 @@ class TestUserPlaybookCRUD:
 
 
 class TestGetUserPlaybooksByIds:
-    """Contract tests for get_user_playbooks_by_ids (used by ReflectionService)."""
+    """Contract tests for the shared get_user_playbooks_by_ids lookup."""
 
     def test_returns_only_requested_ids(self, storage):
         storage.save_user_playbooks(
@@ -236,9 +276,40 @@ class TestGetUserPlaybooksByIds:
         assert len(result) == 1
         assert result[0].user_playbook_id == upid
 
+    def test_include_inactive_returns_archived(self, storage):
+        storage.save_user_playbooks([_make_user_playbook(1, "u1", "fb", "v1")])
+        upid = storage.get_user_playbooks(user_id="u1", status_filter=[None])[
+            0
+        ].user_playbook_id
+        storage.archive_user_playbook_by_id("u1", upid)
+        result = storage.get_user_playbooks_by_ids("u1", [upid], include_inactive=True)
+        assert [p.user_playbook_id for p in result] == [upid]
+
+    def test_include_inactive_still_filters_by_user_id(self, storage):
+        """user_id is the only predicate left standing under include_inactive."""
+        storage.save_user_playbooks([_make_user_playbook(1, "u2", "fb", "v1")])
+        upid = storage.get_user_playbooks(user_id="u2", status_filter=[None])[
+            0
+        ].user_playbook_id
+        storage.archive_user_playbook_by_id("u2", upid)
+        assert (
+            storage.get_user_playbooks_by_ids("u1", [upid], include_inactive=True) == []
+        )
+
+    def test_include_inactive_with_status_filter_is_rejected(self, storage):
+        """The two are contradictory — fail loud rather than drop the filter."""
+        storage.save_user_playbooks([_make_user_playbook(1, "u1", "fb", "v1")])
+        upid = storage.get_user_playbooks(user_id="u1", status_filter=[None])[
+            0
+        ].user_playbook_id
+        with pytest.raises(StorageError):
+            storage.get_user_playbooks_by_ids(
+                "u1", [upid], status_filter=[Status.ARCHIVED], include_inactive=True
+            )
+
 
 class TestArchiveUserPlaybookById:
-    """Contract tests for archive_user_playbook_by_id (used by ReflectionService)."""
+    """Contract tests for the shared archive_user_playbook_by_id mutation."""
 
     def test_archives_current_playbook(self, storage):
         storage.save_user_playbooks([_make_user_playbook(1, "u1", "fb", "v1")])
@@ -271,6 +342,13 @@ class TestArchiveUserPlaybookById:
 
 class TestAgentPlaybookSourceWindows:
     def test_source_windows_round_trip_and_legacy_ids(self, storage):
+        storage.save_user_playbooks(
+            [
+                _make_user_playbook(1, "u1", "fb", "v1"),
+                _make_user_playbook(2, "u1", "fb", "v1"),
+                _make_user_playbook(3, "u1", "fb", "v1"),
+            ]
+        )
         storage.set_source_windows_for_agent_playbook(
             10,
             [
@@ -289,6 +367,13 @@ class TestAgentPlaybookSourceWindows:
         assert [w.source_interaction_ids for w in windows] == [[20, 21], [30]]
 
     def test_legacy_id_writer_creates_empty_source_windows(self, storage):
+        storage.save_user_playbooks(
+            [
+                _make_user_playbook(1, "u1", "fb", "v1"),
+                _make_user_playbook(2, "u1", "fb", "v1"),
+                _make_user_playbook(3, "u1", "fb", "v1"),
+            ]
+        )
         storage.set_source_user_playbook_ids_for_agent_playbook(10, [2, 3, 2])
 
         assert storage.get_source_user_playbook_ids_for_agent_playbook(10) == [2, 3]
@@ -320,6 +405,13 @@ class TestAgentPlaybookSourceWindows:
         ]
 
     def test_batch_source_user_playbook_ids_round_trip(self, storage):
+        storage.save_user_playbooks(
+            [
+                _make_user_playbook(1, "u1", "fb", "v1"),
+                _make_user_playbook(2, "u1", "fb", "v1"),
+                _make_user_playbook(3, "u1", "fb", "v1"),
+            ]
+        )
         storage.set_source_windows_for_agent_playbook(
             10,
             [
@@ -359,6 +451,16 @@ class TestAgentPlaybookSourceWindows:
 
 
 class TestAgentPlaybookCRUD:
+    def test_save_without_trigger_clears_stale_search_fields(self, storage):
+        playbook = _make_agent_playbook(1, "fb", "v1")
+        playbook.embedding = [0.1] * 512
+        playbook.expanded_terms = "stale expanded terms"
+
+        storage.save_agent_playbooks([playbook])
+
+        assert playbook.embedding == []
+        assert playbook.expanded_terms is None
+
     def test_save_and_get_agent_playbooks(self, storage):
         fbs = [
             _make_agent_playbook(1, "fb", "v1"),
@@ -368,6 +470,52 @@ class TestAgentPlaybookCRUD:
 
         result = storage.get_agent_playbooks(playbook_name="fb")
         assert len(result) == 2
+
+    def test_get_agent_playbooks_orders_tied_timestamps_deterministically(
+        self, storage
+    ):
+        playbooks = [
+            _make_agent_playbook(1, "fb", "v1"),
+            _make_agent_playbook(2, "fb", "v1"),
+            _make_agent_playbook(3, "fb", "v1"),
+        ]
+        for playbook in playbooks:
+            playbook.created_at = 1_700_000_000
+        storage.save_agent_playbooks(playbooks)
+
+        first_page = storage.get_agent_playbooks(limit=2, offset=0)
+        second_page = storage.get_agent_playbooks(limit=2, offset=2)
+
+        assert [p.agent_playbook_id for p in first_page] == [3, 2]
+        assert [p.agent_playbook_id for p in second_page] == [1]
+
+    def test_get_agent_playbooks_supports_descending_id_keyset(self, storage):
+        playbooks = [
+            _make_agent_playbook(1, "fb", "v1"),
+            _make_agent_playbook(2, "fb", "v1"),
+            _make_agent_playbook(3, "fb", "v1"),
+        ]
+        playbooks[0].created_at = 1_700_000_300
+        playbooks[1].created_at = 1_700_000_200
+        playbooks[2].created_at = 1_700_000_100
+        storage.save_agent_playbooks(playbooks)
+
+        page = storage.get_agent_playbooks(limit=2, offset=99, max_agent_playbook_id=2)
+
+        assert [playbook.agent_playbook_id for playbook in page] == [2, 1]
+
+    def test_get_agent_playbooks_filters_query_before_limit(self, storage):
+        newer = _make_agent_playbook(1, "alpha", "v1")
+        newer.content = "newer nonmatch"
+        newer.created_at = 1_700_000_200
+        older_match = _make_agent_playbook(2, "beta", "v1")
+        older_match.content = "older needle"
+        older_match.created_at = 1_700_000_100
+        storage.save_agent_playbooks([newer, older_match])
+
+        result = storage.get_agent_playbooks(limit=1, query="needle")
+
+        assert [p.content for p in result] == ["older needle"]
 
     def test_update_agent_playbook_tags_round_trip(self, storage):
         storage.save_agent_playbooks([_make_agent_playbook(1, "fb", "v1")])
@@ -443,9 +591,9 @@ class TestDashboardPlaybooksTimeSeries:
         stats = storage.get_dashboard_stats(days_back=30)
 
         assert stats["current_period"]["total_playbooks"] == 2
-        # The series must contain BOTH playbooks (regression: it previously
-        # queried only user_playbooks and would have length 1 here).
-        assert len(stats["playbooks_time_series"]) == 2
+        # The series must count BOTH playbooks (regression: it previously
+        # queried only user_playbooks and would undercount this bucket).
+        assert sum(point["value"] for point in stats["playbooks_time_series"]) == 2
 
 
 # ---------------------------------------------------------------------------

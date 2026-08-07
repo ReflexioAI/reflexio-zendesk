@@ -93,6 +93,42 @@ def _add_request_with_interactions(
     return request_id
 
 
+def test_experiment_output_tokens_exclude_sessions_with_legacy_null_counts(
+    storage: SQLiteStorage,
+) -> None:
+    request = Request(
+        request_id="req_token_coverage",
+        user_id="user_token_coverage",
+        session_id="session_token_coverage",
+        agent_version="v1",
+        source="test",
+        created_at=_now(),
+        retrieval_experiment_id="exp-token-coverage",
+        retrieval_experiment_arm="treatment",
+    )
+    storage.add_request(request)
+    interaction = Interaction(
+        user_id=request.user_id,
+        request_id=request.request_id,
+        role="assistant",
+        content="measured output",
+    )
+    storage.add_user_interactions_bulk(request.user_id, [interaction])
+    assert storage.get_retrieval_experiment_output_token_counts(
+        "exp-token-coverage"
+    ) == {(request.user_id, request.session_id): interaction.token_count}
+
+    storage.conn.execute(
+        "UPDATE interactions SET token_count = NULL WHERE request_id = ?",
+        (request.request_id,),
+    )
+    storage.conn.commit()
+
+    assert (
+        storage.get_retrieval_experiment_output_token_counts("exp-token-coverage") == {}
+    )
+
+
 # ---------------------------------------------------------------------------
 # count_sessions_with_shadow_content
 # ---------------------------------------------------------------------------
@@ -179,7 +215,8 @@ def test_get_citations_by_session_ids_extracts_cited_rows(
         session_id="s1",
         request_id="req_s1",
         assistant_citations=[
-            Citation(kind="playbook", real_id="42", title="Keep it short"),
+            Citation(kind="user_playbook", real_id="42", title="Keep it short"),
+            Citation(kind="agent_playbook", real_id="77", title="Escalate sooner"),
             Citation(kind="profile", real_id="p9", title="Prefers email"),
         ],
     )
@@ -203,6 +240,10 @@ def test_get_citations_by_session_ids_extracts_cited_rows(
         "UPDATE interactions SET citations = NULL WHERE request_id = ? AND role = ?",
         (null_request_id, "Assistant"),
     )
+    # Commit the raw UPDATE so the shared connection isn't left mid-transaction —
+    # otherwise the next add_request()'s `BEGIN IMMEDIATE` raises
+    # "cannot start a transaction within a transaction".
+    storage.conn.commit()
     blank_request_id = _add_request_with_interactions(
         storage,
         session_id="blank",
@@ -213,6 +254,7 @@ def test_get_citations_by_session_ids_extracts_cited_rows(
         "UPDATE interactions SET citations = '' WHERE request_id = ? AND role = ?",
         (blank_request_id, "Assistant"),
     )
+    storage.conn.commit()
 
     out = storage.get_citations_by_session_ids(
         ["s1", "s2", "empty", "nullish", "blank", "missing"]
@@ -223,7 +265,8 @@ def test_get_citations_by_session_ids_extracts_cited_rows(
         by_session.setdefault(citation.session_id, []).append(citation)
     assert set(by_session) == {"s1", "s2"}
     assert [(c.kind, c.real_id, c.title) for c in by_session["s1"]] == [
-        ("playbook", "42", "Keep it short"),
+        ("user_playbook", "42", "Keep it short"),
+        ("agent_playbook", "77", "Escalate sooner"),
         ("profile", "p9", "Prefers email"),
     ]
     assert [(c.kind, c.real_id) for c in by_session["s2"]] == [

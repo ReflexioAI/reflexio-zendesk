@@ -3,7 +3,7 @@
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, cast
 
 from psycopg2 import sql
 
@@ -53,7 +53,11 @@ class RequestMixin(SchemaScopedClient):
         Args:
             request: Request object to store
         """
-        self._table("requests").upsert(request_to_data(request)).execute()
+        subject_ref = self._subject_ref_for_user_id(request.user_id)
+        self._assert_subject_writable_locked(subject_ref)
+        data = request_to_data(request)
+        data["governance_subject_ref"] = subject_ref
+        self._table("requests").upsert(data).execute()
 
     @handle_exceptions
     def get_request(self, request_id: str) -> Request | None:
@@ -226,6 +230,7 @@ class RequestMixin(SchemaScopedClient):
         end_time: int | None = None,
         top_k: int | None = 30,
         offset: int = 0,
+        source: str | None = None,
     ) -> dict[str, list[RequestInteractionDataModel]]:
         """
         Get requests with their associated interactions, grouped by session_id.
@@ -260,6 +265,8 @@ class RequestMixin(SchemaScopedClient):
             query = query.eq("request_id", request_id)
         if session_id:
             query = query.eq("session_id", session_id)
+        if source is not None:
+            query = query.eq("source", source)
         if start_time:
             start_time_iso = datetime.fromtimestamp(start_time, tz=UTC).isoformat()
             query = query.gte("created_at", start_time_iso)
@@ -317,6 +324,61 @@ class RequestMixin(SchemaScopedClient):
             )
 
         return grouped_results
+
+    @handle_exceptions
+    def get_retrieval_experiment_assignments(
+        self, experiment_id: str
+    ) -> dict[tuple[str, str], Literal["treatment", "holdout"]]:
+        rows = self._fetch_all(
+            sql.SQL(
+                """SELECT user_id, session_id, retrieval_experiment_arm FROM (
+                       SELECT user_id, session_id, retrieval_experiment_arm,
+                              row_number() OVER (
+                                  PARTITION BY user_id, session_id
+                                  ORDER BY created_at, request_id
+                              ) AS row_number
+                       FROM {} WHERE retrieval_experiment_id = %s
+                   ) ranked WHERE row_number = 1"""
+            ).format(self._table_identifier("requests")),
+            [experiment_id],
+        )
+        return {
+            (str(row["user_id"]), str(row["session_id"])): cast(
+                Literal["treatment", "holdout"], row["retrieval_experiment_arm"]
+            )
+            for row in rows
+        }
+
+    @handle_exceptions
+    def get_retrieval_experiment_output_token_counts(
+        self, experiment_id: str
+    ) -> dict[tuple[str, str], int]:
+        rows = self._fetch_all(
+            sql.SQL(
+                """SELECT r.user_id, r.session_id,
+                          COALESCE(SUM(CASE WHEN lower(btrim(i.role)) <> 'user'
+                                            THEN i.token_count ELSE 0 END), 0)
+                              AS output_token_count,
+                          COUNT(*) FILTER (
+                              WHERE lower(btrim(i.role)) <> 'user'
+                                AND i.token_count IS NULL
+                          ) AS missing_token_count
+                   FROM {} r LEFT JOIN {} i ON i.request_id = r.request_id
+                   WHERE r.retrieval_experiment_id = %s
+                   GROUP BY r.user_id, r.session_id"""
+            ).format(
+                self._table_identifier("requests"),
+                self._table_identifier("interactions"),
+            ),
+            [experiment_id],
+        )
+        return {
+            (str(row["user_id"]), str(row["session_id"])): int(
+                row["output_token_count"]
+            )
+            for row in rows
+            if int(row.get("missing_token_count") or 0) == 0
+        }
 
     @handle_exceptions
     def get_rerun_user_ids(

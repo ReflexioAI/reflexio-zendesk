@@ -195,12 +195,12 @@ _PROVIDER_DEFAULTS: dict[str, ProviderDefaults] = {
         extraction_agent="gpt-5.5",
     ),
     "anthropic": ProviderDefaults(
-        generation="claude-sonnet-4-6",
-        evaluation="claude-sonnet-4-6",
+        generation="claude-sonnet-5",
+        evaluation="claude-sonnet-5",
         should_run="claude-haiku-4-5-20251001",
         pre_retrieval="claude-haiku-4-5-20251001",
         embedding=None,
-        extraction_agent="claude-sonnet-4-6",
+        extraction_agent="claude-sonnet-5",
     ),
     "gemini": ProviderDefaults(
         generation="gemini/gemini-3-flash-preview",
@@ -229,7 +229,7 @@ _PROVIDER_DEFAULTS: dict[str, ProviderDefaults] = {
         should_run="minimax/MiniMax-M3",
         pre_retrieval="minimax/MiniMax-M3",
         embedding=None,
-        # Same M2.7 model handles resumable extraction. Surfaced by an
+        # Same M3 model handles resumable extraction. Surfaced by an
         # e2e run on a MiniMax-only VPS where publish printed
         # "No provider in ['minimax'] supports role=extraction_agent"
         # warnings and silently skipped profile creation. Without this,
@@ -258,13 +258,41 @@ _PROVIDER_DEFAULTS: dict[str, ProviderDefaults] = {
         embedding=None,
     ),
     "zai": ProviderDefaults(
-        generation="zai/glm-5.1",
-        evaluation="zai/glm-5.1",
-        should_run="zai/glm-5.1",
-        pre_retrieval="zai/glm-5.1",
+        generation="zai/glm-5.2",
+        evaluation="zai/glm-5.2",
+        should_run="zai/glm-5.2",
+        pre_retrieval="zai/glm-5.2",
         embedding=None,
     ),
 }
+
+
+# Output-token cap applied when neither the call site nor the client config
+# sets max_tokens. MiniMax-M3 misbehaves with unbounded output: omitting
+# max_tokens (especially combined with a strict json_schema response_format)
+# deterministically stalls generation into litellm's 120s timeout (reproduced
+# 2026-07; observed in prod as consolidator/document-expansion timeouts).
+# Sizing (measured in prod, 2026-07-14): M3's reasoning tokens count against
+# this budget, so too small a cap starves the visible output — at 4096 the
+# model regularly spent the whole budget thinking and returned empty/truncated
+# content (structured-output parse failures ran ~10-20x the 8192-era rate,
+# breaking extraction). 8192 was the healthiest measured setting. The 120s
+# provider stalls occur at every cap value (provider-side; mitigate with
+# fallback models, not here). Providers absent from this map stay unbounded.
+_PROVIDER_DEFAULT_MAX_TOKENS: dict[str, int] = {"minimax": 8192}
+
+
+def default_max_tokens_for_model(model: str) -> int | None:
+    """Return the provider-level default output-token cap for ``model``.
+
+    Args:
+        model (str): Full model name, e.g. ``"minimax/MiniMax-M3"``.
+
+    Returns:
+        int | None: Cap to apply when the caller set none, or None (no cap).
+    """
+    provider = model.split("/", 1)[0] if "/" in model else ""
+    return _PROVIDER_DEFAULT_MAX_TOKENS.get(provider)
 
 
 EMBEDDING_CAPABLE_PROVIDERS: frozenset[str] = frozenset(
@@ -446,10 +474,9 @@ def validate_llm_availability(
         )
     logger.info("Primary provider for generation: %s", generation_provider)
 
-    # Validate embedding availability. When no embedding-capable provider
-    # is configured, fall back to the in-process local ONNX embedder if
-    # chromadb is importable — this keeps users with only a non-embedding
-    # LLM key (Anthropic, MiniMax, etc.) from being blocked at startup.
+    # The launcher always provides a separate colocated inference service when
+    # no remote endpoint is configured. API workers never import or construct
+    # the local model.
     embedding_provider = next(
         (p for p in providers if _PROVIDER_DEFAULTS[p].embedding), None
     )
@@ -459,21 +486,42 @@ def validate_llm_availability(
             "embedding model selects this provider)",
             embedding_provider,
         )
-        return
-
-    from reflexio.server.llm.providers.local_embedding_provider import (
-        is_chromadb_importable,
-    )
-
-    if is_chromadb_importable():
-        logger.info(
-            "Local MiniLM embedding fallback available: %s "
-            "(no cloud embedding provider configured)",
-            _LOCAL_EMBEDDING_PROVIDER,
+    else:
+        from reflexio.server.llm.providers.embedding_service_provider import (
+            remote_inference_service_configured,
         )
-        return
-    raise RuntimeError(
-        "No embedding-capable provider configured and chromadb is not "
-        "importable. Set OPENAI_API_KEY or GEMINI_API_KEY, or "
-        "`pip install chromadb`."
-    )
+
+        location = "remote" if remote_inference_service_configured() else "colocated"
+        logger.info(
+            "Using the configured %s inference service for embeddings", location
+        )
+
+    fallback_raw = os.environ.get("REFLEXIO_LLM_FALLBACK_MODELS", "")
+    fallbacks = [m.strip() for m in fallback_raw.split(",") if m.strip()]
+    for model in fallbacks:
+        if model.startswith("local/"):
+            continue
+        provider = model.split("/", 1)[0].lower() if "/" in model else ""
+        if not provider:
+            continue
+        if provider not in _ENV_TO_PROVIDER.values():
+            # A provider reflexio doesn't key-validate at boot (bedrock,
+            # vertex_ai, azure, groq, ollama, together_ai, ...) authenticates
+            # via non-``<PROVIDER>_API_KEY`` means (IAM role, service
+            # account, etc.). Refusing to boot here would be a backward-
+            # compat break — these fallbacks booted fine before per-rung
+            # boot validation existed and only failed at request time.
+            logger.warning(
+                "Configured fallback model %r names provider %r, which "
+                "reflexio cannot validate credentials for at boot; any "
+                "misconfiguration will surface at request time instead.",
+                model,
+                provider,
+            )
+            continue
+        if provider not in providers:
+            raise RuntimeError(
+                f"Configured fallback model {model!r} needs provider {provider!r}, "
+                f"but no key for it is available. Set the provider's API key or "
+                f"remove it from REFLEXIO_LLM_FALLBACK_MODELS."
+            )

@@ -22,26 +22,59 @@ from ._agent_run import (
     not_applicable_tool_result,
 )
 from ._base import BaseStorageCore, matches_status_filter
+from ._commit_scope import CommitScopeMixin
 from ._extras import ExtrasMixin
-from ._governance import GovernanceMixin
+from ._learning_jobs import LearningJob, LearningJobStatus, LearningJobStoreABC
 from ._lineage import EntityType, LineageEventMixin
 from ._operations import OperationMixin
-from ._playbook import PlaybookMixin
-from ._profiles import ProfileMixin
+from ._playbook import AGGREGATE_REASON_PREFIX
 from ._requests import RequestMixin
-from ._retrieval_log import RetrievalLogMixin
+from ._session_outcomes import (
+    SessionOutcomeContext,
+    SessionOutcomeStoreMixin,
+    SessionOutcomeWriteResult,
+)
 from ._shadow_verdicts import ShadowVerdictsMixin
 from ._share_links import ShareLinkMixin
 from ._stall_state import StallStateMixin
+from .governance import (
+    AuditEventStoreMixin,
+    GovernanceEraseExecutionMixin,
+    PurgeOperationStoreMixin,
+    RebuildHideMixin,
+    SubjectBarrierMixin,
+)
+from .playbook import (
+    AgentEvaluationResultStoreMixin,
+    AgentPlaybookStoreMixin,
+    OptimizationJobStoreMixin,
+    PlaybookAggregationStoreMixin,
+    PlaybookSourceLinkageMixin,
+    UserPlaybookStoreMixin,
+)
+from .profiles import InteractionStoreMixin, ProfileSearchMixin, ProfileStoreMixin
 
 
 class BaseStorage(
+    LearningJobStoreABC,
+    CommitScopeMixin,
     AgentRunMixin,
-    ProfileMixin,
+    ProfileStoreMixin,
+    InteractionStoreMixin,
+    ProfileSearchMixin,
     RequestMixin,
-    PlaybookMixin,
-    RetrievalLogMixin,
-    GovernanceMixin,
+    SessionOutcomeStoreMixin,
+    PlaybookAggregationStoreMixin,
+    AgentPlaybookStoreMixin,
+    UserPlaybookStoreMixin,
+    PlaybookSourceLinkageMixin,
+    OptimizationJobStoreMixin,
+    AgentEvaluationResultStoreMixin,
+    AuditEventStoreMixin,
+    PurgeOperationStoreMixin,
+    SubjectBarrierMixin,
+    GovernanceEraseExecutionMixin,
+    RebuildHideMixin,
     LineageEventMixin,
     OperationMixin,
     ExtrasMixin,
@@ -114,13 +147,13 @@ class BaseStorage(
     def clear_user_data(self, user_id: str) -> dict[str, int]:
         """Delete all rows scoped to a single ``user_id``.
 
-        Removes the user's interactions, user playbooks, profiles, and
-        requests. Intentionally does NOT touch ``agent_playbooks`` — those
-        are the cross-project rollup of skills and have no ``user_id``
-        column. This is the data-isolation primitive used by paired
-        protocols (e.g. SWE-bench) that share a single backend across
-        parallel tasks without one task's clear-all nuking another
-        in-flight task's rows.
+        Removes the user's interactions, session outcomes, user playbooks,
+        profiles, and requests. Intentionally does NOT touch
+        ``agent_playbooks`` — those are the cross-project rollup of skills and
+        have no ``user_id`` column. This is the data-isolation primitive used
+        by paired protocols (e.g. SWE-bench) that share a single backend across
+        parallel tasks without one task's clear-all nuking another in-flight
+        task's rows.
 
         **Lineage-aware erasure:** rows that are tombstones (``merged_into``
         or ``superseded_by`` is set) *or* are pointed to by another row
@@ -143,17 +176,18 @@ class BaseStorage(
             user_id (str): The user id whose rows should be deleted.
 
         Returns:
-            dict[str, int]: Per-entity counts with keys ``interactions``,
-                ``user_playbooks``, ``profiles``, ``requests``,
+            dict[str, int]: Per-entity counts with keys ``session_outcomes``,
+                ``interactions``, ``user_playbooks``, ``profiles``, ``requests``,
                 ``purged_profiles``, and ``purged_user_playbooks``.
                 ``profiles`` and ``user_playbooks`` reflect hard-deleted
                 counts; purged rows are counted separately.
         """
+        session_outcome_counts = self.clear_session_outcomes_for_user(user_id)
         interaction_count = len(self.get_user_interaction(user_id))
 
         # All statuses a user's row can have — including tombstones (SUPERSEDED,
-        # MERGED). Erasure MUST reach every row the user owns regardless of
-        # status; the old filter excluded tombstones, leaving them in the DB
+        # MERGED, EXPIRED). Erasure MUST reach every row the user owns regardless
+        # of status; the old filter excluded tombstones, leaving them in the DB
         # after clear_user_data (GDPR regression).
         _all_statuses: list[Status | None] = [
             None,  # CURRENT
@@ -162,6 +196,7 @@ class BaseStorage(
             Status.ARCHIVE_IN_PROGRESS,
             Status.SUPERSEDED,
             Status.MERGED,
+            Status.EXPIRED,
         ]
 
         # Snapshot user_playbook ids for the user and partition into
@@ -180,10 +215,14 @@ class BaseStorage(
         )
 
         # Snapshot profile ids for the user and partition into
-        # purge vs delete sets.
+        # purge vs delete sets. include_expired=True drops the
+        # expiration_timestamp >= now guard so EXPIRED tombstones (expiry in
+        # the past) are enumerated and reached by the erasure path.
         raw_profile_ids = [
             p.profile_id
-            for p in self.get_user_profile(user_id, status_filter=_all_statuses)
+            for p in self.get_user_profile(
+                user_id, status_filter=_all_statuses, include_expired=True
+            )
             if p.profile_id is not None
         ]
         purge_profile_ids, delete_profile_ids = self._partition_purge_vs_delete(
@@ -225,6 +264,7 @@ class BaseStorage(
             self.purge_content(entity_type="user_playbook", entity_id=upid)
 
         return {
+            "session_outcomes": session_outcome_counts.get("session_outcomes", 0),
             "interactions": interaction_count,
             "user_playbooks": deleted_user_playbooks,
             "profiles": deleted_profiles,
@@ -233,8 +273,21 @@ class BaseStorage(
             "purged_user_playbooks": len(purge_upb_ids),
         }
 
+    def learning_jobs_columns(self) -> list[str]:
+        """Return the column names of the learning_jobs table.
+
+        Each backend overrides this to query its own schema introspection
+        mechanism (SQLite: PRAGMA table_info; Postgres/Supabase:
+        information_schema.columns).
+        """
+        raise NotImplementedError
+
 
 __all__ = [
+    "LearningJob",
+    "LearningJobStatus",
+    "LearningJobStoreABC",
+    "CommitScopeMixin",
     "AgentBinding",
     "AgentRunMixin",
     "EntityType",
@@ -246,8 +299,20 @@ __all__ = [
     "PendingToolCallRecord",
     "PendingToolCallStatus",
     "PendingToolCallUpsertResult",
-    "PlaybookMixin",
-    "RetrievalLogMixin",
+    "AgentEvaluationResultStoreMixin",
+    "AGGREGATE_REASON_PREFIX",
+    "AuditEventStoreMixin",
+    "PurgeOperationStoreMixin",
+    "SubjectBarrierMixin",
+    "GovernanceEraseExecutionMixin",
+    "RebuildHideMixin",
+    "AgentPlaybookStoreMixin",
+    "OptimizationJobStoreMixin",
+    "PlaybookSourceLinkageMixin",
+    "UserPlaybookStoreMixin",
+    "InteractionStoreMixin",
+    "ProfileSearchMixin",
+    "ProfileStoreMixin",
     "PriorAnswerMatch",
     "RunToolDependencyKind",
     "RunToolDependencyRecord",

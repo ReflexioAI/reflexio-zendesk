@@ -10,7 +10,11 @@ from inspect import iscoroutinefunction
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+from fastapi import HTTPException
+
 from reflexio.models.api_schema.retriever_schema import (
+    GetProfilesViewResponse,
     SearchInteractionResponse,
     SearchUserProfileResponse,
     SetConfigResponse,
@@ -18,8 +22,19 @@ from reflexio.models.api_schema.retriever_schema import (
 )
 from reflexio.models.api_schema.service_schemas import (
     PublishUserInteractionResponse,
+    Status,
+    UserProfile,
 )
-from reflexio.models.config_schema import Config, StorageConfigSQLite
+from reflexio.models.config_schema import (
+    Config,
+    RetrievalExperimentConfig,
+    RetrievalExperimentRecord,
+    StorageConfigSQLite,
+)
+from reflexio.server.rate_limit import limiter
+from reflexio.server.services.configurator.config_storage import (
+    ConfigWriteConflictError,
+)
 
 
 class TestHealthEndpoints:
@@ -48,17 +63,18 @@ class TestPublishInteraction:
 
     @staticmethod
     def _publish_payload():
+        # Every key inside interaction_data_list must be a real InteractionData
+        # field. This fixture previously sent user_message/agent_message/
+        # interaction_type -- none of which exist on the model -- so it posted
+        # an interaction that bound to nothing and stored content=''. It still
+        # asserted 200, which is exactly the silent failure this suite now
+        # guards against.
         return {
             "user_id": "user-1",
             "session_id": "sess-1",
             "interaction_data_list": [
-                {
-                    "user_id": "user-1",
-                    "session_id": "sess-1",
-                    "interaction_type": "conversation",
-                    "user_message": "Hello",
-                    "agent_message": "Hi there!",
-                }
+                {"role": "User", "content": "Hello"},
+                {"role": "Agent", "content": "Hi there!"},
             ],
         }
 
@@ -67,9 +83,18 @@ class TestPublishInteraction:
             success=True, message="Interaction processed"
         )
 
-        with patch(
-            "reflexio.server.api_endpoints.publisher_api.add_user_interaction",
-            return_value=mock_response,
+        def run_immediately(**kwargs):
+            return kwargs["fn"]()
+
+        with (
+            patch(
+                "reflexio.server.routes._common.run_with_operation_limit",
+                side_effect=run_immediately,
+            ) as run_with_operation_limit,
+            patch(
+                "reflexio.server.api_endpoints.publisher_api.add_user_interaction",
+                return_value=mock_response,
+            ) as add_user_interaction,
         ):
             response = client.post(
                 "/api/publish_interaction",
@@ -79,6 +104,9 @@ class TestPublishInteraction:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert run_with_operation_limit.call_args.kwargs["operation"] == "publish"
+        add_user_interaction.assert_called_once()
+        assert add_user_interaction.call_args.kwargs["use_publish_limiter"] is False
 
     def test_async_publish_returns_queued(self, client, patched_reflexio):
         """Async mode returns immediate acknowledgement without calling publisher."""
@@ -91,26 +119,82 @@ class TestPublishInteraction:
         assert data["success"] is True
         assert "queued" in data["message"].lower()
 
-    def test_async_publish_does_not_wait_forever_for_limiter_capacity(
+    def test_async_publish_rejects_contentless_interactions(
         self, client, patched_reflexio
     ):
-        captured: dict[str, bool] = {}
+        """A contentless publish must 422 on the async path too.
 
-        def _fake_run_with_limit(**kwargs):
-            captured["wait_forever"] = kwargs["wait_forever"]
-            return kwargs["fn"]()
+        This is the regression that matters most: the async path returns 200
+        "queued" before the publisher runs, and discards the publisher's result,
+        so a rejection there is invisible to the caller. Validating on the
+        request model is what makes this path fail loudly. Previously this
+        returned 200 and silently stored rows with content=''.
+        """
+        payload = self._publish_payload()
+        payload["interaction_data_list"] = [{"role": "User"}]
+        response = client.post("/api/publish_interaction", json=payload)
+        assert response.status_code == 422
+        assert "is empty" in response.text
+
+    def test_async_publish_accepts_plugin_wire_shape(self, client, patched_reflexio):
+        """Regression: a request-level key on an interaction must not break.
+
+        Both first-party plugins build their wire payload with a denylist, so
+        every turn carries ``user_id``. Rejecting unknown keys wedged them into
+        a silent retry loop that never published again, so they stay ignored.
+        """
+        payload = self._publish_payload()
+        payload["interaction_data_list"] = [
+            {"role": "User", "content": "how do I do X?", "user_id": "proj-a"}
+        ]
+        response = client.post("/api/publish_interaction", json=payload)
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+    def test_background_publish_rejection_is_logged(
+        self, client, patched_reflexio, caplog
+    ):
+        """A discarded background ``success=False`` must leave a trace.
+
+        The async path hands the caller 200 "queued" and throws the publisher's
+        return value away, so this log line is the only evidence a rejected
+        publish ever produces. The reason string is deliberately withheld -- it
+        can be an unbounded ``str(e)`` and reporters may ingest ERROR bodies unscrubbed.
+        """
+        import logging
 
         with (
             patch(
-                "reflexio.server.api.run_with_operation_limit",
-                side_effect=_fake_run_with_limit,
+                "reflexio.server.api_endpoints.publisher_api.add_user_interaction",
+                return_value=PublishUserInteractionResponse(
+                    success=False, message="CUSTOMER-SECRET-XYZ"
+                ),
+            ),
+            caplog.at_level(
+                logging.ERROR, logger="reflexio.server.routes.interactions"
+            ),
+        ):
+            response = client.post(
+                "/api/publish_interaction", json=self._publish_payload()
+            )
+        assert response.status_code == 200
+        assert "Background publish rejected" in caplog.text
+        assert "CUSTOMER-SECRET-XYZ" not in caplog.text
+
+    def test_async_publish_does_not_gate_durable_write_on_limiter(
+        self, client, patched_reflexio
+    ):
+        with (
+            patch(
+                "reflexio.server.routes._common.run_with_operation_limit",
+                side_effect=AssertionError("publish limiter should not wrap storage"),
             ),
             patch(
                 "reflexio.server.api_endpoints.publisher_api.add_user_interaction",
                 return_value=PublishUserInteractionResponse(
                     success=True, message="Interaction processed"
                 ),
-            ),
+            ) as add_user_interaction,
         ):
             response = client.post(
                 "/api/publish_interaction",
@@ -118,17 +202,109 @@ class TestPublishInteraction:
             )
 
         assert response.status_code == 200
-        assert captured["wait_forever"] is False
+        add_user_interaction.assert_called_once()
+        assert add_user_interaction.call_args.kwargs["defer_learning"] is True
 
     def test_publish_missing_body_returns_422(self, client):
         response = client.post("/api/publish_interaction")
         assert response.status_code == 422
+
+    def test_async_publish_reports_unknown_field_in_warnings(
+        self, client, patched_reflexio
+    ):
+        """A mis-keyed field is accepted but reported, never silently dropped.
+
+        Asserts on the parsed ``warnings`` list rather than a substring of
+        ``response.text``: a 422 echoes the whole request body in ``input``, so a
+        substring check passes even with the feature removed entirely. That
+        false-pass was demonstrated by mutation on an earlier revision.
+        """
+        payload = self._publish_payload()
+        payload["interaction_data_list"] = [
+            {"role": "User", "content": "hi", "Content": "typo"}
+        ]
+        response = client.post("/api/publish_interaction", json=payload)
+        assert response.status_code == 200
+        warnings = response.json()["warnings"]
+        assert any("Content" in warning for warning in warnings), warnings
+        # Names only — never the value.
+        assert not any("typo" in warning for warning in warnings), warnings
+
+    def test_async_publish_reports_skipped_empty_rows(self, client, patched_reflexio):
+        payload = self._publish_payload()
+        payload["interaction_data_list"] = [
+            {"role": "User", "content": "REAL"},
+            {"role": "Agent", "content": ""},
+        ]
+        response = client.post("/api/publish_interaction", json=payload)
+        assert response.status_code == 200
+        assert any(
+            "skipped 1 empty" in warning for warning in response.json()["warnings"]
+        ), response.json()["warnings"]
+
+    def test_sync_publish_appends_payload_warnings_to_service_warnings(
+        self, client, patched_reflexio
+    ):
+        """The sync path must APPEND, not assign.
+
+        ``warnings`` already carries extraction-stall warnings from the
+        generation service, which the CLI renders — and the sync path is what
+        the CLI uses. Assigning the payload warnings over them drops the
+        service's, while dropping the append entirely loses the payload's; both
+        mutations are invisible to every other test here, which posts without
+        ``wait_for_response``.
+        """
+        mock_response = PublishUserInteractionResponse(
+            success=True,
+            message="Interaction processed",
+            warnings=["extraction stalled: provider auth"],
+        )
+
+        def run_immediately(**kwargs):
+            return kwargs["fn"]()
+
+        payload = self._publish_payload()
+        payload["interaction_data_list"] = [
+            {"role": "User", "content": "hi", "Content": "typo"}
+        ]
+        with (
+            patch(
+                "reflexio.server.routes._common.run_with_operation_limit",
+                side_effect=run_immediately,
+            ),
+            patch(
+                "reflexio.server.api_endpoints.publisher_api.add_user_interaction",
+                return_value=mock_response,
+            ),
+        ):
+            response = client.post(
+                "/api/publish_interaction",
+                params={"wait_for_response": "true"},
+                json=payload,
+            )
+
+        assert response.status_code == 200
+        warnings = response.json()["warnings"]
+        assert "extraction stalled: provider auth" in warnings, warnings
+        assert any("Content" in warning for warning in warnings), warnings
+        # Names only — never the value.
+        assert not any("typo" in warning for warning in warnings), warnings
+
+    def test_clean_publish_reports_no_warnings(self, client, patched_reflexio):
+        response = client.post("/api/publish_interaction", json=self._publish_payload())
+        assert response.status_code == 200
+        # Indexed, not ``.get(...)``: a default would pass even if ``warnings``
+        # disappeared from the response schema entirely.
+        assert response.json()["warnings"] == []
 
 
 class TestSearchEndpoints:
     """Tests for search endpoints."""
 
     def test_search_profiles_returns_200(self, client, patched_reflexio, mock_reflexio):
+        mock_reflexio.request_context.configurator.get_config.return_value = Config(
+            storage_config=StorageConfigSQLite()
+        )
         mock_reflexio.search_user_profiles.return_value = SearchUserProfileResponse(
             success=True,
             user_profiles=[],
@@ -165,6 +341,56 @@ class TestSearchEndpoints:
     def test_search_profiles_missing_body_returns_422(self, client):
         response = client.post("/api/search_profiles")
         assert response.status_code == 422
+
+
+class TestGetAllProfilesRoute:
+    """Tests for GET /api/get_all_profiles."""
+
+    def test_exact_profile_lookup_includes_tombstones_when_requested(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        profile = UserProfile(
+            profile_id="p-superseded",
+            user_id="project-1",
+            content="old preference",
+            last_modified_timestamp=123,
+            generated_from_request_id="req-1",
+            status=Status.SUPERSEDED,
+        )
+        mock_storage = MagicMock()
+        mock_storage.get_profile_by_id.return_value = profile
+        mock_reflexio.request_context.storage = mock_storage
+
+        response = client.get(
+            "/api/get_all_profiles",
+            params={
+                "profile_id": "p-superseded",
+                "include_tombstones": "true",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["user_profiles"][0]["profile_id"] == "p-superseded"
+        assert data["user_profiles"][0]["status"] == "superseded"
+        mock_storage.get_profile_by_id.assert_called_once_with(
+            "p-superseded", include_tombstones=True
+        )
+
+    def test_list_profiles_still_uses_existing_reflexio_method(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        mock_reflexio.get_all_profiles.return_value = GetProfilesViewResponse(
+            success=True,
+            user_profiles=[],
+            msg="Found 0 profile(s)",
+        )
+
+        response = client.get("/api/get_all_profiles", params={"limit": 10})
+
+        assert response.status_code == 200
+        mock_reflexio.get_all_profiles.assert_called_once()
 
 
 class TestUpdateUserProfileRoute:
@@ -206,9 +432,46 @@ class TestUpdateUserProfileRoute:
 class TestSetConfigRoute:
     """Tests for POST /api/set_config (full replacement semantics)."""
 
+    def test_passes_exact_config_returned_by_normalizer(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        payload = {
+            "storage_config": {
+                "db_path": str(Path(tempfile.gettempdir()) / "set-config.db")
+            }
+        }
+        normalized = Config.model_validate(payload)
+        configurator = mock_reflexio.request_context.configurator
+        configurator.get_config.return_value = Config(
+            storage_config=StorageConfigSQLite()
+        )
+        configurator.normalize_config_payload.return_value = normalized
+        mock_reflexio.set_config.return_value = SetConfigResponse(
+            success=True, msg="Configuration set successfully"
+        )
+
+        response = client.post("/api/set_config", json=payload)
+
+        assert response.status_code == 200, response.text
+        configurator.normalize_config_payload.assert_called_once_with(
+            {
+                **payload,
+                "retrieval_experiment_config": None,
+                "retrieval_experiment_history": [],
+            }
+        )
+        mock_reflexio.set_config.assert_called_once_with(normalized)
+        assert mock_reflexio.set_config.call_args.args[0] is normalized
+
     def test_unknown_field_returns_422_before_set_config(
         self, client, patched_reflexio, mock_reflexio
     ):
+        configurator = mock_reflexio.request_context.configurator
+        configurator.get_config.return_value = Config(
+            storage_config=StorageConfigSQLite()
+        )
+        configurator.normalize_config_payload.side_effect = lambda payload: payload
+
         response = client.post(
             "/api/set_config",
             json={
@@ -222,16 +485,53 @@ class TestSetConfigRoute:
         assert response.status_code == 422, response.text
         mock_reflexio.set_config.assert_not_called()
 
+    def test_omitted_experiment_fields_are_preserved(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        existing = Config(
+            storage_config=StorageConfigSQLite(),
+            retrieval_experiment_config=RetrievalExperimentConfig(
+                experiment_id="exp-1", holdout_percentage=10
+            ),
+            retrieval_experiment_history=[
+                RetrievalExperimentRecord(
+                    experiment_id="exp-1",
+                    holdout_percentage=10,
+                    started_at=100,
+                )
+            ],
+        )
+        configurator = mock_reflexio.request_context.configurator
+        configurator.get_config.return_value = existing
+        configurator.normalize_config_payload.side_effect = Config.model_validate
+        mock_reflexio.set_config.return_value = SetConfigResponse(
+            success=True, msg="Configuration set successfully"
+        )
+
+        response = client.post(
+            "/api/set_config",
+            json={"storage_config": {}, "window_size": 25},
+        )
+
+        assert response.status_code == 200, response.text
+        saved = mock_reflexio.set_config.call_args.args[0]
+        assert saved.retrieval_experiment_config == existing.retrieval_experiment_config
+        assert (
+            saved.retrieval_experiment_history == existing.retrieval_experiment_history
+        )
+
 
 class TestUpdateConfigRoute:
     """Tests for POST /api/update_config (PATCH-style partial update).
 
     The endpoint fetches the existing config, shallow-merges the partial
-    payload over it, and round-trips through ``Config(**merged)`` so
-    Pydantic rejects unknown fields. Storage validation lives in
-    ``reflexio.set_config``; we mock it out and assert the merged dict
-    that arrives there.
+    payload over it, and delegates to the active configurator before shared
+    Pydantic validation. Storage validation lives in ``reflexio.set_config``.
     """
+
+    @pytest.fixture(autouse=True)
+    def _reset_rate_limit(self) -> None:
+        limiter.reset()
 
     @staticmethod
     def _existing_config() -> Config:
@@ -245,6 +545,14 @@ class TestUpdateConfigRoute:
     def _wire_mock(self, mock_reflexio: MagicMock, existing: Config) -> None:
         configurator = MagicMock()
         configurator.get_config.return_value = existing
+        configurator.normalize_config_payload.side_effect = lambda payload: payload
+        configurator.prepare_config_patch.side_effect = lambda partial: (
+            Config.model_validate(
+                configurator.normalize_config_payload(
+                    {**existing.model_dump(mode="python"), **partial}
+                )
+            )
+        )
         mock_reflexio.request_context.configurator = configurator
         mock_reflexio.set_config.return_value = SetConfigResponse(
             success=True, msg="Configuration set successfully"
@@ -254,7 +562,9 @@ class TestUpdateConfigRoute:
         existing = self._existing_config()
         self._wire_mock(mock_reflexio, existing)
 
-        with patch("reflexio.server.api.invalidate_reflexio_cache") as mock_invalidate:
+        with patch(
+            "reflexio.server.cache.reflexio_cache.invalidate_reflexio_cache"
+        ) as mock_invalidate:
             response = client.post(
                 "/api/update_config",
                 json={"window_size": 25},
@@ -271,8 +581,91 @@ class TestUpdateConfigRoute:
         assert isinstance(merged, Config)
         assert merged.window_size == 25
         assert merged.storage_config == existing.storage_config
+        configurator = mock_reflexio.request_context.configurator
+        configurator.prepare_config_patch.assert_called_once_with({"window_size": 25})
 
         # Cache invalidated on success.
+        mock_invalidate.assert_called_once_with(org_id="test-org")
+
+    def test_rejects_direct_experiment_lifecycle_mutation(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        existing = self._existing_config()
+        self._wire_mock(mock_reflexio, existing)
+
+        response = client.post(
+            "/api/update_config",
+            json={
+                "retrieval_experiment_config": {
+                    "experiment_id": "exp-1",
+                    "holdout_percentage": 10,
+                }
+            },
+        )
+
+        assert response.status_code == 409, response.text
+        mock_reflexio.set_config.assert_not_called()
+
+    def test_patch_uses_prepared_config_instance(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        existing = self._existing_config()
+        self._wire_mock(mock_reflexio, existing)
+        configurator = mock_reflexio.request_context.configurator
+        prepared = existing.model_copy(update={"window_size": 31})
+        object.__setattr__(prepared, "_patch_marker", "prepared")
+        configurator.prepare_config_patch.return_value = prepared
+        configurator.prepare_config_patch.side_effect = None
+
+        response = client.post("/api/update_config", json={"window_size": 31})
+
+        assert response.status_code == 200, response.text
+        assert mock_reflexio.set_config.call_args.args[0] is prepared
+
+    def test_no_op_patch_skips_set_config_and_cache_invalidation(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        existing = self._existing_config()
+        self._wire_mock(mock_reflexio, existing)
+
+        with patch(
+            "reflexio.server.cache.reflexio_cache.invalidate_reflexio_cache"
+        ) as mock_invalidate:
+            response = client.post(
+                "/api/update_config",
+                json={"window_size": existing.window_size},
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "success": True,
+            "msg": "Configuration unchanged",
+        }
+        mock_reflexio.set_config.assert_not_called()
+        mock_invalidate.assert_not_called()
+
+    def test_managed_patch_matching_cache_is_persisted(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        """A durable managed snapshot may have changed after the cached read."""
+        existing = self._existing_config()
+        self._wire_mock(mock_reflexio, existing)
+        configurator = mock_reflexio.request_context.configurator
+        configurator.requires_durable_config_patch = True
+
+        with patch(
+            "reflexio.server.cache.reflexio_cache.invalidate_reflexio_cache"
+        ) as mock_invalidate:
+            response = client.post(
+                "/api/update_config",
+                json={"window_size": existing.window_size},
+            )
+
+        assert response.status_code == 200, response.text
+        assert mock_reflexio.set_config.call_count == 1
+        assert mock_reflexio.set_config.call_args.args[0].window_size == (
+            existing.window_size
+        )
         mock_invalidate.assert_called_once_with(org_id="test-org")
 
     def test_unknown_field_returns_422_before_set_config(
@@ -289,6 +682,64 @@ class TestUpdateConfigRoute:
 
         assert response.status_code == 422, response.text
         mock_reflexio.set_config.assert_not_called()
+
+    def test_overlay_field_is_validated_by_configurator_before_shared_config(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        existing = self._existing_config()
+        self._wire_mock(mock_reflexio, existing)
+        configurator = mock_reflexio.request_context.configurator
+        normalized = existing.model_copy(update={"window_size": 25})
+        object.__setattr__(normalized, "_overlay_marker", "normalized")
+        configurator.normalize_config_payload.return_value = normalized
+        configurator.normalize_config_payload.side_effect = None
+
+        response = client.post(
+            "/api/update_config",
+            json={"offline_tuner_config": {"enabled": True}, "window_size": 25},
+        )
+
+        assert response.status_code == 200, response.text
+        patch_payload = configurator.prepare_config_patch.call_args.args[0]
+        assert patch_payload["offline_tuner_config"] == {"enabled": True}
+        assert mock_reflexio.set_config.call_args.args[0] is normalized
+
+    def test_configurator_capability_error_propagates(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        existing = self._existing_config()
+        self._wire_mock(mock_reflexio, existing)
+        configurator = mock_reflexio.request_context.configurator
+        configurator.normalize_config_payload.side_effect = HTTPException(
+            status_code=409,
+            detail={"error": "replay_unsupported"},
+        )
+
+        response = client.post(
+            "/api/update_config",
+            json={"offline_tuner_config": {"enabled": True}},
+        )
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == {"error": "replay_unsupported"}
+        mock_reflexio.set_config.assert_not_called()
+
+    def test_config_write_conflict_returns_409(
+        self, client, patched_reflexio, mock_reflexio
+    ):
+        existing = self._existing_config()
+        self._wire_mock(mock_reflexio, existing)
+        mock_reflexio.set_config.side_effect = ConfigWriteConflictError(
+            "Configuration changed while writing"
+        )
+
+        response = client.post("/api/update_config", json={"window_size": 25})
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == {
+            "error": "config_write_conflict",
+            "message": "Configuration changed while writing",
+        }
 
     def test_replaces_nested_object_wholesale(
         self, client, patched_reflexio, mock_reflexio
@@ -312,14 +763,14 @@ class TestUpdateConfigRoute:
     ):
         """When reflexio.set_config returns success=False, cache stays warm."""
         existing = self._existing_config()
-        configurator = MagicMock()
-        configurator.get_config.return_value = existing
-        mock_reflexio.request_context.configurator = configurator
+        self._wire_mock(mock_reflexio, existing)
         mock_reflexio.set_config.return_value = SetConfigResponse(
             success=False, msg="storage validation failed"
         )
 
-        with patch("reflexio.server.api.invalidate_reflexio_cache") as mock_invalidate:
+        with patch(
+            "reflexio.server.cache.reflexio_cache.invalidate_reflexio_cache"
+        ) as mock_invalidate:
             response = client.post(
                 "/api/update_config",
                 json={"window_size": 25},
@@ -379,7 +830,7 @@ class TestUpdateConfigRoute:
         existing = self._existing_config()
         self._wire_mock(mock_reflexio, existing)
 
-        with patch("reflexio.server.api.invalidate_reflexio_cache"):
+        with patch("reflexio.server.cache.reflexio_cache.invalidate_reflexio_cache"):
             response = client.post(
                 "/api/update_config",
                 json={
@@ -409,7 +860,7 @@ class TestUpdateConfigRoute:
         existing = self._existing_config_with_playbooks()
         self._wire_mock(mock_reflexio, existing)
 
-        with patch("reflexio.server.api.invalidate_reflexio_cache"):
+        with patch("reflexio.server.cache.reflexio_cache.invalidate_reflexio_cache"):
             response = client.post(
                 "/api/update_config",
                 json={
@@ -431,7 +882,7 @@ class TestUpdateConfigRoute:
         existing = self._existing_config_with_playbooks()
         self._wire_mock(mock_reflexio, existing)
 
-        with patch("reflexio.server.api.invalidate_reflexio_cache"):
+        with patch("reflexio.server.cache.reflexio_cache.invalidate_reflexio_cache"):
             response = client.post(
                 "/api/update_config",
                 json={"window_size": 25},

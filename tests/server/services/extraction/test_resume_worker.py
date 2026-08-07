@@ -15,7 +15,11 @@ from reflexio.models.config_schema import (
     StorageConfigSQLite,
 )
 from reflexio.server.api_endpoints.request_context import RequestContext
-from reflexio.server.services.extraction.resume_worker import ExtractionResumeWorker
+from reflexio.server.services.extraction.resume_worker import (
+    ExtractionResumeWorker,
+    _run_playbook_contract_selection,
+    _run_uses_strict_playbook_evidence,
+)
 from reflexio.server.services.storage.sqlite_storage import SQLiteStorage
 from reflexio.server.services.storage.storage_base import (
     AgentBinding,
@@ -59,6 +63,75 @@ def request_context(storage):
         f"{prompt_id}: {variables}"
     )
     return ctx
+
+
+@pytest.mark.parametrize(
+    ("schema_name", "expected"),
+    [
+        ("StructuredReferencedExtractedPlaybookList", True),
+        ("StructuredExtractedPlaybookList", True),
+        ("StructuredPlaybookList", False),
+    ],
+)
+def test_playbook_resume_uses_schema_recorded_at_run_creation(
+    request_context, schema_name, expected
+):
+    run = AgentRunRecord(
+        id="playbook_run",
+        binding=AgentBinding(
+            org_id="org_1",
+            extractor_kind="playbook",
+            user_id=None,
+            request_id="request_1",
+            agent_version="v1",
+            source="api",
+            source_interaction_ids=[1],
+        ),
+        status=AgentRunStatus.RUNNING,
+        generation_request_snapshot={"output_schema_name": schema_name},
+    )
+
+    assert (
+        _run_uses_strict_playbook_evidence(
+            request_context,
+            run,
+            expert=False,
+        )
+        is expected
+    )
+    request_context.prompt_manager.get_active_version.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("schema_name", "expected"),
+    [
+        ("StructuredReferencedExtractedPlaybookList", (True, True)),
+        ("StructuredExtractedPlaybookList", (True, False)),
+        ("StructuredPlaybookList", (False, False)),
+    ],
+)
+def test_playbook_resume_pins_evidence_reference_mode(
+    request_context, schema_name, expected
+):
+    run = AgentRunRecord(
+        id="playbook_run",
+        binding=AgentBinding(
+            org_id="org_1",
+            extractor_kind="playbook",
+            user_id=None,
+            request_id="request_1",
+            agent_version="v1",
+            source="api",
+            source_interaction_ids=[1],
+        ),
+        status=AgentRunStatus.RUNNING,
+        generation_request_snapshot={"output_schema_name": schema_name},
+    )
+
+    assert (
+        _run_playbook_contract_selection(request_context, run, expert=False) == expected
+    )
+    request_context.prompt_manager.get_active_version.assert_not_called()
 
 
 def _seed_interactions(storage: SQLiteStorage) -> None:
@@ -175,10 +248,12 @@ def test_resume_worker_resumes_profile_run_and_consumes_dependency(
     with (
         patch("litellm.completion", side_effect=[response]),
         patch(
-            "reflexio.server.site_var.feature_flags.is_deduplicator_enabled",
-            return_value=False,
-        ),
+            "reflexio.server.services.profile.components.consolidator.ProfileConsolidator",
+        ) as mock_consolidator_cls,
     ):
+        mock_consolidator_cls.return_value.deduplicate.side_effect = (
+            lambda profiles, _user_id, _request_id: (profiles, [], [])
+        )
         resumed = worker.drain(max_runs=1)
 
     assert resumed == 1
@@ -260,6 +335,52 @@ def test_resume_worker_retries_finalization_without_rerunning_agent(
     assert retried is not None
     assert retried.status == AgentRunStatus.FINALIZED
     assert storage.list_run_tool_dependencies("run_1")[0].consumed_at is not None
+
+
+@pytest.mark.parametrize(
+    ("extractor_kind", "finalize_path", "entity_type"),
+    [
+        (
+            "profile",
+            "reflexio.server.services.profile.service."
+            "ProfileGenerationService._finalize_extracted_items",
+            "profile",
+        ),
+        (
+            "playbook",
+            "reflexio.server.services.playbook.service."
+            "PlaybookGenerationService._finalize_extracted_items",
+            "user_playbook",
+        ),
+    ],
+)
+def test_resume_bills_only_items_that_survive_finalization(
+    request_context, extractor_kind, finalize_path, entity_type
+):
+    run = AgentRunRecord(
+        id="survivor-run",
+        binding=AgentBinding(
+            org_id="org_1",
+            extractor_kind=extractor_kind,
+            user_id="user_1",
+            request_id="request_1",
+            agent_version="v1",
+            source="api",
+        ),
+        status=AgentRunStatus.FINALIZING,
+        generation_request_snapshot={},
+    )
+    dropped = object()
+    survivor = object()
+    worker = ExtractionResumeWorker(request_context=request_context)
+
+    with (
+        patch(finalize_path, return_value=[survivor]),
+        patch.object(worker, "_record_finalized_learnings") as record,
+    ):
+        worker._finalize_items(run, [dropped, survivor])
+
+    record.assert_called_once_with(run, [survivor], entity_type=entity_type)
 
 
 def test_resume_worker_tagging_schedule_failure_is_best_effort(

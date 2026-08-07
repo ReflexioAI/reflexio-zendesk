@@ -230,5 +230,34 @@ if DEBUG_LOG_TO_CONSOLE:
         logging.ERROR
     )
 else:
-    # Default to WARNING level when DEBUG_LOG_TO_CONSOLE is not set or is false
+    # Production (DEBUG_LOG_TO_CONSOLE off): default the root logger to WARNING.
+    # App-wide INFO on a busy server drove ~3x log volume and grew memory to the
+    # container ceiling over a few hours (prod incident 2026-07-04) — so INFO is
+    # OPT-IN per subsystem, not global. A stdout StreamHandler is still attached at
+    # INFO so that any logger explicitly raised to INFO reaches the container log
+    # driver (e.g. CloudWatch awslogs); everything else stays WARNING+ and cheap.
+    #
+    # REFLEXIO_INFO_LOGGERS: comma-separated logger-name prefixes to surface at INFO
+    # (e.g. the billing money-path). Empty/unset => WARNING-only (the safe default).
     root_logger.setLevel(logging.WARNING)
+    if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+        prod_console_handler = logging.StreamHandler(sys.stdout)
+        prod_console_handler.setLevel(logging.INFO)
+        prod_console_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+        )
+        root_logger.addHandler(prod_console_handler)
+
+    for _info_logger in (
+        name.strip()
+        for name in os.getenv("REFLEXIO_INFO_LOGGERS", "").split(",")
+        if name.strip()
+    ):
+        logging.getLogger(_info_logger).setLevel(logging.INFO)
+
+    # Keep noisy loggers quiet regardless of the above (mirror the debug branch).
+    for _noisy in ("litellm", "LiteLLM", "httpx", "httpcore", "openai", "urllib3"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+    logging.getLogger("reflexio.server.site_var.site_var_manager").setLevel(
+        logging.ERROR
+    )

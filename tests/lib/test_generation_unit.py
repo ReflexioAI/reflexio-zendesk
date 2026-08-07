@@ -5,6 +5,7 @@ rerun_profile_generation, manual_profile_generation, rerun_playbook_generation,
 manual_playbook_generation, and storage-not-configured error handling.
 """
 
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,7 +22,11 @@ from reflexio.models.api_schema.service_schemas import (
     RerunProfileGenerationRequest,
     RerunProfileGenerationResponse,
 )
-from reflexio.server.services.playbook.user_detail_stripping import PassthroughStripper
+from reflexio.server.extensions import register_service
+from reflexio.server.services.playbook.aggregation_prompt_processing import (
+    AGGREGATION_PROMPT_PROCESSOR,
+    PassthroughPromptProcessor,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,14 +54,8 @@ def _make_mixin(*, storage_configured: bool = True) -> GenerationMixin:
 
 
 class TestRunPlaybookAggregation:
-    @patch(
-        "reflexio.server.services.playbook.user_detail_stripping.create_aggregation_user_detail_stripper",
-        return_value=None,
-    )
     @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
-    def test_calls_aggregator_run_with_correct_args(
-        self, mock_agg_cls, mock_create_stripper
-    ):
+    def test_calls_aggregator_run_with_correct_args(self, mock_agg_cls):
         """Constructs PlaybookAggregator and calls run() with correct request."""
         mixin = _make_mixin()
         mock_agg_instance = MagicMock()
@@ -70,55 +69,49 @@ class TestRunPlaybookAggregation:
             request_context=mixin.request_context,
             agent_version="v2",
         )
-        mock_create_stripper.assert_called_once_with(mixin.request_context.configurator)
         mock_agg_instance.run.assert_called_once()
         request_arg = mock_agg_instance.run.call_args[0][0]
         assert request_arg.agent_version == "v2"
         assert request_arg.rerun is True
 
     @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
-    def test_injects_factory_stripper(self, mock_agg_cls):
-        """Passes a configured user-detail stripper to manual aggregation."""
-        stripper = PassthroughStripper()
+    def test_injects_registered_processor(self, mock_agg_cls):
+        """Passes a registered prompt processor to manual aggregation."""
+        processor: Any = PassthroughPromptProcessor()
+        register_service(AGGREGATION_PROMPT_PROCESSOR, processor, override=True)
         mixin = _make_mixin()
 
         mock_agg_instance = MagicMock()
         mock_agg_cls.return_value = mock_agg_instance
 
-        with patch(
-            "reflexio.server.services.playbook.user_detail_stripping.create_aggregation_user_detail_stripper",
-            return_value=stripper,
-        ) as mock_create_stripper:
-            mixin.run_playbook_aggregation(agent_version="v2")
+        mixin.run_playbook_aggregation(agent_version="v2")
 
         mock_agg_cls.assert_called_once_with(
             llm_client=mixin.llm_client,
             request_context=mixin.request_context,
             agent_version="v2",
-            user_detail_stripper=stripper,
+            aggregation_prompt_processor=processor,
         )
-        mock_create_stripper.assert_called_once_with(mixin.request_context.configurator)
         mock_agg_instance.run.assert_called_once()
 
     @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
-    def test_does_not_thread_stripper_prompt_text_as_separate_kwarg(self, mock_agg_cls):
+    def test_does_not_thread_processor_prompt_text_as_separate_kwarg(
+        self, mock_agg_cls
+    ):
+        processor: Any = PassthroughPromptProcessor()
+        processor.prompt_extra_instructions = "Extra aggregation instruction."
+        register_service(AGGREGATION_PROMPT_PROCESSOR, processor, override=True)
         mixin = _make_mixin()
-        stripper = PassthroughStripper()
-        stripper.prompt_extra_instructions = "Extra aggregation instruction."
         mock_agg_instance = MagicMock()
         mock_agg_cls.return_value = mock_agg_instance
 
-        with patch(
-            "reflexio.server.services.playbook.user_detail_stripping.create_aggregation_user_detail_stripper",
-            return_value=stripper,
-        ):
-            mixin.run_playbook_aggregation(agent_version="v2")
+        mixin.run_playbook_aggregation(agent_version="v2")
 
         mock_agg_cls.assert_called_once_with(
             llm_client=mixin.llm_client,
             request_context=mixin.request_context,
             agent_version="v2",
-            user_detail_stripper=stripper,
+            aggregation_prompt_processor=processor,
         )
         mock_agg_instance.run.assert_called_once()
 
@@ -128,6 +121,88 @@ class TestRunPlaybookAggregation:
 
         with pytest.raises(ValueError, match=STORAGE_NOT_CONFIGURED_MSG):
             mixin.run_playbook_aggregation(agent_version="v1", playbook_name="fb")
+
+    @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
+    def test_admin_rerun_uses_configured_min_interval(
+        self, mock_agg_cls, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("REFLEXIO_AGGREGATION_MIN_INTERVAL_SECONDS", "123")
+        mixin = _make_mixin()
+        storage = cast(Any, mixin.request_context.storage)
+        storage.supports_incremental_playbook_aggregation = True
+        storage.claim_due_playbook_aggregation.return_value = MagicMock()
+        storage.finish_playbook_aggregation_claim.return_value = True
+
+        mixin.run_playbook_aggregation(agent_version="v1")
+
+        assert storage.finish_playbook_aggregation_claim.call_args.kwargs == {
+            "success": True,
+            "retry_after_seconds": 60,
+            "backlog_retry_after_seconds": 1,
+            "min_interval_seconds": 123,
+        }
+
+    @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
+    def test_failed_admin_rerun_uses_configured_min_interval(
+        self, mock_agg_cls, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("REFLEXIO_AGGREGATION_MIN_INTERVAL_SECONDS", "123")
+        mixin = _make_mixin()
+        storage = cast(Any, mixin.request_context.storage)
+        storage.supports_incremental_playbook_aggregation = True
+        storage.claim_due_playbook_aggregation.return_value = MagicMock()
+        mock_agg_cls.return_value.run.side_effect = RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            mixin.run_playbook_aggregation(agent_version="v1")
+
+        assert storage.finish_playbook_aggregation_claim.call_args.kwargs == {
+            "success": False,
+            "retry_after_seconds": 60,
+            "backlog_retry_after_seconds": 1,
+            "min_interval_seconds": 123,
+        }
+
+    @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
+    @patch(
+        "reflexio.server.services.playbook.aggregation_scheduler.AggregationLeaseHeartbeat"
+    )
+    def test_admin_rerun_finishes_with_heartbeat_renewed_claim(
+        self, heartbeat_cls, mock_agg_cls
+    ) -> None:
+        mixin = _make_mixin()
+        storage = cast(Any, mixin.request_context.storage)
+        storage.supports_incremental_playbook_aggregation = True
+        original_claim = MagicMock(name="original_claim")
+        renewed_claim = MagicMock(name="renewed_claim")
+        storage.claim_due_playbook_aggregation.return_value = original_claim
+        storage.finish_playbook_aggregation_claim.return_value = True
+        heartbeat_cls.return_value.claim = renewed_claim
+
+        mixin.run_playbook_aggregation(agent_version="v1")
+
+        heartbeat_cls.return_value.start.assert_called_once_with()
+        heartbeat_cls.return_value.stop.assert_called_once_with()
+        heartbeat_cls.return_value.require_live.assert_called_once_with()
+        assert storage.finish_playbook_aggregation_claim.call_args.args == (
+            renewed_claim,
+        )
+
+    @patch("reflexio.server.services.playbook.components.aggregator.PlaybookAggregator")
+    def test_admin_rerun_preserves_original_error_when_claim_cleanup_fails(
+        self, mock_agg_cls
+    ) -> None:
+        mixin = _make_mixin()
+        storage = cast(Any, mixin.request_context.storage)
+        storage.supports_incremental_playbook_aggregation = True
+        storage.claim_due_playbook_aggregation.return_value = MagicMock()
+        storage.finish_playbook_aggregation_claim.side_effect = RuntimeError(
+            "cleanup failed"
+        )
+        mock_agg_cls.return_value.run.side_effect = ValueError("aggregation failed")
+
+        with pytest.raises(ValueError, match="aggregation failed"):
+            mixin.run_playbook_aggregation(agent_version="v1")
 
 
 # ---------------------------------------------------------------------------

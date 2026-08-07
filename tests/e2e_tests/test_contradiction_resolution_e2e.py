@@ -1,7 +1,7 @@
 """End-to-end test for write-time contradiction resolution.
 
-Verifies the load-bearing invariant of the reflection-extraction-polarity
-feature at the consolidator boundary:
+Verifies the load-bearing no-self-contradiction invariant at the consolidator
+boundary:
 
 When an EXISTING positive ``UserPlaybook`` collides with a NEW
 failure-path-derived NEGATIVE candidate on the same trigger (a
@@ -56,6 +56,7 @@ import pytest
 
 from reflexio.models.api_schema.service_schemas import UserPlaybook
 from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.llm._litellm_types import CompletionResult, ModelProvenance
 from reflexio.server.llm.litellm_client import LiteLLMClient
 from reflexio.server.services.playbook.components.consolidator import (
     DifferentiateDecision,
@@ -230,7 +231,7 @@ def _drive_consolidator(
 ) -> tuple[list[UserPlaybook], list[int]]:
     """Run ``deduplicate`` with a scripted LLM and pre-fetched existing rows.
 
-    Patches ``_retrieve_existing_playbooks`` so the decision can reference
+    Patches ``retrieve_existing_playbooks`` so the decision can reference
     ``EXISTING-0`` without depending on the search backend's ranking
     behaviour. Mirrors ``_run_consolidator`` in the integration tests.
 
@@ -246,13 +247,15 @@ def _drive_consolidator(
         tuple[list[UserPlaybook], list[int]]: ``(rows_to_save,
         ids_to_delete)`` as returned by ``deduplicate``.
     """
-    consolidator.client.generate_chat_response.return_value = (  # type: ignore[attr-defined]
-        PlaybookConsolidationOutput(decisions=decisions)
+    consolidator.client.generate_chat_response_with_provenance.return_value = (  # type: ignore[attr-defined]
+        CompletionResult(
+            PlaybookConsolidationOutput(decisions=decisions), ModelProvenance()
+        )
     )
     with (
         patch.object(
             consolidator,
-            "_retrieve_existing_playbooks",
+            "retrieve_existing_playbooks",
             return_value=existing_playbooks,
         ),
         patch.dict("os.environ", {"MOCK_LLM_RESPONSE": "false"}),

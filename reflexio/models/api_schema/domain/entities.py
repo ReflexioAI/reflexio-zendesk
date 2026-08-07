@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
-from typing import Any, Literal, Self
+from hashlib import sha256
+from typing import Any, Final, Literal, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from reflexio.defaults import DEFAULT_AGENT_VERSION
 
@@ -11,7 +19,9 @@ from ..common import (
     NEVER_EXPIRES_TIMESTAMP,
     BlockingIssue,
     BlockingIssueKind,
+    CapturesUnknownFields,
     ToolUsed,
+    sanitise_for_log,
 )
 from ..validators import (
     EmbeddingVector,
@@ -24,6 +34,8 @@ from .enums import (
     PlaybookStatus,
     ProfileTimeToLive,
     RegularVsShadow,
+    SessionOutcomeFailureReason,
+    SessionOutcomeKind,
     Status,
     UserActionType,
 )
@@ -33,7 +45,11 @@ __all__ = [
     "BlockingIssue",
     "BlockingIssueKind",
     "ToolUsed",
+    "CitationKind",
     "Citation",
+    "RetrievedLearningKind",
+    "RetrievedLearning",
+    "LearningImpact",
     "Interaction",
     "Request",
     "UserProfile",
@@ -41,6 +57,7 @@ __all__ = [
     "ProfileChangeLog",
     "AgentPlaybook",
     "AgentSuccessEvaluationResult",
+    "RetrievedLearningEvaluationResult",
     "DeleteUserProfileRequest",
     "DeleteUserProfileResponse",
     "DeleteUserInteractionRequest",
@@ -49,6 +66,11 @@ __all__ = [
     "DeleteRequestResponse",
     "DeleteSessionRequest",
     "DeleteSessionResponse",
+    "SessionOutcomeRecord",
+    "SetSessionOutcomeRequest",
+    "SetSessionOutcomeResponse",
+    "GetSessionOutcomesRequest",
+    "GetSessionOutcomesResponse",
     "DeleteAgentPlaybookRequest",
     "DeleteAgentPlaybookResponse",
     "DeleteUserPlaybookRequest",
@@ -86,7 +108,13 @@ __all__ = [
     "AgentPlaybookUpdateEntry",
     "PlaybookAggregationChangeLog",
     "PlaybookAggregationChangeLogResponse",
+    "OptimizerKind",
+    "OptimizationJobStage",
+    "OptimizationTerminalOutcome",
+    "OptimizationArtifactKind",
+    "OptimizationJobClaim",
     "PlaybookOptimizationJob",
+    "PlaybookOptimizationArtifact",
     "PlaybookOptimizationCandidate",
     "PlaybookOptimizationEvaluation",
     "PlaybookOptimizationEvent",
@@ -102,6 +130,10 @@ __all__ = [
     "ManualPlaybookGenerationResponse",
     "RerunPlaybookGenerationRequest",
     "RerunPlaybookGenerationResponse",
+    "ReviewUserPlaybookEdit",
+    "ReviewUserPlaybookResult",
+    "ReviewUserPlaybooksRequest",
+    "ReviewUserPlaybooksResponse",
     "UpgradeProfilesRequest",
     "UpgradeProfilesResponse",
     "DowngradeProfilesRequest",
@@ -118,42 +150,91 @@ __all__ = [
     "ShareLink",
     "AdminInvalidateCacheRequest",
     "AdminInvalidateCacheResponse",
-    "PlaybookRetrievalLogItem",
-    "PlaybookRetrievalLog",
     "LineageEvent",
     "LineageContext",
     "RecordRef",
+    "LearningStatusResponse",
 ]
+
+
+def canonicalize_artifact_json(content_json: str) -> str:
+    """Validate and serialize durable artifact content using the proof contract."""
+    try:
+        value = json.loads(
+            content_json,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {constant}")
+            ),
+        )
+        # Imported lazily because publication's contracts reference OptimizerKind
+        # from this module while defining the shared RFC 8785 encoder.
+        from reflexio.server.services.playbook.publication import canonical_json_bytes
+
+        return canonical_json_bytes(value).decode("utf-8")
+    except (TypeError, ValueError, json.JSONDecodeError, UnicodeError) as exc:
+        raise ValueError("artifact content_json must be valid JSON") from exc
+
 
 # ===============================
 # Data Models
 # ===============================
 
+type CitationKind = Literal["playbook", "profile", "user_playbook", "agent_playbook"]
 
-class Citation(BaseModel):
+
+class Citation(CapturesUnknownFields):
     """A playbook or profile item the agent cited as influential.
 
     Carried inline on an Assistant ``InteractionData`` row to mark
     which previously-injected playbook rule or user-profile row
-    materially shaped that response. The server uses these to drive
-    reflection (does the cited rule still look right after seeing how
-    it was applied?).
+    materially shaped that response. The server stores these for retrieval
+    attribution and evaluation.
 
     Attributes:
-        kind (Literal["playbook", "profile"]): Which kind of cited
-            item this references.
+        kind (CitationKind): Which kind of cited item this references.
+            ``"playbook"`` is the legacy compatibility value.
+            ``"user_playbook"`` is the direct tuner target.
+            ``"agent_playbook"`` references an org-level playbook row.
+            ``"profile"`` references a user profile row.
         real_id (str): Stable storage id — ``user_playbook_id`` for
-            playbooks, ``profile_id`` for profiles.
+            user playbooks, ``agent_playbook_id`` for agent playbooks,
+            and ``profile_id`` for profiles.
         tag (str): Injection-time rank tag (e.g. ``"r1-301"``,
             ``"p1-0f37"``). Per-injection, not stable across sessions;
             kept as a debug aid.
         title (str): Short human-readable label for logs and UI.
     """
 
-    kind: Literal["playbook", "profile"]
+    kind: CitationKind
     real_id: str
     tag: str = ""
     title: str = ""
+
+
+# Canonical kinds accepted and persisted by retrieved-learning evaluation.
+# Unlike ``Citation.kind`` there is no legacy ``"playbook"`` alias.
+type RetrievedLearningKind = Literal["profile", "user_playbook", "agent_playbook"]
+
+type LearningImpact = Literal["positive", "negative", "neutral"]
+
+
+class RetrievedLearning(CapturesUnknownFields):
+    """A learning the caller retrieved and injected into the agent context.
+
+    Deliberately minimal — just the identity pair. It does NOT reuse
+    ``Citation``: citations carry injection-time debug fields (``tag``,
+    ``title``) that callers should not need to supply (or see) when declaring
+    what was retrieved.
+
+    Attributes:
+        kind (RetrievedLearningKind): Which kind of learning this references.
+        learning_id (str): Stable storage id — ``profile_id`` for profiles,
+            ``user_playbook_id`` for user playbooks, ``agent_playbook_id``
+            for agent playbooks (numeric ids as decimal strings).
+    """
+
+    kind: RetrievedLearningKind
+    learning_id: str = Field(min_length=1, max_length=1_000)
 
 
 # information about the user interaction sent by the client
@@ -164,6 +245,7 @@ class Interaction(BaseModel):
     created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
     role: str = "User"
     content: str = ""
+    token_count: int | None = Field(default=None, ge=0)
     user_action: UserActionType = UserActionType.NONE
     user_action_description: str = ""
     interacted_image_url: str = ""
@@ -172,6 +254,10 @@ class Interaction(BaseModel):
     expert_content: str = ""
     tools_used: list[ToolUsed] = Field(default_factory=list)
     citations: list[Citation] = Field(default_factory=list)
+    # Every learning retrieved and injected for this turn — including ones
+    # that did not end up influencing the response (contrast: ``citations``
+    # is the agent's claim of influence).
+    retrieved_learnings: list[RetrievedLearning] = Field(default_factory=list)
     embedding: EmbeddingVector = []
 
     @field_validator("interacted_image_url", mode="after")
@@ -197,6 +283,10 @@ class Request(BaseModel):
         evaluation_only (bool): Whether this request is stored for
             session-level evaluation only and must be excluded from
             profile/playbook learning windows.
+        retrieval_experiment_id (str | None): Retrieval experiment attached
+            to this request by the publishing agent.
+        retrieval_experiment_arm (str | None): Deterministic user assignment
+            for the attached retrieval experiment.
     """
 
     request_id: str
@@ -206,6 +296,18 @@ class Request(BaseModel):
     agent_version: str = ""
     session_id: NonEmptyStr
     evaluation_only: bool = False
+    retrieval_experiment_id: NonEmptyStr | None = None
+    retrieval_experiment_arm: Literal["treatment", "holdout"] | None = None
+
+    @model_validator(mode="after")
+    def validate_retrieval_experiment_pair(self) -> Self:
+        if (self.retrieval_experiment_id is None) != (
+            self.retrieval_experiment_arm is None
+        ):
+            raise ValueError(
+                "retrieval_experiment_id and retrieval_experiment_arm must be provided together"
+            )
+        return self
 
 
 # information about the user profile generated from the user interaction
@@ -293,6 +395,63 @@ class AgentPlaybook(BaseModel):
     superseded_by: int | None = None
 
 
+OptimizerKind = Literal[
+    "gepa",
+    "offline_tuner_replay",
+    "offline_tuner_legacy",
+    "optimizer_legacy_unknown",
+]
+
+OptimizationJobStage = Literal[
+    "evidence_frozen",
+    "candidate_generated",
+    "replay_running",
+    "replay_evaluated",
+    "publishing",
+    "applied",
+    "abstained",
+    "failed",
+]
+
+OptimizationTerminalOutcome = Literal[
+    "applied",
+    "insufficient_negative_evidence",
+    "insufficient_positive_evidence",
+    "insufficient_coverage",
+    "replay_unsupported",
+    "deployment_unsupported",
+    "incomplete_replay_scope",
+    "insufficient_replay_cases",
+    "replay_inconclusive",
+    "candidate_regressed",
+    "candidate_did_not_improve",
+    "incumbent_changed",
+    "generation_failed",
+    "replay_failed",
+    "publication_failed",
+    "governance_erased",
+]
+
+OptimizationArtifactKind = Literal[
+    "expected_population_manifest",
+    "generation_selection",
+    "replay_manifest",
+    "candidate",
+    "candidate_search_projection",
+]
+
+Sha256Digest = str
+
+
+class OptimizationJobClaim(BaseModel):
+    """One renewable optimizer lease identified by a monotonic fence."""
+
+    job_id: int
+    owner: str
+    fence: int = Field(ge=1)
+    expires_at: int
+
+
 class PlaybookOptimizationJob(BaseModel):
     """One end-to-end optimizer run for a single playbook target.
 
@@ -302,6 +461,7 @@ class PlaybookOptimizationJob(BaseModel):
     """
 
     job_id: int = 0
+    optimizer_kind: OptimizerKind = "optimizer_legacy_unknown"
     target_kind: Literal["agent_playbook", "user_playbook"]
     target_id: int
     status: Literal["pending", "running", "completed", "skipped", "failed"] = "pending"
@@ -309,8 +469,68 @@ class PlaybookOptimizationJob(BaseModel):
     successor_target_id: int | None = None
     decision_reason: str = ""
     metadata_json: str = "{}"
+    discovery_key: str | None = None
+    attempt_key: str | None = None
+    lease_owner: str | None = None
+    lease_fence: int = Field(default=0, ge=0)
+    lease_expires_at: int | None = None
+    stage: OptimizationJobStage | None = None
+    terminal_outcome: OptimizationTerminalOutcome | None = None
+    expected_population_manifest_digest: Sha256Digest | None = None
+    generation_selection_manifest_digest: Sha256Digest | None = None
+    replay_manifest_digest: Sha256Digest | None = None
+    candidate_content_digest: Sha256Digest | None = None
+    search_projection_digest: Sha256Digest | None = None
+    publication_scope_digest: Sha256Digest | None = None
     created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
     updated_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
+
+    @field_validator(
+        "expected_population_manifest_digest",
+        "generation_selection_manifest_digest",
+        "replay_manifest_digest",
+        "candidate_content_digest",
+        "search_projection_digest",
+        "publication_scope_digest",
+    )
+    @classmethod
+    def validate_sha256_digest(cls, value: str | None) -> str | None:
+        if value is not None and (
+            len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise ValueError("optimizer proof digests must be lowercase SHA-256 hex")
+        return value
+
+
+class PlaybookOptimizationArtifact(BaseModel):
+    """One typed, content-bearing singleton artifact owned by an optimizer job."""
+
+    artifact_id: int = 0
+    job_id: int
+    artifact_kind: OptimizationArtifactKind
+    content_json: str
+    content_digest: Sha256Digest
+    created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
+    updated_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
+
+    @field_validator("content_json")
+    @classmethod
+    def canonicalize_content_json(cls, value: str) -> str:
+        return canonicalize_artifact_json(value)
+
+    @field_validator("content_digest")
+    @classmethod
+    def validate_content_digest(cls, value: str) -> str:
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError("artifact digest must be lowercase SHA-256 hex")
+        return value
+
+    @model_validator(mode="after")
+    def validate_content_digest_matches_content(self) -> Self:
+        expected = sha256(self.content_json.encode()).hexdigest()
+        if self.content_digest != expected:
+            raise ValueError("artifact digest must match canonical content_json")
+        return self
 
 
 class PlaybookOptimizationCandidate(BaseModel):
@@ -392,42 +612,67 @@ class AgentSuccessEvaluationResult(BaseModel):
     evaluation_name: str | None = None
     created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
     regular_vs_shadow: RegularVsShadow | None = None
-    number_of_correction_per_session: int = 0
+    number_of_correction_per_session: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of user turns in the session that corrected or redirected an "
+            "earlier agent response or action."
+        ),
+    )
     user_turns_to_resolution: int | None = None
     is_escalated: bool = False
+    tags: list[str] | None = None
     embedding: EmbeddingVector = []
 
 
-class PlaybookRetrievalLogItem(BaseModel):
-    """One retrieved agent playbook plus the serve-time attribution snapshot."""
+class RetrievedLearningEvaluationResult(BaseModel):
+    """Latest per-learning relevance/impact verdict for one interaction.
 
-    retrieval_log_item_id: int = 0
-    retrieval_log_id: int = 0
-    ordinal: int
-    agent_playbook_id: int
-    source_user_playbook_ids: list[int] = Field(default_factory=list)
-    source_interaction_ids_by_user_playbook_id: dict[str, list[int]] = Field(
-        default_factory=dict
-    )
+    New rows are unique per ``(user_id, session_id, interaction_id, kind,
+    learning_id)``. Nullable interaction fields preserve read compatibility
+    with legacy session-level rows while the table continues to hold only the
+    most recent successfully persisted evaluation set for a session.
 
-
-class PlaybookRetrievalLog(BaseModel):
-    """A retrieval-log header with ordered item rows.
-
-    Used by retrieval-capture consumers to correlate retrieval decisions with
-    downstream outcomes. ``retrieval_log_id`` is assigned by the storage layer;
-    ``shown_items`` stores ids and serve-time attribution snapshots only.
+    Attributes:
+        result_id (int): DB auto-increment identifier (0 = placeholder).
+        user_id (str): Session owner.
+        session_id (str): Evaluated session.
+        agent_version (str): Version supplied to group evaluation;
+            informational, not part of the uniqueness key.
+        interaction_id (int | None): Interaction that received the learning.
+            ``None`` only for legacy session-level rows.
+        interaction_created_at (int | None): Timestamp of the target
+            interaction. ``None`` only for legacy session-level rows.
+        kind (RetrievedLearningKind): The learning kind.
+        learning_id (str): Stable storage id, matching
+            ``RetrievedLearning.learning_id``.
+        is_relevant (bool | None): Whether the learning applies to its target
+            interaction. ``None`` only when the relevance judge/chunk failed.
+        relevance_reason (str): Judge reasoning; empty when ``is_relevant``
+            is ``None``.
+        impact (LearningImpact | None): Whether the learning improved,
+            harmed, or did not materially change the response. ``None`` only
+            when the impact judge/chunk failed.
+        impact_reason (str): Judge reasoning; empty when ``impact`` is
+            ``None``.
+        created_at (int): Earliest request timestamp in the evaluated
+            session.
     """
 
-    retrieval_log_id: int = 0
-    request_id: str
-    session_id: str
-    interaction_id: int | None = None
+    result_id: int = 0
     user_id: str
-    query: str | None = None
-    agent_version: str | None = None
-    shown_items: list[PlaybookRetrievalLogItem] = Field(default_factory=list)
-    created_at: int = 0
+    session_id: str
+    agent_version: str = ""
+    interaction_id: int | None = None
+    interaction_created_at: int | None = None
+    kind: RetrievedLearningKind
+    learning_id: str
+    is_relevant: bool | None = None
+    relevance_reason: str = ""
+    impact: LearningImpact | None = None
+    impact_reason: str = ""
+    created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
 
 
 class LineageEvent(BaseModel):
@@ -441,10 +686,15 @@ class LineageEvent(BaseModel):
         op (str): create|revise|merge|aggregate|archive|soft_delete|hard_delete|purge|status_change.
         prov_relation (str): W3C PROV relation (see spec §14).
         source_ids (list[str]): Records merged/superseded into entity_id.
-        actor (str): Who/what triggered it (consolidator|reflection|offline_optimizer|...).
+        actor (str): Who/what triggered it (consolidator|offline_optimizer|...).
         request_id (str): Triggering request — part of the idempotency key.
         reason (str): Free-text rationale (no PII).
         created_at (int): Unix epoch seconds (0 = unset; storage stamps it).
+        from_status (str | None): Status before a transition.
+        to_status (str | None): Status after a transition.
+        status_namespace (str | None): Namespace for status values.
+        model_name (str | None): Observed model for a content-shaping operation.
+        provider (str | None): Observed provider for that operation.
     """
 
     event_id: int = 0
@@ -461,6 +711,8 @@ class LineageEvent(BaseModel):
     from_status: str | None = None
     to_status: str | None = None
     status_namespace: str | None = None
+    model_name: str | None = None
+    provider: str | None = None
 
 
 class LineageContext(BaseModel):
@@ -474,6 +726,8 @@ class LineageContext(BaseModel):
     source_ids: list[str] = []
     reason: str = ""
     request_id: str | None = None
+    model_name: str | None = None
+    provider: str | None = None
 
 
 class RecordRef(BaseModel):
@@ -569,6 +823,94 @@ class DeleteSessionResponse(BaseModel):
     deleted_requests_count: int = 0
 
 
+class SessionOutcomeRecord(BaseModel):
+    user_id: str
+    session_id: NonEmptyStr
+    outcome: SessionOutcomeKind
+    occurred_at: int = Field(ge=0)
+    source: str
+    label: str | None = Field(default=None, max_length=128)
+    value: float | None = Field(default=None, allow_inf_nan=False)
+    metadata: dict[str, Any] | None = None
+    created_at: int = Field(ge=0)
+
+
+class SetSessionOutcomeRequest(CapturesUnknownFields):
+    session_id: NonEmptyStr
+    outcome: SessionOutcomeKind
+    occurred_at: int = Field(ge=0)
+    label: str | None = Field(default=None, max_length=128)
+    value: float | None = Field(default=None, allow_inf_nan=False)
+    metadata: dict[str, Any] | None = None
+
+    @field_validator("label")
+    @classmethod
+    def _strip_non_empty(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be empty")
+        return stripped
+
+    @field_validator("metadata")
+    @classmethod
+    def _bound_metadata(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        try:
+            encoded = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("metadata must contain only valid JSON values") from exc
+        if len(encoded) > 16 * 1024:
+            raise ValueError("metadata must encode to at most 16384 bytes")
+        return value
+
+
+class SetSessionOutcomeResponse(BaseModel):
+    success: bool
+    recorded: bool = False
+    reason: SessionOutcomeFailureReason | None = None
+    message: str = ""
+    user_id: str | None = None
+    source: str | None = None
+
+
+class GetSessionOutcomesRequest(CapturesUnknownFields):
+    session_ids: list[NonEmptyStr] | None = Field(default=None, max_length=100)
+    user_id: str | None = None
+    source: str | None = None
+    outcome: SessionOutcomeKind | None = None
+    label: str | None = None
+    start_time: int | None = Field(default=None, ge=0)
+    end_time: int | None = Field(default=None, ge=0)
+    top_k: int = Field(default=100, ge=1, le=1_000)
+    offset: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_range_and_ids(self) -> Self:
+        if (
+            self.start_time is not None
+            and self.end_time is not None
+            and self.start_time > self.end_time
+        ):
+            raise ValueError("start_time must be less than or equal to end_time")
+        if self.session_ids:
+            self.session_ids = list(dict.fromkeys(self.session_ids))
+        return self
+
+
+class GetSessionOutcomesResponse(BaseModel):
+    success: bool
+    session_outcomes: list[SessionOutcomeRecord] = Field(default_factory=list)
+    message: str = ""
+
+
 # delete agent playbook request
 class DeleteAgentPlaybookRequest(BaseModel):
     agent_playbook_id: int = Field(gt=0)
@@ -598,23 +940,23 @@ class BulkDeleteResponse(BaseModel):
 
 
 class DeleteRequestsByIdsRequest(BaseModel):
-    request_ids: list[str] = Field(min_length=1)
+    request_ids: list[str] = Field(min_length=1, max_length=10_000)
 
 
 class DeleteProfilesByIdsRequest(BaseModel):
-    profile_ids: list[str] = Field(min_length=1)
+    profile_ids: list[str] = Field(min_length=1, max_length=10_000)
 
 
 class DeleteAgentPlaybooksByIdsRequest(BaseModel):
-    agent_playbook_ids: list[int] = Field(min_length=1)
+    agent_playbook_ids: list[int] = Field(min_length=1, max_length=10_000)
 
 
 class DeleteUserPlaybooksByIdsRequest(BaseModel):
-    user_playbook_ids: list[int] = Field(min_length=1)
+    user_playbook_ids: list[int] = Field(min_length=1, max_length=10_000)
 
 
-# Clear all data scoped to a single user_id (interactions, requests, user
-# playbooks, profiles). Used by paired-protocol harnesses (e.g. SWE-bench) to
+# Clear all data scoped to a single user_id (interactions, requests, session
+# outcomes, user playbooks, profiles). Used by paired-protocol harnesses (e.g. SWE-bench) to
 # isolate per-task data on a shared storage backend without nuking sibling
 # tasks' rows. Intentionally does NOT touch agent_playbooks — they are the
 # cross-project rollup of skills and have no user_id column.
@@ -629,34 +971,219 @@ class ClearUserDataResponse(BaseModel):
 
 
 # user provided interaction data from the request
-class InteractionData(BaseModel):
+class InteractionData(CapturesUnknownFields):
     created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
-    role: str = "User"
-    content: str = ""
-    shadow_content: str = ""
-    expert_content: str = ""
+    role: str = Field(default="User", max_length=1_000)
+    content: str = Field(default="", max_length=1_000_000)
+    shadow_content: str = Field(default="", max_length=1_000_000)
+    expert_content: str = Field(default="", max_length=1_000_000)
     user_action: UserActionType = UserActionType.NONE
-    user_action_description: str = ""
-    interacted_image_url: str = ""
-    image_encoding: str = ""  # base64 encoded image
-    tools_used: list[ToolUsed] = Field(default_factory=list)
-    citations: list[Citation] = Field(default_factory=list)
+    user_action_description: str = Field(default="", max_length=10_000)
+    interacted_image_url: str = Field(default="", max_length=2_048)
+    image_encoding: str = Field(
+        default="", max_length=15_000_000
+    )  # base64 encoded image
+    tools_used: list[ToolUsed] = Field(default_factory=list, max_length=1_000)
+    citations: list[Citation] = Field(default_factory=list, max_length=1_000)
+    # Learnings (profiles / user playbooks / agent playbooks) the caller
+    # retrieved and injected into the agent context for this turn. Distinct
+    # from ``citations`` (agent-claimed influence): this is everything that
+    # was injected, whether or not it helped.
+    retrieved_learnings: list[RetrievedLearning] = Field(
+        default_factory=list, max_length=1_000
+    )
 
     @field_validator("interacted_image_url", mode="after")
     @classmethod
     def validate_image_url(cls, v: str) -> str:
         return _validate_image_url(v)
 
+    def reportable_unknown_fields(self) -> list[str]:
+        """Unknown key names worth telling the caller about, nested included.
+
+        Excludes ``_BENIGN_UNKNOWN_KEYS`` -- by LEAF name, so a duplicated
+        ``user_id`` is suppressed identically whether it sits at the top level
+        or on ``tools_used[0]``. Nested models report as a path, e.g.
+        ``tools_used[0].stat``, because a caller matching only top-level names
+        would not recognise the format otherwise.
+
+        Sorted, because only the first few names survive the render cap: an
+        unsorted list puts every top-level name ahead of every nested one, so a
+        payload with five top-level typos could never show a nested path at all.
+
+        Returns:
+            list[str]: Sorted field paths, empty when nothing unrecognised was
+                sent.
+        """
+        names = [
+            name
+            for name in self.unknown_field_names()
+            if name not in _BENIGN_UNKNOWN_KEYS
+        ]
+        for attribute in ("tools_used", "citations", "retrieved_learnings"):
+            for index, item in enumerate(getattr(self, attribute)):
+                names.extend(
+                    f"{attribute}[{index}].{nested}"
+                    for nested in item.unknown_field_names()
+                    if nested not in _BENIGN_UNKNOWN_KEYS
+                )
+        return sorted(names)
+
+    def carries_content(self) -> bool:
+        """
+        Whether this interaction carries anything worth storing.
+
+        The single source of truth for "is this interaction empty", shared by
+        ``PublishUserInteractionRequest``'s boundary validator and the
+        ``precondition_checks`` defense-in-depth guard so the two cannot drift.
+
+        Every content-bearing field counts, not just ``content``: a
+        tool-call-only agent turn, a shadow/expert-only row, and an image-only
+        turn all carry real information. Note ``user_action`` is compared
+        against ``UserActionType.NONE`` rather than tested for truthiness --
+        ``UserActionType`` is a ``StrEnum`` whose NONE member is the *truthy*
+        string ``"none"``, and a truthiness test there is what silently
+        disabled this check for the entire life of the guard.
+
+        Returns:
+            bool: True if any content-bearing field is populated.
+        """
+        if self.user_action != UserActionType.NONE:
+            return True
+        # Text fields are stripped: "   " is not content. Mirrors the
+        # ``session_id`` guard in ``precondition_checks``, which already
+        # rejects whitespace-only values.
+        return any(
+            value.strip() if isinstance(value, str) else value
+            for value in (getattr(self, name) for name in CONTENT_BEARING_FIELD_NAMES)
+        )
+
+    def shape_error(self) -> str | None:
+        """A contradiction in this interaction the caller must fix, or None.
+
+        These are genuine caller mistakes with no sensible recovery, so they
+        are fatal to the request. Emptiness is deliberately NOT one of them --
+        see ``PublishUserInteractionRequest.validate_interaction_shapes``.
+
+        Both rules used to live only in ``precondition_checks``, which on the
+        default ``wait_for_response=False`` path runs inside a background task
+        whose result is discarded, so neither was ever reportable. Keeping them
+        here lets the request model raise a 422 on both paths while
+        ``precondition_checks`` delegates, so the two cannot diverge.
+
+        Returns:
+            str | None: A caller-facing reason, or None when acceptable.
+        """
+        if self.user_action != UserActionType.NONE and not self.user_action_description:
+            return "user_action requires a user_action_description"
+        if self.interacted_image_url and self.image_encoding:
+            return "interacted_image_url and image_encoding cannot both be set"
+        return None
+
+
+# Every field ``carries_content`` consults, in one place. The prose in the
+# error message is DERIVED from this tuple rather than hand-written beside it,
+# so adding a field to the predicate cannot leave the caller-facing list stale.
+CONTENT_BEARING_FIELD_NAMES: Final = (
+    "content",
+    "shadow_content",
+    "expert_content",
+    "interacted_image_url",
+    "image_encoding",
+    "tools_used",
+    "citations",
+    "retrieved_learnings",
+)
+
+# Request-level identifiers callers routinely duplicate onto each interaction.
+# Still stripped, but never warned about: both plugins send `user_id` on every
+# turn, so warning would emit one entry per interaction on every correct publish
+# and train operators to ignore the channel before it carries real signal.
+_BENIGN_UNKNOWN_KEYS: Final = frozenset({"user_id", "session_id"})
+
+# How many original indices to name when reporting skipped empty rows.
+_MAX_SKIPPED_INDICES: Final = 10
+
+# Unknown key names are caller-controlled: unbounded in length and count, and
+# free to contain newlines. They are echoed into both the HTTP response and a
+# log line, so they need bounding on THREE axes -- per-name length, names per
+# interaction, and total entries in the warning list -- plus control-character
+# stripping. Unbounded, 1000 interactions x N long bogus keys produced a
+# ~350 KB response body and one enormous log record.
+_MAX_REPORTED_NAMES: Final = 5
+_MAX_WARNING_ENTRIES: Final = 20
+
+
+def _summarise_unknown_names(names: list[str]) -> str:
+    """Render unknown key names for a caller-facing warning, bounded and safe.
+
+    Args:
+        names (list[str]): The unrecognised key names, in the order they should
+            be shown. Only the first few survive the cap, so a caller wanting a
+            deterministic sample sorts before calling.
+
+    Returns:
+        str: Comma-separated sanitised names, each truncated, with a "+N more"
+            suffix when the list was longer than the cap.
+    """
+    shown = [sanitise_for_log(name) for name in names[:_MAX_REPORTED_NAMES]]
+    remaining = len(names) - len(shown)
+    return ", ".join(shown) + (f", +{remaining} more" if remaining > 0 else "")
+
+
+def _cap_warning_list(warnings: list[str]) -> list[str]:
+    """Bound the NUMBER of warning entries.
+
+    Per-name caps alone do not bound the total: ``interaction_data_list``
+    permits 1000 entries, so one warning each still adds up to a
+    multi-hundred-KB response body and a single enormous log record.
+
+    Args:
+        warnings (list[str]): Individually-bounded warning strings.
+
+    Returns:
+        list[str]: A NEW list of at most ``_MAX_WARNING_ENTRIES`` entries, with
+            a trailing overflow entry when any were dropped. Always a copy --
+            callers append to the result.
+    """
+    if len(warnings) <= _MAX_WARNING_ENTRIES:
+        return list(warnings)
+    dropped = len(warnings) - _MAX_WARNING_ENTRIES
+    return [
+        *warnings[:_MAX_WARNING_ENTRIES],
+        f"...and {dropped} more interaction(s) with the same problem",
+    ]
+
+
+CONTENT_BEARING_FIELDS = (
+    f'{", ".join(CONTENT_BEARING_FIELD_NAMES)}, or a user_action other than "none"'
+)
+
 
 # publish user interaction request
-class PublishUserInteractionRequest(BaseModel):
+class PublishUserInteractionRequest(CapturesUnknownFields):
+    """A publish payload, with everything it quietly altered recorded.
+
+    Inherits the capture mixin for the REQUEST level too, not just the
+    interactions: a top-level typo (``forceExtraction``, ``Source``,
+    ``skip_agregation``) used to bind nothing and vanish silently, which is
+    strictly worse than the nested case it was reported alongside -- a dropped
+    ``force_extraction`` changes what the server does, not just what it stores.
+    """
+
+    # All three are set by ``validate_interaction_shapes`` against the caller's
+    # ORIGINAL list, before empty rows are filtered out, and are read back by
+    # ``payload_warnings()``.
+    _unknown_field_warnings: list[str] = PrivateAttr(default_factory=list)
+    _skipped_empty_indices: list[int] = PrivateAttr(default_factory=list)
+    _skipped_empty_count: int = PrivateAttr(default=0)
+
     request_id: NonEmptyStr | None = None
     user_id: NonEmptyStr
-    interaction_data_list: list[InteractionData] = Field(min_length=1)
-    source: str = ""
-    agent_version: str = (
-        ""  # this is used for aggregating interactions for generating agent playbooks
-    )
+    interaction_data_list: list[InteractionData] = Field(min_length=1, max_length=1_000)
+    source: str = Field(default="", max_length=1_000)
+    # this is used for aggregating interactions for generating agent playbooks
+    agent_version: str = Field(default="", max_length=1_000)
     session_id: NonEmptyStr  # used for grouping requests together
     skip_aggregation: bool = (
         False  # when True, extract profiles/playbooks but skip aggregation
@@ -664,6 +1191,8 @@ class PublishUserInteractionRequest(BaseModel):
     force_extraction: bool = False  # when True, bypass all extraction gates (stride_size, cheap pre-filter, LLM should_run) and always run extractors
     evaluation_only: bool = False  # when True, store for evaluation and permanently exclude from profile/playbook extraction
     override_learning_stall: bool = False  # when True, run extraction even if a provider auth/billing stall is recorded
+    retrieval_experiment_id: NonEmptyStr | None = None
+    retrieval_experiment_arm: Literal["treatment", "holdout"] | None = None
 
     @model_validator(mode="after")
     def validate_evaluation_only(self) -> Self:
@@ -671,6 +1200,147 @@ class PublishUserInteractionRequest(BaseModel):
             raise ValueError("evaluation_only cannot be combined with force_extraction")
         if self.evaluation_only and not self.session_id:
             raise ValueError("evaluation_only publishes require session_id")
+        return self
+
+    @model_validator(mode="after")
+    def validate_retrieval_experiment_pair(self) -> Self:
+        if (self.retrieval_experiment_id is None) != (
+            self.retrieval_experiment_arm is None
+        ):
+            raise ValueError(
+                "retrieval_experiment_id and retrieval_experiment_arm must be provided together"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_interaction_shapes(self) -> Self:
+        """Reject contradictory interactions; drop empty ones.
+
+        Runs during request parsing, so it applies on *both* the synchronous
+        and the ``wait_for_response=False`` background-task path -- unlike
+        ``precondition_checks``, whose ``success=False`` is discarded inside
+        the background task after the caller was told 200 "queued".
+
+        An individual empty interaction is **skipped, not fatal**. Making it
+        fatal was implemented and reverted: both first-party plugins append an
+        empty ``Assistant`` placeholder unconditionally, so one empty row
+        rejected the whole batch -- including the real user turn beside it --
+        and their adapters swallow the error without advancing the publish
+        watermark, retrying the same doomed batch forever. A batch where
+        *every* interaction is empty is still fatal, and that is exactly the
+        incident this validation exists for (50 of 50 rows empty).
+
+        Raises:
+            ValueError: for a contradictory interaction, or an all-empty batch.
+        """
+        for index, interaction in enumerate(self.interaction_data_list):
+            if reason := interaction.shape_error():
+                raise ValueError(f"interaction_data_list[{index}] {reason}")
+
+        # Built against the ORIGINAL list, BEFORE filtering. Computing them
+        # afterwards defeats the feature in its primary case: a mis-keyed
+        # ``content`` yields an *empty* interaction, so the row carrying the typo
+        # is exactly the row that gets dropped -- its "unrecognised field"
+        # warning vanished, leaving the caller "skipped 1 empty interaction" and
+        # no idea which field was wrong. It also renumbered every surviving
+        # index, so a warning pointed at a different row than was sent.
+        self._unknown_field_warnings = [
+            f"interaction_data_list[{index}]: ignored unrecognised field(s)"
+            f" {_summarise_unknown_names(names)}"
+            for index, interaction in enumerate(self.interaction_data_list)
+            if (names := interaction.reportable_unknown_fields())
+        ]
+
+        # Indices are computed against the ORIGINAL list, before filtering, so
+        # what gets reported matches the payload the caller actually sent.
+        skipped = [
+            index
+            for index, interaction in enumerate(self.interaction_data_list)
+            if not interaction.carries_content()
+        ]
+        if len(skipped) == len(self.interaction_data_list):
+            # Carry the unknown-field warnings into the error. This is the
+            # motivating incident, not a nicety: 50 interactions all keyed
+            # ``Content`` bind nothing, so every row is empty, so the request
+            # 422s -- and without this the 422 never once mentions ``Content``,
+            # leaving the caller told only that their payload was empty when
+            # they can see they sent 50 rows of text. ``payload_warnings()``
+            # never runs on this path because the model never finishes
+            # validating, so the warnings are otherwise computed and discarded.
+            faults = _cap_warning_list(self._unknown_field_warnings)
+            cause = f"; likely cause -- {'; '.join(faults)}" if faults else ""
+            raise ValueError(
+                "every interaction is empty: at least one must set"
+                f' "content" (or any of: {CONTENT_BEARING_FIELDS}){cause}'
+            )
+        self._skipped_empty_indices = skipped[:_MAX_SKIPPED_INDICES]
+        self._skipped_empty_count = len(skipped)
+        self.interaction_data_list = [
+            interaction
+            for interaction in self.interaction_data_list
+            if interaction.carries_content()
+        ]
+        return self
+
+    def payload_warnings(self) -> list[str]:
+        """Everything quietly altered in the payload, for the caller.
+
+        Unrecognised keys that were stripped -- at the request level and per
+        interaction -- plus a summary of empty interactions that were skipped.
+        Indices refer to the payload **as the caller sent it**, not the filtered
+        list. Names only, sanitised and bounded: values are caller payload, and
+        the names are equally caller-controlled, so both volume and control
+        characters are handled.
+
+        Returns:
+            list[str]: Bounded warnings; empty when nothing was altered.
+        """
+        # Cap the per-interaction entries, THEN append the two batch-level
+        # entries, so the cap can never drop them. Capping the combined list
+        # swallowed "N interactions were dropped" whenever there were >= 20
+        # field warnings -- the single most important fact about such a batch,
+        # and the same is true of a dropped top-level ``force_extraction``.
+        warnings = _cap_warning_list(self._unknown_field_warnings)
+        if top_level := self.unknown_field_names():
+            warnings.append(
+                "publish request: ignored unrecognised field(s)"
+                f" {_summarise_unknown_names(top_level)}"
+            )
+        if summary := self.skipped_empty_summary():
+            warnings.append(summary)
+        return warnings
+
+    def skipped_empty_summary(self) -> str | None:
+        """A log-safe description of empty interactions that were dropped.
+
+        Returns None when nothing was skipped. Indices refer to the payload as
+        the caller sent it, not the filtered list. Bounded, because the count is
+        caller-controlled.
+
+        Returns:
+            str | None: Summary for the server log, or None.
+        """
+        if not self._skipped_empty_count:
+            return None
+        shown = ", ".join(str(index) for index in self._skipped_empty_indices)
+        more = self._skipped_empty_count - len(self._skipped_empty_indices)
+        return (
+            f"skipped {self._skipped_empty_count} empty interaction(s) that"
+            f" carried no content, at index(es) {shown}"
+            f"{f', +{more} more' if more else ''}"
+        )
+
+    @model_validator(mode="after")
+    def validate_retrieved_learnings_total(self) -> Self:
+        total = sum(
+            len(interaction.retrieved_learnings)
+            for interaction in self.interaction_data_list
+        )
+        if total > 1_000:
+            raise ValueError(
+                "a publish request may carry at most 1000 retrieved_learnings"
+                f" across all interactions (got {total})"
+            )
         return self
 
 
@@ -689,6 +1359,23 @@ class PublishUserInteractionResponse(BaseModel):
     profiles_updated: int | None = None
     playbooks_added: int | None = None
     playbooks_updated: int | None = None
+    # Set to "deferred" when the server queued extraction asynchronously.
+    # None on the sync (wait_for_response=True) path. Poll GET
+    # /api/learning_status?request_id=... to track progress once the
+    # durable queue is active.
+    learning_status: str | None = None
+
+
+class LearningStatusResponse(BaseModel):
+    """Response for GET /api/learning_status.
+
+    Attributes:
+        status: One of ``pending | processing | done | failed``.
+            Coverage-based: reflects whether a durable learning job has
+            processed through the request's creation timestamp.
+    """
+
+    status: Literal["pending", "processing", "done", "failed"]
 
 
 # whoami response — caller identity + resolved storage routing (masked)
@@ -712,7 +1399,7 @@ class MyConfigResponse(BaseModel):
 
 # add user playbook request/response
 class AddUserPlaybookRequest(BaseModel):
-    user_playbooks: list[UserPlaybook] = Field(min_length=1)
+    user_playbooks: list[UserPlaybook] = Field(min_length=1, max_length=1_000)
 
     @model_validator(mode="after")
     def check_content_fields(self) -> Self:
@@ -1074,6 +1761,66 @@ class RerunPlaybookGenerationResponse(BaseModel):
     msg: str | None = None
     playbooks_generated: int | None = None
     operation_id: str = "rerun_playbook_generation"
+
+
+class ReviewUserPlaybookEdit(BaseModel):
+    """Replacement fields proposed by the user-playbook reviewer."""
+
+    content: str
+    trigger: str
+    rationale: str
+
+
+class ReviewUserPlaybookResult(BaseModel):
+    """One persisted user playbook's re-review outcome.
+
+    ``skip`` means the row could not be reviewed at all because its finalized
+    generation-window or cited-evidence provenance is absent, missing, or
+    invalid, not that the reviewer chose to leave it alone — that is ``accept``.
+    A skipped row is never written to.
+    """
+
+    user_playbook_id: int = Field(gt=0)
+    decision: Literal["accept", "edit", "reject", "skip"]
+    reason_code: str
+    reason: str | None = None
+    edit: ReviewUserPlaybookEdit | None = None
+    applied: bool = False
+    successor_user_playbook_id: int | None = Field(default=None, gt=0)
+
+
+class ReviewUserPlaybooksRequest(BaseModel):
+    """Select and re-review current user playbooks created in a time window."""
+
+    start_time: datetime
+    end_time: datetime
+    top_k: int = Field(default=10, gt=0, le=100)
+    report_only: bool = True
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class ReviewUserPlaybooksResponse(BaseModel):
+    """Bulk user-playbook re-review report and optional apply summary.
+
+    Apply mode runs in the background, so its response carries ``run_id`` and an
+    empty ``results`` list; the per-playbook outcome is durably recorded on each
+    replacement's lineage under that ``run_id``.
+    """
+
+    success: bool
+    report_only: bool = True
+    run_id: str | None = None
+    selected_count: int = 0
+    accepted_count: int = 0
+    edited_count: int = 0
+    rejected_count: int = 0
+    skipped_count: int = 0
+    results: list[ReviewUserPlaybookResult] = Field(default_factory=list)
+    msg: str | None = None
 
 
 class UpgradeProfilesRequest(BaseModel):

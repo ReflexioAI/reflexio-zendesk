@@ -7,6 +7,9 @@ from reflexio.server.services.storage.postgres_storage._extras import ExtrasMixi
 from reflexio.server.services.storage.postgres_storage._governance import (
     PostgresGovernanceMixin,
 )
+from reflexio.server.services.storage.postgres_storage._learning_jobs import (
+    PostgresLearningJobStoreMixin,
+)
 from reflexio.server.services.storage.postgres_storage._lineage import (
     PostgresLineageMixin,
 )
@@ -18,8 +21,11 @@ from reflexio.server.services.storage.postgres_storage._playbook import (
 )
 from reflexio.server.services.storage.postgres_storage._profiles import ProfileMixin
 from reflexio.server.services.storage.postgres_storage._requests import RequestMixin
-from reflexio.server.services.storage.postgres_storage._retrieval_log import (
-    PostgresRetrievalLogMixin,
+from reflexio.server.services.storage.postgres_storage._retrieved_learning import (
+    PostgresRetrievedLearningMixin,
+)
+from reflexio.server.services.storage.postgres_storage._session_outcomes import (
+    PostgresSessionOutcomeStoreMixin,
 )
 from reflexio.server.services.storage.postgres_storage._shadow_verdicts import (
     PostgresShadowVerdictsMixin,
@@ -35,11 +41,13 @@ from ._base import PostgresStorageBase
 
 
 class PostgresStorage(
+    PostgresLearningJobStoreMixin,
     PostgresAgentRunMixin,
     ProfileMixin,
     RequestMixin,
+    PostgresSessionOutcomeStoreMixin,
+    PostgresRetrievedLearningMixin,
     PlaybookMixin,
-    PostgresRetrievalLogMixin,
     PostgresGovernanceMixin,
     PostgresLineageMixin,
     OperationMixin,

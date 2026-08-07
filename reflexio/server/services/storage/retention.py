@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 DEFAULT_ROW_RETENTION_LIMIT = 250_000
 ROW_RETENTION_DELETE_FRACTION = 0.20
+TOMBSTONE_STATUSES = ("archived", "merged", "superseded", "expired")
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,23 +19,73 @@ class RetentionTarget:
     table_name: str
     order_column: str
     id_columns: tuple[str, ...]
+    priority_statuses: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizationRetentionClass:
+    """Fixed owner for one optimization artifact lifetime."""
+
+    artifact_class: str
+    owner: str
+
+
+OPTIMIZATION_RETENTION_CLASSES: tuple[OptimizationRetentionClass, ...] = (
+    OptimizationRetentionClass("event", "governance_audit"),
+    OptimizationRetentionClass("source_reference", "existing_source_retention"),
+    OptimizationRetentionClass("staging", "lease_stale_claim"),
+    OptimizationRetentionClass("terminal", "lineage_tombstone_grace"),
+)
 
 
 RETENTION_TARGETS: tuple[RetentionTarget, ...] = (
-    RetentionTarget("profiles", "profiles", "created_at", ("profile_id",)),
+    RetentionTarget(
+        "profiles",
+        "profiles",
+        "created_at",
+        ("profile_id",),
+        priority_statuses=TOMBSTONE_STATUSES,
+    ),
     RetentionTarget("interactions", "interactions", "created_at", ("interaction_id",)),
     RetentionTarget("requests", "requests", "created_at", ("request_id",)),
     RetentionTarget(
-        "user_playbooks", "user_playbooks", "created_at", ("user_playbook_id",)
+        "user_playbooks",
+        "user_playbooks",
+        "created_at",
+        ("user_playbook_id",),
+        priority_statuses=TOMBSTONE_STATUSES,
     ),
     RetentionTarget(
-        "agent_playbooks", "agent_playbooks", "created_at", ("agent_playbook_id",)
+        "agent_playbooks",
+        "agent_playbooks",
+        "created_at",
+        ("agent_playbook_id",),
+        priority_statuses=TOMBSTONE_STATUSES,
     ),
     RetentionTarget(
         "agent_success_evaluation_result",
         "agent_success_evaluation_result",
         "created_at",
         ("result_id",),
+    ),
+    # Grouped session target: keyed on (user_id, session_id) — not result_id —
+    # so retention always removes whole session snapshots, never a partial
+    # per-learning subset. Rows within a session share created_at (earliest
+    # request timestamp), so ordering keeps groups adjacent. The session's
+    # retrieved-eval _operation_state row is intentionally left in place: it
+    # is content-free (digest + counters) and self-heals on the next
+    # publish/forced evaluation.
+    RetentionTarget(
+        "retrieved_learning_evaluation",
+        "retrieved_learning_evaluation",
+        "created_at",
+        ("user_id", "session_id"),
+    ),
+    RetentionTarget(
+        "offline_tuner_reward_label",
+        "offline_tuner_reward_label",
+        "label_created_at",
+        ("reward_label_id",),
     ),
     RetentionTarget("share_links", "share_links", "created_at", ("id",)),
     RetentionTarget(
@@ -67,6 +118,12 @@ RETENTION_TARGETS: tuple[RetentionTarget, ...] = (
         "created_at",
         ("event_id",),
     ),
+    # RETIRED WRITER, LIVE PII. Nothing writes playbook_retrieval_logs any more
+    # (the retrieval-capture subsystem is gone), but the table still exists and
+    # still holds user_id/session_id until a later release DROPs it — so it must
+    # keep being trimmed. Every backend gates on ``_retention_table_exists``
+    # before counting/deleting, so this target no-ops cleanly once the table is
+    # dropped and an old task never issues a raw DELETE against a missing table.
     RetentionTarget(
         "playbook_retrieval_logs",
         "playbook_retrieval_logs",
@@ -114,8 +171,14 @@ RETENTION_CASCADES: dict[str, tuple[CascadeRef, ...]] = {
     "playbook_optimization_candidates": (
         CascadeRef("playbook_optimization_evaluations", "candidate_id"),
     ),
+    # Retired writer, live PII — see the RETENTION_TARGETS note above. The
+    # cascade only runs when the parent target yielded keys, which requires the
+    # parent table to exist, so a dropped pair no-ops without a raw DELETE.
     "playbook_retrieval_logs": (
         CascadeRef("playbook_retrieval_log_items", "retrieval_log_id"),
+    ),
+    "offline_tuner_reward_label": (
+        CascadeRef("offline_tuner_reward_label_target", "reward_label_id"),
     ),
 }
 

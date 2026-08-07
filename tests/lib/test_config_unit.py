@@ -7,10 +7,15 @@ get_dashboard_stats for DashboardMixin with mocked storage.
 from typing import Any, cast
 from unittest.mock import MagicMock
 
+import pytest
+
 from reflexio.lib._config import ConfigMixin
 from reflexio.lib._dashboard import DashboardMixin
 from reflexio.models.api_schema.retriever_schema import GetDashboardStatsRequest
-from reflexio.models.config_schema import Config
+from reflexio.models.config_schema import Config, StorageConfigSQLite
+from reflexio.server.services.configurator.config_storage import (
+    ConfigWriteConflictError,
+)
 
 # ---------------------------------------------------------------------------
 # ConfigMixin helpers
@@ -106,6 +111,52 @@ class TestSetConfig:
         assert response.success is False
         assert "Connection refused" in (response.msg or "")
 
+    def test_set_config_skips_storage_init_when_storage_unchanged(self):
+        """Saving non-storage config changes should not run migrations."""
+        mixin = _make_config_mixin()
+        storage_config = StorageConfigSQLite(db_path="/var/data/current.db")
+        config = Config(storage_config=storage_config, window_size=25)
+
+        _get_configurator(
+            mixin
+        ).get_current_storage_configuration.return_value = storage_config
+
+        response = mixin.set_config(config)
+
+        assert response.success is True
+        _get_configurator(mixin).is_storage_config_ready_to_test.assert_not_called()
+        _get_configurator(mixin).test_and_init_storage_config.assert_not_called()
+        _get_configurator(mixin).set_config.assert_called_once_with(config)
+
+    def test_set_config_initializes_storage_when_storage_changed(self):
+        """Changing storage still validates and initializes the new target."""
+        mixin = _make_config_mixin()
+        existing_storage_config = StorageConfigSQLite(db_path="/var/data/current.db")
+        new_storage_config = StorageConfigSQLite(db_path="/var/data/new.db")
+        config = Config(storage_config=new_storage_config)
+
+        _get_configurator(
+            mixin
+        ).get_current_storage_configuration.return_value = existing_storage_config
+        _get_configurator(mixin).is_storage_config_ready_to_test.return_value = True
+        _get_configurator(mixin).test_and_init_storage_config.return_value = (
+            True,
+            None,
+        )
+
+        response = mixin.set_config(config)
+
+        assert response.success is True
+        _get_configurator(
+            mixin
+        ).is_storage_config_ready_to_test.assert_called_once_with(
+            storage_config=new_storage_config
+        )
+        _get_configurator(mixin).test_and_init_storage_config.assert_called_once_with(
+            storage_config=new_storage_config
+        )
+        _get_configurator(mixin).set_config.assert_called_once_with(config)
+
     def test_set_config_storage_not_ready(self):
         """Returns failure when storage config is incomplete."""
         mixin = _make_config_mixin()
@@ -195,6 +246,26 @@ class TestSetConfig:
 
         assert response.success is True
 
+    def test_set_config_uses_exact_config_returned_by_normalizer(self):
+        """A typed normalization result is persisted without reconstruction."""
+        mixin = _make_config_mixin()
+        payload = {"storage_config": {"db_path": "/var/data/test.db"}}
+        normalized = Config(
+            storage_config=StorageConfigSQLite(db_path="/var/data/test.db")
+        )
+        configurator = _get_configurator(mixin)
+        configurator.normalize_config_payload.return_value = normalized
+        configurator.get_current_storage_configuration.return_value = (
+            normalized.storage_config
+        )
+
+        response = mixin.set_config(payload)
+
+        assert response.success is True
+        configurator.normalize_config_payload.assert_called_once_with(payload)
+        configurator.set_config.assert_called_once_with(normalized)
+        assert configurator.set_config.call_args.args[0] is normalized
+
     def test_set_config_exception(self):
         """Returns failure on unexpected exception."""
         mixin = _make_config_mixin()
@@ -209,6 +280,20 @@ class TestSetConfig:
 
         assert response.success is False
         assert "unexpected" in (response.msg or "")
+
+    def test_set_config_reraises_known_write_conflict(self):
+        """CAS conflicts must reach routes so callers receive HTTP 409."""
+        mixin = _make_config_mixin()
+        storage_config = StorageConfigSQLite(db_path="/var/data/current.db")
+        config = Config(storage_config=storage_config, window_size=25)
+        configurator = _get_configurator(mixin)
+        configurator.get_current_storage_configuration.return_value = storage_config
+        configurator.set_config.side_effect = ConfigWriteConflictError(
+            "Configuration changed while writing"
+        )
+
+        with pytest.raises(ConfigWriteConflictError):
+            mixin.set_config(config)
 
 
 # ---------------------------------------------------------------------------

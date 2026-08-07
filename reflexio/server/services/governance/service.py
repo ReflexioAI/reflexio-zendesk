@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from typing import Any
+from typing import Any, Literal, Protocol, TypedDict
 
 from reflexio.models.api_schema.domain.governance import (
     AuditEvent,
     PurgeOperationTarget,
+    SubjectWriteBarrier,
     UserEraseResult,
     UserExportResult,
 )
-from reflexio.server.services.governance.subject_refs import (
-    request_ref,
-    stable_id,
-    subject_ref,
+from reflexio.server.services.governance.config import (
+    get_governance_ref_secret,
+    governance_request_ref,
+    governance_subject_ref,
 )
+from reflexio.server.services.governance.subject_refs import stable_id
 
 _DELETE_TARGET_NAME_TO_RESULT_KEY = {
     "interaction": "interactions",
@@ -21,23 +23,64 @@ _DELETE_TARGET_NAME_TO_RESULT_KEY = {
     "profile": "profiles",
     "request": "requests",
     "agent_success_evaluation_result": "agent_success_evaluation_results",
+    "retrieved_learning_evaluation_result": "retrieved_learning_evaluation_results",
+    "evaluation_operation_state": "evaluation_operation_states",
+    "offline_tuner_reward_label": "offline_tuner_reward_labels",
+    "offline_tuner_reward_label_target_by_target_owner": (
+        "offline_tuner_reward_label_targets_by_target_owner"
+    ),
     "profile_purge": "purged_profiles",
     "user_playbook_purge": "purged_user_playbooks",
 }
 _REQUIRED_DELETE_TARGET_NAMES = tuple(_DELETE_TARGET_NAME_TO_RESULT_KEY)
 _USER_PLAYBOOK_PAGE_SIZE = 1000
+_LIFECYCLE_COMPLETION_STATUS = "complete"
+
+
+class GovernanceActorContext(TypedDict):
+    actor_type: Literal["api_token", "jwt", "system"]
+    actor_ref: str | None
+
+
+class SubjectErasureLifecycle(Protocol):
+    """Deployment-specific erasure work that must precede barrier completion."""
+
+    def erase_subject(
+        self,
+        *,
+        storage: Any,
+        subject_ref: str,
+        purge_id: str,
+    ) -> None: ...
 
 
 class GovernanceService:
-    def __init__(self, *, storage: Any, org_id: str, ref_secret: str) -> None:
+    def __init__(
+        self,
+        *,
+        storage: Any,
+        org_id: str,
+        ref_secret: str,
+        subject_erasure_lifecycle: SubjectErasureLifecycle | None = None,
+    ) -> None:
         self.storage = storage
         self.org_id = org_id
         self.ref_secret = ref_secret
+        self.subject_erasure_lifecycle = subject_erasure_lifecycle
 
-    def export_user(self, *, user_id: str, request_id: str) -> UserExportResult:
-        subref = subject_ref(user_id, self.ref_secret)
-        reqref = request_ref(request_id, self.ref_secret)
+    def export_user(
+        self,
+        *,
+        user_id: str,
+        request_id: str,
+        actor_context: GovernanceActorContext | None = None,
+    ) -> UserExportResult:
+        self._assert_storage_ref_secret_matches()
+        subref = governance_subject_ref(self.org_id, user_id, self.ref_secret)
+        reqref = governance_request_ref(self.org_id, request_id, self.ref_secret)
         export_id = stable_id("export", f"{self.org_id}:export:{subref}:{reqref}")
+        actor_type = actor_context["actor_type"] if actor_context else "system"
+        actor_ref = actor_context["actor_ref"] if actor_context else None
         requests, sessions = self._load_user_requests_and_sessions(user_id)
         bundle: dict[str, Any] = {
             "profiles": [
@@ -57,6 +100,8 @@ class GovernanceService:
         self.storage.append_audit_event(
             AuditEvent(
                 org_id=self.org_id,
+                actor_type=actor_type,
+                actor_ref=actor_ref,
                 operation="EXPORT",
                 entity_type="request",
                 subject_ref=subref,
@@ -67,9 +112,18 @@ class GovernanceService:
         )
         return UserExportResult(subject_ref=subref, export_id=export_id, bundle=bundle)
 
-    def erase_user(self, *, user_id: str, request_id: str) -> UserEraseResult:
-        subref = subject_ref(user_id, self.ref_secret)
-        reqref = request_ref(request_id, self.ref_secret)
+    def erase_user(
+        self,
+        *,
+        user_id: str,
+        request_id: str,
+        actor_context: GovernanceActorContext | None = None,
+    ) -> UserEraseResult:
+        self._assert_storage_ref_secret_matches()
+        subref = governance_subject_ref(self.org_id, user_id, self.ref_secret)
+        reqref = governance_request_ref(self.org_id, request_id, self.ref_secret)
+        actor_type = actor_context["actor_type"] if actor_context else "system"
+        actor_ref = actor_context["actor_ref"] if actor_context else None
         idempotency_key = stable_id(
             "idem",
             f"{self.org_id}:user_erasure:{subref}:{reqref}",
@@ -84,28 +138,51 @@ class GovernanceService:
             request_ref=reqref,
         )
         if purge.status == "complete":
-            return UserEraseResult(
-                subject_ref=subref, purge_id=purge_id, status="complete"
+            barrier = self._completed_barrier_for_retry(
+                subject_ref=subref, purge_id=purge_id
             )
-
+            if barrier.status != "erased":
+                raise ValueError(
+                    "Completed purge retry requires an erased subject barrier"
+                )
+            return UserEraseResult(
+                subject_ref=subref,
+                purge_id=purge_id,
+                status="complete",
+                deleted_counts=self._deleted_counts_from_targets(purge_id),
+                rebuilt_agent_playbook_ids=(
+                    self._rebuilt_agent_playbook_ids_from_targets(purge_id)
+                ),
+            )
         try:
+            self.storage.begin_subject_erasure_barrier(subref, purge_id)
             if not self.storage.purge_targets_prepared(purge_id):
                 self.storage.prepare_governance_erase_targets(
                     purge_id,
                     user_id,
                 )
 
-            self.storage.hide_governance_agent_playbooks_for_rebuild(purge_id)
-
             if not self._delete_targets_complete(purge_id):
                 self.storage.apply_governance_user_data_delete(purge_id, user_id)
+            if (
+                self.subject_erasure_lifecycle is not None
+                and not self._subject_erasure_lifecycle_complete(purge_id)
+            ):
+                self.subject_erasure_lifecycle.erase_subject(
+                    storage=self.storage,
+                    subject_ref=subref,
+                    purge_id=purge_id,
+                )
+                self._record_subject_erasure_lifecycle_complete(purge_id)
             deleted_counts = self._deleted_counts_from_targets(purge_id)
 
-            rebuilt_agent_playbook_ids = self._rebuild_agent_playbooks(purge_id)
-            completed = self.storage.complete_purge_operation_with_audit(
+            rebuilt_agent_playbook_ids: list[int] = []
+            completed = self.storage.complete_subject_erasure_barrier_after_empty_check(
                 purge_id,
                 AuditEvent(
                     org_id=self.org_id,
+                    actor_type=actor_type,
+                    actor_ref=actor_ref,
                     operation="ERASE",
                     entity_type="request",
                     subject_ref=subref,
@@ -118,6 +195,13 @@ class GovernanceService:
                 ),
             )
         except Exception as exc:
+            with suppress(Exception):
+                self.storage.fail_subject_erasure_barrier(
+                    subref,
+                    purge_id,
+                    error_code="governance_erase_failed",
+                    error_detail=type(exc).__name__,
+                )
             with suppress(Exception):
                 self.storage.fail_purge_operation(
                     purge_id,
@@ -132,6 +216,24 @@ class GovernanceService:
             deleted_counts=deleted_counts,
             rebuilt_agent_playbook_ids=rebuilt_agent_playbook_ids,
         )
+
+    def _assert_storage_ref_secret_matches(self) -> None:
+        storage_secret = get_governance_ref_secret()
+        if storage_secret != self.ref_secret:
+            raise RuntimeError(
+                "GovernanceService ref_secret must match REFLEXIO_GOVERNANCE_REF_SECRET "
+                "for governance operations"
+            )
+
+    def _completed_barrier_for_retry(
+        self, *, subject_ref: str, purge_id: str
+    ) -> SubjectWriteBarrier:
+        barrier = self.storage.get_subject_write_barrier(subject_ref)
+        if barrier is None or barrier.purge_id != purge_id:
+            raise ValueError(
+                "Completed purge retry requires the matching subject barrier"
+            )
+        return barrier
 
     def _load_user_requests_and_sessions(
         self, user_id: str
@@ -200,6 +302,59 @@ class GovernanceService:
                 continue
             counts[result_key] = int(target.deleted_count)
         return counts
+
+    def _subject_erasure_lifecycle_complete(self, purge_id: str) -> bool:
+        snapshot = self._prepared_target_snapshot(purge_id)
+        return bool(
+            snapshot is not None
+            and (snapshot.detail or {}).get("status") == _LIFECYCLE_COMPLETION_STATUS
+        )
+
+    def _record_subject_erasure_lifecycle_complete(self, purge_id: str) -> None:
+        snapshot = self._prepared_target_snapshot(purge_id)
+        if snapshot is None or snapshot.status != "complete":
+            raise ValueError(
+                "Subject erasure lifecycle requires a prepared target snapshot"
+            )
+        detail = dict(snapshot.detail or {})
+        detail["status"] = _LIFECYCLE_COMPLETION_STATUS
+        self.storage.record_purge_target(
+            purge_id=purge_id,
+            target_name="target_snapshot",
+            target_ref="all",
+            phase="prepare_targets",
+            status="complete",
+            detail=detail,
+            deleted_count=snapshot.deleted_count,
+            error_detail=snapshot.error_detail,
+        )
+
+    def _prepared_target_snapshot(self, purge_id: str) -> PurgeOperationTarget | None:
+        return next(
+            (
+                target
+                for target in self.storage.list_purge_targets(
+                    purge_id, phase="prepare_targets"
+                )
+                if target.target_name == "target_snapshot"
+                and target.target_ref == "all"
+            ),
+            None,
+        )
+
+    def _rebuilt_agent_playbook_ids_from_targets(self, purge_id: str) -> list[int]:
+        return [
+            int(target.target_ref)
+            for target in self.storage.list_purge_targets(
+                purge_id,
+                phase="rebuild_without_erased_sources",
+            )
+            if (
+                target.target_name == "agent_playbook"
+                and target.target_ref
+                and target.status == "complete"
+            )
+        ]
 
     def _rebuild_agent_playbooks(self, purge_id: str) -> list[int]:
         rebuilt_ids: list[int] = []

@@ -128,16 +128,28 @@ def test_postgres_opensearch_profile_search_round_trip(
 
     postgres_opensearch_storage.add_user_profile(user_id, [profile])
 
-    results = postgres_opensearch_storage.search_user_profile(
-        SearchUserProfileRequest(
-            user_id=user_id,
-            query="local OpenSearch verification",
-            top_k=5,
-            threshold=0.1,
+    embedding_purposes: list[str] = []
+
+    def record_query_embedding(_text: str, purpose: str = "document") -> list[float]:
+        embedding_purposes.append(purpose)
+        return [0.1] * 512
+
+    with patch.object(
+        postgres_opensearch_storage,
+        "_get_embedding",
+        side_effect=record_query_embedding,
+    ):
+        results = postgres_opensearch_storage.search_user_profile(
+            SearchUserProfileRequest(
+                user_id=user_id,
+                query="local OpenSearch verification",
+                top_k=5,
+                threshold=0.1,
+            )
         )
-    )
 
     assert [item.profile_id for item in results] == [profile.profile_id]
+    assert embedding_purposes == ["query"]
 
 
 @skip_in_precommit
@@ -225,14 +237,26 @@ def test_postgres_opensearch_user_playbook_search_excludes_superseded(
         ),
     )
 
-    results = postgres_opensearch_storage.search_user_playbooks(
-        SearchUserPlaybookRequest(
-            user_id=user_id,
-            query="OpenSearch retrieval procedure",
-            tags=["storage"],
-            top_k=5,
-            threshold=0.1,
+    embedding_purposes: list[str] = []
+
+    def record_query_embedding(_text: str, purpose: str = "document") -> list[float]:
+        embedding_purposes.append(purpose)
+        return [0.1] * 512
+
+    with patch.object(
+        postgres_opensearch_storage,
+        "_get_embedding",
+        side_effect=record_query_embedding,
+    ):
+        results = postgres_opensearch_storage.search_user_playbooks(
+            SearchUserPlaybookRequest(
+                user_id=user_id,
+                query="OpenSearch retrieval procedure",
+                tags=["storage"],
+                top_k=5,
+                threshold=0.1,
+            )
         )
-    )
 
     assert [item.user_playbook_id for item in results] == [successor.user_playbook_id]
+    assert embedding_purposes == ["query"]

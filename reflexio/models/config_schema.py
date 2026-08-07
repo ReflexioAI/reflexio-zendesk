@@ -377,11 +377,14 @@ class APIKeyConfig(BaseModel):
 class DeduplicationConfig(BaseModel):
     """Configuration for playbook deduplication search parameters.
 
-    Controls the hybrid search behavior when looking for existing playbooks
-    to deduplicate against.
+    Controls bounded candidate generation when looking for existing playbooks
+    to deduplicate against. The candidate threshold is intentionally independent
+    from the embedding model's user-facing retrieval default because an LLM
+    performs the final duplicate decision.
 
     Args:
-        search_threshold: Minimum similarity score for search results (0.0-1.0).
+        search_threshold: Minimum similarity score for deduplication candidates
+            (0.0-1.0), independent from user-facing retrieval defaults.
         search_top_k: Maximum number of existing playbooks to retrieve per new playbook.
         max_unified_content_chars: Soft cap on a unified playbook's content length.
     """
@@ -390,7 +393,11 @@ class DeduplicationConfig(BaseModel):
         default=0.4,
         ge=0.0,
         le=1.0,
-        description="Minimum similarity score for deduplication search results.",
+        description=(
+            "Minimum similarity score for deduplication candidates. This is a "
+            "dedup-specific override, independent from the embedding model's "
+            "user-facing retrieval default."
+        ),
     )
     search_top_k: int = Field(
         default=5,
@@ -448,17 +455,13 @@ class ProfileExtractorConfig(_ExtractorWindowOverrideCompatMixin, BaseModel):
 class PlaybookAggregatorConfig(BaseModel):
     min_cluster_size: int = Field(default=2, ge=1)
     reaggregation_trigger_count: int = Field(default=2, ge=1)
-    clustering_similarity: float = Field(
-        default=0.3,
+    clustering_similarity: float | None = Field(
+        default=None,
         ge=0.0,
         le=1.0,
         description=(
             "Cosine similarity threshold for clustering. Higher = tighter clusters. "
-            "Default 0.3 is a compromise that works for both cloud embeddings "
-            "(OpenAI text-embedding-3-*, Gemini) and the local zero-padded "
-            "MiniLM-L6-v2 embedder. Cloud embeddings typically tolerate 0.4-0.6; "
-            "the local embedder's 384-dim vectors zero-padded to 512 produce "
-            "lower cosine similarities and need ~0.15-0.3 to cluster at all."
+            "When omitted, Reflexio uses the embedding model's calibrated default."
         ),
     )
     direction_overlap_threshold: float = Field(
@@ -481,7 +484,9 @@ class UserPlaybookExtractorConfig(_ExtractorWindowOverrideCompatMixin, BaseModel
     extraction_definition_prompt: SanitizedNonEmptyStr
     context_prompt: str | None = None
     tagging_definition_prompt: str | None = None
-    aggregation_config: PlaybookAggregatorConfig | None = None
+    aggregation_config: PlaybookAggregatorConfig = Field(
+        default_factory=PlaybookAggregatorConfig
+    )
     deduplication_config: DeduplicationConfig | None = None
     request_sources_enabled: list[str] | None = (
         None  # default enabled for all sources, if set, only extract user playbooks from the enabled request sources
@@ -493,6 +498,15 @@ class UserPlaybookExtractorConfig(_ExtractorWindowOverrideCompatMixin, BaseModel
     @classmethod
     def _migrate_field_names(cls, data: Any) -> Any:
         data = _migrate_dict(data, _PLAYBOOK_CONFIG_FIELD_MIGRATION)
+        if (
+            isinstance(data, dict)
+            and "aggregation_config" in data
+            and data["aggregation_config"] is None
+        ):
+            # Historical configs persisted the absent optional aggregator as
+            # JSON null. Aggregation is now default-on, so treat both a missing
+            # field and the legacy null representation as "use defaults".
+            data.pop("aggregation_config")
         return _migrate_dict(data, _EXTRACTOR_OVERRIDE_MIGRATION)
 
 
@@ -511,7 +525,7 @@ class AgentSuccessConfig(_ExtractorWindowOverrideCompatMixin, BaseModel):
     # (one agent-success evaluator per org), so the name is accepted but ignored.
     evaluation_name: NonEmptyStr | None = None
     success_definition_prompt: SanitizedNonEmptyStr
-    metadata_definition_prompt: str | None = None
+    tagging_definition_prompt: str | None = None
     request_sources_enabled: list[str] | None = (
         None  # default enabled for all sources, if set, only evaluate requests from the enabled request sources
     )
@@ -520,6 +534,27 @@ class AgentSuccessConfig(_ExtractorWindowOverrideCompatMixin, BaseModel):
         ge=0.0,
         le=1.0,
         description="Fraction of sessions to evaluate automatically.",
+    )
+    evaluation_only_sampling_rate: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of evaluation-only sessions to evaluate automatically."
+            " None inherits sampling_rate."
+        ),
+    )
+    retrieved_learning_sampling_rate: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of sessions to judge for retrieved-learning relevance and"
+            " impact. None inherits sampling_rate. Set this independently when"
+            " the retrieved-learning verdicts feed a downstream consumer (e.g."
+            " the offline playbook tuner) that needs denser coverage than the"
+            " session-success judge."
+        ),
     )
     window_size_override: int | None = Field(default=None, gt=0)
     stride_size_override: int | None = Field(default=None, gt=0)
@@ -538,63 +573,12 @@ def _default_agent_success_config() -> AgentSuccessConfig:
     )
 
 
-class ReflectionConfig(BaseModel):
-    """Configuration for the sliding-window reflection step.
-
-    Reflection runs inside ``GenerationService.run`` as its own
-    sliding-window step (window = global ``window_size``, stride = global
-    ``stride_size``, bookmark via ``OperationStateManager``). When
-    the gate opens and at least one Assistant interaction in the window
-    cites a current user playbook / user profile row, the LLM is asked
-    whether any cited rows should be replaced. When ``enabled`` is
-    False the step short-circuits.
-
-    Args:
-        enabled (bool): Master switch. When False, no LLM call is made.
-        model (str | None): Optional model name override. Falls back to
-            ``LLMConfig.generation_model_name`` and then the site
-            default for ``ModelRole.GENERATION`` when None.
-        post_horizon_size (int): Minimum interactions after a citation before
-            reflection judges it with full confidence. Citations near the recent
-            edge of the window with fewer than this many follow-up turns get a
-            'last_chance' judgment with the prompt biased toward no_change.
-            Set to 0 to disable the filter (legacy behavior).
-        max_revisions_per_pass (int): Cap on the number of revision decisions
-            applied in a single reflection pass (regularization). Once the cap
-            is hit, remaining revision-intent decisions are skipped and counted
-            in ``ReflectionResult.capped_count``.
-    """
-
-    enabled: bool = True
-    model: str | None = None
-    post_horizon_size: int = Field(
-        default=3,
-        description=(
-            "Minimum interactions after a citation before reflection judges "
-            "it with full confidence. Citations near the recent edge of the "
-            "window with fewer than this many follow-up turns get a "
-            "'last_chance' judgment with the prompt biased toward no_change. "
-            "Set to 0 to disable the filter (legacy behavior)."
-        ),
-        ge=0,
-    )
-    max_revisions_per_pass: int = Field(
-        default=8,
-        gt=0,
-        description=(
-            "Cap on revision decisions applied per reflection pass "
-            "(regularization; excess are skipped)."
-        ),
-    )
-
-
 class RetrievalFloorConfig(BaseModel):
     """Read-path relevance floor: drop search results below a per-arm cross-encoder score.
 
-    Floors are RAW cross-encoder logits (ms-marco-MiniLM), not probabilities. On this
-    corpus strongly relevant items score roughly 0..-3, weak/marginal items -3..-5,
-    and clear junk -6..-11. A default of -3 keeps strong matches while dropping the
-    weak tail that drives false-positive citations. Calibrate per arm on real data.
+    Floors are raw, model-specific cross-encoder logits, not probabilities. ``None``
+    selects the calibrated default for the reranker discovered from the inference
+    service. Numeric values are exact organization overrides, including ``0.0``.
     """
 
     enabled: bool = False
@@ -603,9 +587,9 @@ class RetrievalFloorConfig(BaseModel):
         gt=0,
         description="Candidates fetched per arm before flooring + cap to top_k.",
     )
-    profile_floor: float = -3.0
-    user_playbook_floor: float = -3.0
-    agent_playbook_floor: float = -3.0
+    profile_floor: float | None = None
+    user_playbook_floor: float | None = None
+    agent_playbook_floor: float | None = None
 
 
 class PlaybookOptimizerConfig(BaseModel):
@@ -716,7 +700,29 @@ class LineageGCConfig(BaseModel):
     poll_interval_seconds: int = Field(default=86400, gt=0)
 
 
+class ExpiryReclamationConfig(BaseModel):
+    """Direct-delete reclamation of expired plain rows (non-audited).
+
+    Independent of ``lineage_gc``: these rows carry no PII/audit/grace obligation,
+    so they can be reclaimed whenever this is enabled even if tombstone GC is off.
+
+    Opt-in by default (``enabled=False``) so operators control a staged rollout
+    of the direct-delete Class B sweeps and are not surprised by deletions on
+    upgrade.  ``lineage_gc.enabled`` (which defaults to True) is unaffected and
+    continues to drive the Class A profile-expiry and tombstone-GC paths.
+    """
+
+    enabled: bool = False
+
+
 class GovernanceRetentionConfig(BaseModel):
+    """Audit-event retention policy. **Enterprise-only:** reclamation is performed
+    by an enterprise per-org reclamation sweep registered via
+    ``register_per_org_sweep``. In an OSS-only deployment these knobs are accepted
+    but inert (the OSS lineage scheduler does not reclaim audit events) and the
+    server logs a startup warning when retention is enabled.
+    """
+
     audit_events_retention_enabled: bool = False
     audit_events_retention_days: int = Field(default=365, gt=0)
     audit_events_delete_batch_limit: int = Field(default=500, gt=0)
@@ -799,6 +805,28 @@ class LLMConfig(BaseModel):
     )
 
 
+class RetrievalExperimentConfig(BaseModel):
+    """The single retrieval holdout experiment currently serving traffic."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    experiment_id: NonEmptyStr = Field(max_length=128)
+    holdout_percentage: float = Field(gt=0, lt=100)
+
+
+class RetrievalExperimentRecord(RetrievalExperimentConfig):
+    """Immutable lifecycle metadata retained after an experiment stops."""
+
+    started_at: int = Field(ge=0)
+    ended_at: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> Self:
+        if self.ended_at is not None and self.ended_at < self.started_at:
+            raise ValueError("ended_at must be greater than or equal to started_at")
+        return self
+
+
 def _default_profile_extractor_config() -> ProfileExtractorConfig:
     return ProfileExtractorConfig(
         extraction_definition_prompt=(
@@ -851,8 +879,13 @@ class Config(BaseModel):
     api_key_config: APIKeyConfig | None = None
     # LLM model configuration overrides
     llm_config: LLMConfig | None = None
-    # Post-publish reflection service configuration
-    reflection_config: ReflectionConfig = Field(default_factory=ReflectionConfig)
+    # One active user-randomized retrieval holdout experiment. Lifecycle
+    # endpoints own this field and the append-only history below so generic
+    # settings saves cannot silently erase an experiment.
+    retrieval_experiment_config: RetrievalExperimentConfig | None = None
+    retrieval_experiment_history: list[RetrievalExperimentRecord] = Field(
+        default_factory=list
+    )
     # Read-path relevance floor (per-arm cross-encoder score cutoff)
     retrieval_floor: RetrievalFloorConfig = Field(default_factory=RetrievalFloorConfig)
     # Optional GEPA-backed playbook content optimizer
@@ -861,6 +894,10 @@ class Config(BaseModel):
     )
     # Tombstone GC job gate (opt-in, off by default — see LineageGCConfig)
     lineage_gc: LineageGCConfig = Field(default_factory=LineageGCConfig)
+    # Direct-delete reclamation of expired plain rows (share links, pending tool calls)
+    expiry_reclamation: ExpiryReclamationConfig = Field(
+        default_factory=ExpiryReclamationConfig
+    )
     governance_retention: GovernanceRetentionConfig = Field(
         default_factory=GovernanceRetentionConfig
     )
@@ -896,7 +933,7 @@ class Config(BaseModel):
         ),
     )
     shadow_comparison_judge_prompt_version: NonEmptyStr = Field(
-        default="v1.0.0",
+        default="v1.1.0",
         description=(
             "F1: pinned judge prompt version for per-turn shadow comparison. "
             "Verdicts are stored with the version that produced them; the "
@@ -919,9 +956,9 @@ class Config(BaseModel):
             for key in (
                 "window_size",
                 "stride_size",
-                "reflection_config",
                 "playbook_optimizer_config",
                 "lineage_gc",
+                "expiry_reclamation",
                 "governance_retention",
                 "pending_tool_call_config",
                 "retrieval_floor",
@@ -1005,3 +1042,18 @@ class Config(BaseModel):
     @batch_interval.setter
     def batch_interval(self, value: int) -> None:
         self.stride_size = value
+
+
+def validate_stored_config(data: dict[str, Any]) -> Config:
+    """Validate persisted config with schema-evolution read compatibility.
+
+    Persisted JSON can contain fields that were valid when it was written but
+    have since been deleted. Ignore only those unknown fields while retaining
+    normal validation for recognized values. Missing fields continue to use
+    their current schema defaults.
+
+    API writes intentionally construct ``Config`` directly and therefore keep
+    the model's strict ``extra="forbid"`` behavior.
+    """
+    normalized = normalize_legacy_config_shape(data)
+    return Config.model_validate(normalized, extra="ignore")

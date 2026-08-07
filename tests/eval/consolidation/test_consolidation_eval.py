@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from reflexio.server.llm._litellm_types import CompletionResult, ModelProvenance
 from reflexio.server.services.playbook.components.consolidator import (
     ConsolidationDecision,
     DifferentiateDecision,
@@ -38,7 +39,7 @@ from tests.eval.consolidation.runner import EvalResults, run_eval, score_case
 # ---------------------------------------------------------------------------
 
 
-def _unify(new_id: str = "n1", **kw: object) -> UnifyDecision:
+def _unify(new_id: str = "NEW-1", **kw: object) -> UnifyDecision:
     base: dict[str, object] = {
         "new_id": new_id,
         "content": "Always summarize the report.",
@@ -50,14 +51,16 @@ def _unify(new_id: str = "n1", **kw: object) -> UnifyDecision:
 
 
 def _reject(
-    new_id: str = "n1", superseded_by_existing_id: int = 1
+    new_id: str = "NEW-1", superseded_by_existing_id: int = 1
 ) -> RejectNewDecision:
     return RejectNewDecision(
         new_id=new_id, superseded_by_existing_id=superseded_by_existing_id
     )
 
 
-def _differentiate(new_id: str = "n1", existing_id: int = 1) -> DifferentiateDecision:
+def _differentiate(
+    new_id: str = "NEW-1", existing_id: int = 1
+) -> DifferentiateDecision:
     return DifferentiateDecision(
         new_id=new_id,
         existing_id=existing_id,
@@ -66,7 +69,7 @@ def _differentiate(new_id: str = "n1", existing_id: int = 1) -> DifferentiateDec
     )
 
 
-def _independent(new_id: str = "n1") -> IndependentDecision:
+def _independent(new_id: str = "NEW-1") -> IndependentDecision:
     return IndependentDecision(new_id=new_id)
 
 
@@ -79,7 +82,7 @@ def _case(case_id: str = "c1", gold_kind: str = "unify") -> ConsolidationEvalCas
                 {"id": 1, "content": "existing rule", "trigger": "t", "rationale": ""}
             ],
             "candidate": {
-                "new_id": "n1",
+                "new_id": "NEW-1",
                 "content": "candidate rule",
                 "trigger": "t",
                 "rationale": "",
@@ -469,8 +472,8 @@ def test_live_provider_returns_canned_decision(tmp_path):
 
     canned = UnifyDecision(new_id="NEW-0", content="x", trigger="t", rationale="r")
     mock = MagicMock()
-    mock.generate_chat_response.return_value = PlaybookConsolidationOutput(
-        decisions=[canned]
+    mock.generate_chat_response_with_provenance.return_value = CompletionResult(
+        PlaybookConsolidationOutput(decisions=[canned]), ModelProvenance()
     )
 
     ctx = RequestContext(org_id="eval-cons-prov", storage_base_dir=str(tmp_path))
@@ -484,7 +487,7 @@ def test_live_provider_returns_canned_decision(tmp_path):
     assert decision == canned
     assert kind_for_decision(decision) == "unify"
     # The provider reached the LLM call (entity build + prompt render succeeded).
-    mock.generate_chat_response.assert_called_once()
+    mock.generate_chat_response_with_provenance.assert_called_once()
 
 
 def test_live_provider_empty_output_maps_to_independent(tmp_path):
@@ -493,7 +496,9 @@ def test_live_provider_empty_output_maps_to_independent(tmp_path):
     from reflexio.server.api_endpoints.request_context import RequestContext
 
     mock = MagicMock()
-    mock.generate_chat_response.return_value = PlaybookConsolidationOutput(decisions=[])
+    mock.generate_chat_response_with_provenance.return_value = CompletionResult(
+        PlaybookConsolidationOutput(decisions=[]), ModelProvenance()
+    )
 
     ctx = RequestContext(org_id="eval-cons-noop", storage_base_dir=str(tmp_path))
     provider = make_consolidation_decision_provider(
@@ -556,7 +561,7 @@ def test_real_judge_smoke():  # pragma: no cover - manual, costs money
                 }
             ],
             "candidate": {
-                "new_id": "n1",
+                "new_id": "NEW-1",
                 "content": "Do not attach internal-only files to a customer email.",
                 "trigger": "drafting a customer email",
                 "rationale": "Internal files can leak confidential data.",
@@ -567,7 +572,7 @@ def test_real_judge_smoke():  # pragma: no cover - manual, costs money
         }
     )
     decision = UnifyDecision(
-        new_id="n1",
+        new_id="NEW-1",
         archive_existing_ids=[1],
         content=(
             "Always greet the recipient by name; do not attach internal-only "

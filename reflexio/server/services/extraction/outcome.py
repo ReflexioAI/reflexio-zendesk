@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from reflexio.server.llm._litellm_types import ModelProvenance
     from reflexio.server.llm.token_accounting import RunTokenTotals
+    from reflexio.server.services.deferred_learning_plan import (
+        ExtractorBookmarkAdvance,
+    )
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,10 @@ class ExtractionOutcome[T]:
     items: list[T] = field(default_factory=list)
     run_id: str | None = None
     token_totals: RunTokenTotals | None = None
+    # The stride-bookmark advance the extractor no longer applies itself (F1);
+    # applied downstream in persist (durable) or ``.run()``'s persist half.
+    bookmark_advance: ExtractorBookmarkAdvance | None = None
+    model_provenance: ModelProvenance | None = None
 
     @classmethod
     def completed(
@@ -25,9 +33,16 @@ class ExtractionOutcome[T]:
         *,
         run_id: str | None = None,
         token_totals: RunTokenTotals | None = None,
+        bookmark_advance: ExtractorBookmarkAdvance | None = None,
+        model_provenance: ModelProvenance | None = None,
     ) -> ExtractionOutcome[T]:
         return cls(
-            status="completed", items=items, run_id=run_id, token_totals=token_totals
+            status="completed",
+            items=items,
+            run_id=run_id,
+            token_totals=token_totals,
+            bookmark_advance=bookmark_advance,
+            model_provenance=model_provenance,
         )
 
     @classmethod

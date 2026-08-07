@@ -12,6 +12,7 @@ from reflexio.models.config_schema import (
 )
 from reflexio.server.llm.model_defaults import (
     _PROVIDER_DEFAULTS,
+    GENERATION_CAPABLE_PROVIDERS,
     ModelRole,
     detect_available_providers,
     resolve_model_name,
@@ -37,6 +38,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "CLAUDE_SMART_CLI_PATH",
         "CLAUDE_SMART_CLI_TIMEOUT",
         "CLAUDE_SMART_USE_LOCAL_EMBEDDING",
+        "REFLEXIO_LLM_FALLBACK_MODELS",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -305,16 +307,15 @@ class TestValidateLlmAvailability:
         monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
         validate_llm_availability()  # should not raise
 
-    def test_no_embedding_provider_no_chromadb_raises(
+    def test_no_embedding_provider_uses_colocated_service_without_chromadb(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Anthropic key + chromadb missing → raise with install hint."""
+        """Model packages live in the child service, not the API worker."""
         from reflexio.server.llm.providers import local_embedding_provider as lep
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
         monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: None)
-        with pytest.raises(RuntimeError, match="chromadb"):
-            validate_llm_availability()
+        validate_llm_availability()
 
     def test_openai_only_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
@@ -359,6 +360,46 @@ class TestValidateLlmAvailability:
             validate_llm_availability()
 
 
+def test_configured_fallback_without_provider_key_raises(monkeypatch):
+    from reflexio.server.llm import model_defaults as md
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "x")  # primary provider present
+    monkeypatch.setenv("REFLEXIO_LLM_FALLBACK_MODELS", "zai/glm-5.2")
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)  # fallback key MISSING
+    with pytest.raises(RuntimeError, match=r"fallback model.*zai"):
+        md.validate_llm_availability()
+
+
+def test_configured_fallback_unknown_provider_warns_not_raises(monkeypatch, caplog):
+    """A fallback naming a provider reflexio cannot validate at boot (outside
+    ``_ENV_TO_PROVIDER`` — e.g. bedrock, vertex_ai, azure, groq, ollama,
+    together_ai, all authenticated via non-``<PROVIDER>_API_KEY`` means) must
+    not crash the server: it warns and lets the failure surface at request
+    time instead, preserving pre-PR boot behavior for these providers."""
+    import logging
+
+    from reflexio.server.llm import model_defaults as md
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "x")  # primary provider present
+    monkeypatch.setenv("REFLEXIO_LLM_FALLBACK_MODELS", "bedrock/anthropic.claude-v2")
+    with caplog.at_level(logging.WARNING):
+        md.validate_llm_availability()  # should not raise
+    assert any("bedrock" in r.message.lower() for r in caplog.records)
+
+
+def test_configured_fallback_provider_case_insensitive(monkeypatch):
+    """An upper/mixed-case provider prefix (e.g. ``ZAI/glm-5.2``) must resolve
+    to the same known provider as its lowercase form, not be treated as an
+    unknown provider that skips the fallback-key check."""
+    from reflexio.server.llm import model_defaults as md
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "x")  # primary provider present
+    monkeypatch.setenv("REFLEXIO_LLM_FALLBACK_MODELS", "ZAI/glm-5.2")
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)  # fallback key MISSING
+    with pytest.raises(RuntimeError, match=r"fallback model.*ZAI"):
+        md.validate_llm_availability()
+
+
 # ---------------------------------------------------------------------------
 # All providers have defaults defined
 # ---------------------------------------------------------------------------
@@ -398,6 +439,21 @@ class TestProviderDefaults:
                     value = getattr(defaults, role.value)
                     assert value, f"{provider}.{role.value} is empty"
 
+    def test_local_provider_is_embedding_only(self) -> None:
+        """Pin the contract the generation-fallback filter relies on.
+
+        ``_build_completion_params`` (in ``_litellm_text_generation``) drops every
+        ``local/*`` model from text-generation fallback lists on the assumption
+        that ``local`` is an in-process EMBEDDING provider with no litellm
+        completion route (that blanket filter fixes the production
+        PYTHON-FASTAPI-CV). If a local *generation* model is ever added, this
+        assertion fails loudly so that filter — and the whole ``local/`` naming
+        scheme — is revisited before a legitimate local generation fallback gets
+        silently dropped.
+        """
+        assert _PROVIDER_DEFAULTS["local"].generation is None
+        assert "local" not in GENERATION_CAPABLE_PROVIDERS
+
 
 # ---------------------------------------------------------------------------
 # EXTRACTION_AGENT role (drives the always-on resumable extraction loop)
@@ -410,8 +466,10 @@ class TestExtractionAgentRole:
 
     def test_anthropic_defaults_map_to_sonnet(self) -> None:
         anthropic = _PROVIDER_DEFAULTS["anthropic"]
+        assert anthropic.generation == "claude-sonnet-5"
+        assert anthropic.evaluation == "claude-sonnet-5"
         assert anthropic.extraction_agent is not None
-        assert "sonnet" in anthropic.extraction_agent.lower()
+        assert anthropic.extraction_agent == "claude-sonnet-5"
 
     def test_openai_defaults_map_to_gpt5(self) -> None:
         openai = _PROVIDER_DEFAULTS["openai"]
@@ -561,3 +619,18 @@ class TestMinimaxOnlyEnvRegression:
         monkeypatch.setattr(lep.importlib.util, "find_spec", lambda _name: object())
         result = resolve_model_name(ModelRole.EMBEDDING)
         assert result == "local/minilm-l6-v2"
+
+
+# ---------------------------------------------------------------------------
+# zai provider defaults (glm-5.2 is the live-verified flagship, #792)
+# ---------------------------------------------------------------------------
+
+
+def test_zai_defaults_to_glm_5_2():
+    from reflexio.server.llm.model_defaults import _PROVIDER_DEFAULTS
+
+    z = _PROVIDER_DEFAULTS["zai"]
+    assert z.generation == "zai/glm-5.2"
+    assert z.evaluation == "zai/glm-5.2"
+    assert z.should_run == "zai/glm-5.2"
+    assert z.pre_retrieval == "zai/glm-5.2"

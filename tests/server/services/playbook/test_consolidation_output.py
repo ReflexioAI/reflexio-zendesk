@@ -8,10 +8,12 @@ longer parse — that structural guarantee is what the new schema buys.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from reflexio.models.api_schema.service_schemas import UserPlaybook
 from reflexio.server.services.playbook.components.consolidator import (
     ConsolidationDecision,
     DifferentiateDecision,
@@ -19,7 +21,35 @@ from reflexio.server.services.playbook.components.consolidator import (
     PlaybookConsolidationOutput,
     RejectNewDecision,
     UnifyDecision,
+    validate_consolidation_output,
 )
+
+
+def _playbook(idx: int) -> UserPlaybook:
+    return UserPlaybook(
+        content=f"content {idx}",
+        trigger=f"trigger {idx}",
+        request_id=f"req-{idx}",
+        agent_version="v1",
+        source_interaction_ids=[idx],
+    )
+
+
+def test_active_prompt_documents_partition_contract():
+    prompt_path = (
+        Path(__file__).resolve().parents[4]
+        / "reflexio"
+        / "server"
+        / "prompt"
+        / "prompt_bank"
+        / "playbook_consolidation"
+        / "v2.4.0.prompt.md"
+    )
+    prompt = prompt_path.read_text(encoding="utf-8")
+
+    assert "Every NEW label MUST appear exactly once" in prompt
+    assert '"new_id": ["NEW-0", "NEW-1"]' in prompt
+    assert "`archive_existing_ids` only refers to rows from the EXISTING list" in prompt
 
 
 def test_output_json_schema_is_provider_safe_by_construction():
@@ -28,7 +58,7 @@ def test_output_json_schema_is_provider_safe_by_construction():
     Option C (``ProviderSafeUnionMixin``): the discriminated union is folded to
     ``anyOf`` at the model boundary, so the emitted JSON schema is accepted by
     strict structured-output providers WITHOUT ``make_strict_json_schema`` and
-    WITHOUT any provider-detection gate (the gap that caused Sentry
+    WITHOUT any provider-detection gate (the gap that caused the production
     ``PYTHON-FASTAPI-9J``). Asserting on the raw schema proves the property is
     intrinsic to the model, not bolted on by a downstream normalizer.
     """
@@ -116,6 +146,59 @@ def test_unify_accepts_empty_archive_existing_ids():
     assert unify.archive_existing_ids == []
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("NEW-0", "NEW-0"),
+        ("[NEW-0]", "NEW-0"),
+        (["NEW-0"], "NEW-0"),
+        (["[NEW-0]"], "NEW-0"),
+    ],
+)
+def test_single_new_id_accepts_prompt_label_variants(raw_value, expected):
+    """Single-NEW decision fields tolerate common LLM label echoes."""
+    d = DifferentiateDecision(
+        new_id=raw_value,  # type: ignore[arg-type]
+        existing_id=0,
+        refined_new_trigger="narrow new",
+        refined_existing_trigger="narrow existing",
+    )
+    assert d.new_id == expected
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        UnifyDecision(
+            new_id=["[NEW-0]", "NEW-1"],  # type: ignore[arg-type]
+            archive_existing_ids=[],
+            content="X",
+            trigger="t",
+            rationale="r",
+        ),
+        RejectNewDecision(
+            new_id=["[NEW-0]", "NEW-1"],  # type: ignore[arg-type]
+            superseded_by_existing_id=0,
+        ),
+        IndependentDecision(new_id=["[NEW-0]", "NEW-1"]),  # type: ignore[arg-type]
+    ],
+)
+def test_multi_new_decisions_accept_new_id_lists(decision):
+    """Decision kinds with clear multi-NEW semantics keep canonical NEW ids."""
+    assert decision.new_ids == ["NEW-0", "NEW-1"]
+
+
+def test_differentiate_rejects_multi_new_id_list():
+    """``differentiate`` has one pair of refined triggers, so multi-NEW is ambiguous."""
+    with pytest.raises(ValidationError):
+        DifferentiateDecision(
+            new_id=["NEW-0", "NEW-1"],  # type: ignore[arg-type]
+            existing_id=0,
+            refined_new_trigger="narrow new",
+            refined_existing_trigger="narrow existing",
+        )
+
+
 def test_reject_new_requires_superseded_existing_id():
     """``RejectNewDecision`` must name the superseding existing id."""
     with pytest.raises(ValidationError):
@@ -149,6 +232,69 @@ def test_all_four_kinds_round_trip_through_output():
         "differentiate",
         "independent",
     ]
+
+
+def test_validate_consolidation_output_accepts_exactly_once_coverage():
+    output = PlaybookConsolidationOutput(
+        decisions=[
+            UnifyDecision(
+                new_id=["NEW-0", "NEW-1"],
+                archive_existing_ids=[],
+                content="X",
+                trigger="t",
+                rationale="r",
+            ),
+            RejectNewDecision(new_id="NEW-2", superseded_by_existing_id=0),
+            DifferentiateDecision(
+                new_id="NEW-3",
+                existing_id=0,
+                refined_new_trigger="narrow new",
+                refined_existing_trigger="narrow existing",
+            ),
+            IndependentDecision(new_id="NEW-4"),
+        ]
+    )
+
+    assert validate_consolidation_output([_playbook(i) for i in range(5)], output) == []
+
+
+def test_validate_consolidation_output_reports_missing_new_id():
+    output = PlaybookConsolidationOutput(
+        decisions=[IndependentDecision(new_id="NEW-0")]
+    )
+
+    errors = validate_consolidation_output([_playbook(0), _playbook(1)], output)
+
+    assert any("missing NEW ids: NEW-1" in error for error in errors)
+
+
+def test_validate_consolidation_output_reports_duplicate_new_id():
+    output = PlaybookConsolidationOutput(
+        decisions=[
+            IndependentDecision(new_id="NEW-0"),
+            UnifyDecision(
+                new_id="NEW-0",
+                archive_existing_ids=[],
+                content="X",
+                trigger="t",
+                rationale="r",
+            ),
+        ]
+    )
+
+    errors = validate_consolidation_output([_playbook(0)], output)
+
+    assert any("NEW-0 appears in decision[0]" in error for error in errors)
+
+
+def test_validate_consolidation_output_reports_unknown_new_id():
+    output = PlaybookConsolidationOutput(
+        decisions=[IndependentDecision(new_id="NEW-99")]
+    )
+
+    errors = validate_consolidation_output([_playbook(0)], output)
+
+    assert any("unknown NEW id NEW-99" in error for error in errors)
 
 
 @pytest.mark.parametrize(
@@ -185,9 +331,11 @@ def test_legacy_kind_literals_no_longer_parse(legacy_payload):
     [
         ([0, 1], [0, 1]),
         (["EXISTING-0", "EXISTING-3"], [0, 3]),
+        (["[EXISTING-0]", "[EXISTING-3]"], [0, 3]),
         (["existing-2"], [2]),
         (["5", "EXISTING-6"], [5, 6]),
         ([0, "EXISTING-7"], [0, 7]),
+        ("[EXISTING-8]", [8]),
         (None, []),
     ],
 )
@@ -222,6 +370,15 @@ def test_reject_new_superseded_id_coerces_position_label():
     assert r.superseded_by_existing_id == 4
 
 
+def test_reject_new_superseded_id_accepts_position_label_list():
+    """``reject_new`` can name one-or-more EXISTING refs in list form."""
+    r = RejectNewDecision(
+        new_id="NEW-0",
+        superseded_by_existing_id=["[EXISTING-1]", "EXISTING-4"],  # type: ignore[arg-type]
+    )
+    assert r.superseded_by_existing_ids == [1, 4]
+
+
 def test_differentiate_existing_id_coerces_position_label():
     """``existing_id`` strips an ``EXISTING-N`` label to ``N`` (see
     ``test_reject_new_superseded_id_coerces_position_label``).
@@ -233,6 +390,28 @@ def test_differentiate_existing_id_coerces_position_label():
         refined_existing_trigger="narrow existing",
     )
     assert d.existing_id == 9
+
+
+def test_differentiate_existing_id_accepts_one_item_list():
+    """``differentiate`` tolerates a one-item EXISTING list, but stays singular."""
+    d = DifferentiateDecision(
+        new_id="NEW-0",
+        existing_id=["[EXISTING-2]"],  # type: ignore[arg-type]
+        refined_new_trigger="narrow new",
+        refined_existing_trigger="narrow existing",
+    )
+    assert d.existing_id == 2
+
+
+def test_differentiate_existing_id_rejects_multi_item_list():
+    """A single pair of refined triggers cannot safely cover multiple existing rows."""
+    with pytest.raises(ValidationError):
+        DifferentiateDecision(
+            new_id="NEW-0",
+            existing_id=["EXISTING-1", "EXISTING-2"],  # type: ignore[arg-type]
+            refined_new_trigger="narrow new",
+            refined_existing_trigger="narrow existing",
+        )
 
 
 def test_reject_new_superseded_id_rejects_non_numeric_label():
