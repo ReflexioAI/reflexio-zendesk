@@ -12,7 +12,6 @@ answers instead of admitting it can't check, the extracted playbook:
 3. Uses the new flat schema (trigger + content, no instruction/pitfall)
 """
 
-import os
 from collections.abc import Callable
 
 import pytest
@@ -21,9 +20,24 @@ from reflexio.lib.reflexio_lib import Reflexio
 from reflexio.models.api_schema.retriever_schema import GetUserPlaybooksRequest
 from reflexio.models.api_schema.service_schemas import InteractionData, UserPlaybook
 from reflexio.models.config_schema import SINGLETON_USER_PLAYBOOK_NAME
+from reflexio.test_support.llm_credentials import real_generation_provider
+from reflexio.test_support.llm_mock import assert_litellm_unpatched
 from tests.server.test_utils import skip_low_priority
 
-pytestmark = [pytest.mark.e2e, pytest.mark.requires_credentials]
+# ``requires_credentials`` does not skip on its own — it is a ``-m`` deselector
+# and the key the e2e conftest uses to lift the litellm mock. Without the skipif
+# below, a keyless run lifts the mock and then calls the provider with the
+# placeholder key the credential floor pins, dying on AuthenticationError
+# instead of skipping. The fixture pins no model, so any generation-capable
+# provider satisfies this test.
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.requires_credentials,
+    pytest.mark.skipif(
+        not real_generation_provider(),
+        reason="No real API key for a generation-capable provider",
+    ),
+]
 
 
 @skip_low_priority
@@ -36,9 +50,7 @@ def test_knowledge_gap_extraction_real_llm(
     Uses the default agent_context_prompt and user_playbook_extractor_config.
     Verify the extracted playbook captures the knowledge gap honestly.
     """
-    assert os.environ.get("MOCK_LLM_RESPONSE", "").strip().lower() != "true", (
-        "requires_credentials E2E tests must run without MOCK_LLM_RESPONSE=true"
-    )
+    assert_litellm_unpatched()
 
     interactions = [
         InteractionData(

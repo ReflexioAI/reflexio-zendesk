@@ -5,7 +5,7 @@ import math
 import os
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
@@ -1055,6 +1055,12 @@ class PlaybookAggregator:
             "retryable_failures": len(retryable_outcomes) + cluster_fence_losses,
             "cluster_fence_losses": cluster_fence_losses,
             "selected_rebuild_members": rebuilding_residual_count,
+            # Deferred for want of a vector, not for want of work. These are
+            # already dispositioned residual/embedding_pending, but `residual`
+            # sums three unrelated reasons, so a run starved of embeddings is
+            # indistinguishable from an idle one at the log line. Reported
+            # separately so "succeeded, created nothing" can be read correctly.
+            "embedding_pending": len(missing_embedding_ids),
         }
         self._enqueue_playbook_optimization(saved_playbooks)
         record_usage_event(
@@ -1072,17 +1078,6 @@ class PlaybookAggregator:
             count_value=len(saved_playbooks),
             duration_ms=int((time.perf_counter() - aggregation_start) * 1000),
             metadata=stats,
-        )
-        self._record_learnings_generated(
-            learning_ids=[
-                str(saved.agent_playbook_id)
-                for saved in saved_playbooks
-                if getattr(saved, "agent_playbook_id", None)
-            ],
-            playbook_name=SINGLETON_USER_PLAYBOOK_NAME,
-            request_id=run_id,
-            metadata=stats,
-            total_count=len(saved_playbooks),
         )
         return stats
 
@@ -1769,26 +1764,37 @@ class PlaybookAggregator:
                         playbook_aggregator_request.rerun
                         and self.aggregation_claim is not None
                     ):
-                        if not saved_fb.embedding:
+                        # Mock mode clusters by trigger rather than by vector
+                        # (see the MOCK_LLM_RESPONSE branch in
+                        # ``get_clusters``), so no centroid exists
+                        # to persist and cluster bookkeeping is skipped. Every
+                        # other caller still aborts on a missing embedding: a
+                        # centroid-less cluster row would silently break the
+                        # incremental re-aggregation this table exists to feed.
+                        if (
+                            not saved_fb.embedding
+                            and os.getenv("MOCK_LLM_RESPONSE", "").lower() != "true"
+                        ):
                             raise RuntimeError(
                                 "rerun agent playbook has no centroid embedding"
                             )
-                        cluster_id = self._stable_aggregation_cluster_id(fp_key)
-                        self.storage.create_playbook_aggregation_cluster(  # type: ignore[attr-defined]
-                            cluster_id=cluster_id,
-                            agent_version=self.agent_version,
-                            agent_playbook_id=saved_fb.agent_playbook_id,
-                            centroid_embedding=saved_fb.embedding,
-                            member_count=len(raw_ids),
-                            embedding_model=self.storage.embedding_model_name,
-                        )
-                        self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
-                            self.agent_version,
-                            raw_ids,
-                            disposition="cluster_member",
-                            cluster_id=cluster_id,
-                            reason="full_rerun",
-                        )
+                        if saved_fb.embedding:
+                            cluster_id = self._stable_aggregation_cluster_id(fp_key)
+                            self.storage.create_playbook_aggregation_cluster(  # type: ignore[attr-defined]
+                                cluster_id=cluster_id,
+                                agent_version=self.agent_version,
+                                agent_playbook_id=saved_fb.agent_playbook_id,
+                                centroid_embedding=saved_fb.embedding,
+                                member_count=len(raw_ids),
+                                embedding_model=self.storage.embedding_model_name,
+                            )
+                            self.storage.set_playbook_aggregation_disposition(  # type: ignore[attr-defined]
+                                self.agent_version,
+                                raw_ids,
+                                disposition="cluster_member",
+                                cluster_id=cluster_id,
+                                reason="full_rerun",
+                            )
                     for prev_fp in previous_fingerprints_for_changed_clusters.get(
                         fp_key, {}
                     ):
@@ -1972,17 +1978,6 @@ class PlaybookAggregator:
                 duration_ms=int((time.perf_counter() - aggregation_start) * 1000),
                 metadata=stats,
             )
-            self._record_learnings_generated(
-                learning_ids=[
-                    str(saved.agent_playbook_id)
-                    for saved in saved_playbook_list
-                    if getattr(saved, "agent_playbook_id", None)
-                ],
-                playbook_name=playbook_name,
-                request_id=_run_id,
-                metadata=stats,
-                total_count=len(saved_playbook_list),
-            )
             return stats
 
         except Exception as e:
@@ -2024,61 +2019,6 @@ class PlaybookAggregator:
                 )
             # Re-raise the exception after restoring
             raise
-
-    def _record_learnings_generated(
-        self,
-        *,
-        learning_ids: list[str],
-        playbook_name: str,
-        request_id: str,
-        metadata: Mapping[str, Any],
-        total_count: int | None = None,
-    ) -> None:
-        """Emit ``learnings_generated`` for a completed aggregation run.
-
-        Prefers one event per learning id (entity-backed) when every saved
-        playbook in this run carries a durable ``agent_playbook_id`` — the
-        common case, since ``save_agent_playbooks``
-        raises rather than returning a partial row. Falls back to the
-        count-based aggregate event when ``learning_ids`` is short of
-        ``total_count`` (a falsy/unset id slipped through), mirroring
-        ``ExtractionResumeWorker._record_finalized_learnings`` — this avoids
-        emitting a colliding ``learn:agent_playbook:0`` key. ``total_count``
-        defaults to ``len(learning_ids)`` so callers that already guarantee a
-        complete id list (e.g. existing tests) are unaffected.
-        """
-        from reflexio.server.billing_meter import (
-            emit_learnings_generated,
-            emit_learnings_generated_records,
-        )
-
-        total = len(learning_ids) if total_count is None else total_count
-        if len(learning_ids) == total:
-            emit_learnings_generated_records(
-                org_id=self.request_context.org_id,
-                configurator=self.configurator,
-                learning_ids=learning_ids,
-                source="aggregation",
-                pipeline="playbook",
-                request_id=request_id,
-                agent_version=self.agent_version,
-                playbook_name=playbook_name,
-                entity_type="agent_playbook",
-                metadata=metadata,
-            )
-            return
-        emit_learnings_generated(
-            org_id=self.request_context.org_id,
-            configurator=self.configurator,
-            count=total,
-            source="aggregation",
-            pipeline="playbook",
-            request_id=request_id,
-            agent_version=self.agent_version,
-            playbook_name=playbook_name,
-            entity_type="agent_playbook",
-            metadata=metadata,
-        )
 
     def get_clusters(
         self,

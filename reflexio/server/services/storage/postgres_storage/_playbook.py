@@ -872,6 +872,8 @@ class PlaybookMixin(SchemaScopedClient):
                     filters.append({"term": {"agent_version": agent_version}})
                 if playbook_name:
                     filters.append({"term": {"playbook_name": playbook_name}})
+                if request.source:
+                    filters.append({"term": {"source": request.source}})
                 if start_time:
                     filters.append({"range": {"created_at": {"gte": start_time}}})
                 if end_time:
@@ -904,6 +906,12 @@ class PlaybookMixin(SchemaScopedClient):
                 playbooks = self.get_user_playbooks_by_ids_any_user(
                     [int(playbook_id) for playbook_id in ids]
                 )
+                if request.source:
+                    playbooks = [
+                        playbook
+                        for playbook in playbooks
+                        if playbook.source == request.source
+                    ]
                 return _order_by_ids(playbooks, ids, "user_playbook_id")
             response = self._rpc(
                 "hybrid_match_user_playbooks",
@@ -930,6 +938,8 @@ class PlaybookMixin(SchemaScopedClient):
                 if agent_version and up.agent_version != agent_version:
                     continue
                 if playbook_name and up.playbook_name != playbook_name:
+                    continue
+                if request.source and up.source != request.source:
                     continue
                 if start_time and up.created_at < start_time:
                     continue
@@ -970,6 +980,8 @@ class PlaybookMixin(SchemaScopedClient):
             db_query = db_query.eq("agent_version", agent_version)
         if playbook_name:
             db_query = db_query.eq("playbook_name", playbook_name)
+        if request.source:
+            db_query = db_query.eq("source", request.source)
         if start_time:
             db_query = db_query.gte("created_at", _timestamp_to_iso(start_time))
         if end_time:
@@ -1787,6 +1799,13 @@ class PlaybookMixin(SchemaScopedClient):
         )
         match_count = request.top_k or 10
         query_embedding = options.query_embedding if options else None
+        source_agent_playbook_ids = (
+            self._agent_playbook_ids_for_source(request.source)
+            if request.source
+            else None
+        )
+        if source_agent_playbook_ids == set():
+            return []
 
         # If query is provided, use hybrid search first (filters applied in Python)
         if query:
@@ -1797,6 +1816,14 @@ class PlaybookMixin(SchemaScopedClient):
                     filters.append({"term": {"agent_version": agent_version}})
                 if playbook_name:
                     filters.append({"term": {"playbook_name": playbook_name}})
+                if source_agent_playbook_ids is not None:
+                    filters.append(
+                        {
+                            "terms": {
+                                "agent_playbook_id": sorted(source_agent_playbook_ids)
+                            }
+                        }
+                    )
                 if start_time:
                     filters.append({"range": {"created_at": {"gte": start_time}}})
                 if end_time:
@@ -1806,13 +1833,7 @@ class PlaybookMixin(SchemaScopedClient):
                     filters.append({"terms": {"status": terms}})
                 else:
                     filters.append(
-                        {
-                            "bool": {
-                                "must_not": [
-                                    {"terms": {"status": ["merged", "superseded"]}}
-                                ]
-                            }
-                        }
+                        {"terms": {"status": ["__current__", Status.PENDING.value]}}
                     )
                 if playbook_status_filter is not None:
                     if isinstance(playbook_status_filter, list):
@@ -1882,6 +1903,11 @@ class PlaybookMixin(SchemaScopedClient):
                     continue
                 if playbook_name and ap.playbook_name != playbook_name:
                     continue
+                if (
+                    source_agent_playbook_ids is not None
+                    and ap.agent_playbook_id not in source_agent_playbook_ids
+                ):
+                    continue
                 if start_time and ap.created_at < start_time:
                     continue
                 if end_time and ap.created_at > end_time:
@@ -1894,6 +1920,8 @@ class PlaybookMixin(SchemaScopedClient):
                 if status_filter is not None and not matches_status_filter(
                     ap.status, status_filter
                 ):
+                    continue
+                if status_filter is None and ap.status not in (None, Status.PENDING):
                     continue
                 filtered_playbooks.append(ap)
             return filtered_playbooks[:match_count]
@@ -1911,6 +1939,10 @@ class PlaybookMixin(SchemaScopedClient):
             db_query = db_query.eq("agent_version", agent_version)
         if playbook_name:
             db_query = db_query.eq("playbook_name", playbook_name)
+        if source_agent_playbook_ids is not None:
+            db_query = db_query.in_(
+                "agent_playbook_id", sorted(source_agent_playbook_ids)
+            )
         if start_time:
             db_query = db_query.gte("created_at", _timestamp_to_iso(start_time))
         if end_time:
@@ -1929,9 +1961,31 @@ class PlaybookMixin(SchemaScopedClient):
             or_condition = _build_status_or_condition(status_filter)
             if or_condition:
                 db_query = db_query.or_(or_condition)
+        else:
+            default_condition = _build_status_or_condition([None, Status.PENDING])
+            if default_condition:
+                db_query = db_query.or_(default_condition)
 
         response = db_query.execute()
         return [self._row_to_agent_playbook(item) for item in _rows(response)]
+
+    def _agent_playbook_ids_for_source(self, source: str) -> set[int]:
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT DISTINCT link.agent_playbook_id
+                FROM {} AS link
+                JOIN {} AS source_playbook
+                  ON source_playbook.user_playbook_id = link.user_playbook_id
+                WHERE source_playbook.source = %s
+                """
+            ).format(
+                self._table_identifier("agent_playbook_source_user_playbooks"),
+                self._table_identifier("user_playbooks"),
+            ),
+            [source],
+        )
+        return {int(row["agent_playbook_id"]) for row in rows}
 
     # ==============================
     # Playbook optimization methods
@@ -2286,6 +2340,7 @@ class PlaybookMixin(SchemaScopedClient):
         agent_version: str | None = None,
         user_id: str | None = None,
         only_untagged: bool = False,
+        include_embedding: bool = True,
     ) -> list[AgentSuccessEvaluationResult]:
         """
         Get agent success evaluation results from storage.
@@ -2297,9 +2352,14 @@ class PlaybookMixin(SchemaScopedClient):
         Returns:
             list[AgentSuccessEvaluationResult]: List of agent success evaluation result objects
         """
+        columns = (
+            f"{_EVAL_RESULT_COLUMNS}, embedding"
+            if include_embedding
+            else _EVAL_RESULT_COLUMNS
+        )
         query = (
             self._table("agent_success_evaluation_result")
-            .select(_EVAL_RESULT_COLUMNS)
+            .select(columns)
             .order("created_at", desc=True)
             .limit(limit)
         )
@@ -2336,7 +2396,11 @@ class PlaybookMixin(SchemaScopedClient):
                 user_turns_to_resolution=item.get("user_turns_to_resolution"),
                 is_escalated=item.get("is_escalated", False) or False,
                 tags=item.get("tags"),
-                embedding=[],
+                embedding=(
+                    _parse_user_playbook_embedding(item.get("embedding"))
+                    if include_embedding
+                    else []
+                ),
             )
             for item in _rows(response)
         ]

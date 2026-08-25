@@ -3,7 +3,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import ValidationError
 
 from reflexio.models.api_schema.domain.entities import (
     Interaction,
@@ -408,7 +407,7 @@ def test_apply_decisions_uses_the_same_trimmed_candidate_id_as_validation():
 def test_reviewer_prompt_is_versioned_and_active():
     manager = PromptManager()
 
-    assert manager.get_active_version("playbook_candidate_review") == "1.2.0"
+    assert manager.get_active_version("playbook_candidate_review") == "1.3.0"
 
 
 def test_reviewer_prompt_preserves_grounded_procedures_and_forbids_substitutes():
@@ -461,9 +460,28 @@ def test_reviewer_prompt_preserves_grounded_procedures_and_forbids_substitutes()
         # (a retry bounded by an observed rejection; delivering announced work)
         # because their TRIGGER is another system's output.
         "does not disqualify an entry; only that output being the entry's PAYLOAD does",
+        # The subject gate. Ordering is the whole mechanism: naming the subject
+        # BEFORE weighing evidence is what makes it fire, because the failure it
+        # fixes is the reviewer going down the evidence axis and never asking.
+        "First name, in your own words, what the entry is ABOUT",
+        "before asking\nwhether any of its clauses are supported".replace("\n", " "),
+        "is not a core to preserve, it is\nthe same subject in gentler words".replace(
+            "\n", " "
+        ),
     )
     for invariant in required_invariants:
         assert invariant in normalized
+
+    # Position, not just presence. Ordering IS the mechanism here: the defect is
+    # the reviewer reaching the evidence question first and never asking about
+    # the subject, so a regression that keeps the words but restores
+    # evidence-first would leave every substring assertion above green.
+    gate = normalized.index("First name, in your own words, what the entry is ABOUT")
+    for later in ("`accept` when the candidate", "`revise` when removing"):
+        assert gate < normalized.index(later), (
+            "the subject gate must precede the accept/revise branches; it is the "
+            "step that decides whether they are reached at all"
+        )
 
     # Keep the policy compact enough that chronology and evidence remain the
     # dominant context. Frontmatter is not included in the rendered prompt.
@@ -472,11 +490,17 @@ def test_reviewer_prompt_preserves_grounded_procedures_and_forbids_substitutes()
     # The real gate is measured behaviour: a change earns its words by pruning
     # its target class while leaving a healthy window and a second tenant
     # untouched. The in-repo half of that gate is
-    # test_reviewer_manifest_regression.py (real API, deselected by default);
+    # tests/e2e_tests/test_reviewer_manifest_regression_real_llm.py (real API,
+    # opt-in via RUN_LOW_PRIORITY=1);
     # the production-window harness lives in the enterprise repo under
     # docs_for_coding_agent/prompt-change-evaluation.md.
     #
     # Raised 1000 -> 1050 in v1.1.0 to fit check 7 (absence).
+    # Raised 1260 -> 1360 in v1.3.0 to fit the subject gate in decision rule 1.
+    # Measured paired over frozen pools, 24 runs: known-bad leak 8/20 -> 1/20
+    # (p=0.039) while healthy-window retention ROSE 48/58 -> 53/58. A variant
+    # with the explanatory clauses cut leaks 5/20 (p=0.508), so the clauses are
+    # load-bearing -- do not trim them to reclaim the words.
     # Raised 1050 -> 1260 in v1.2.0 to fit check 8 (decision ownership),
     # including the discriminator that keeps an entry whose TRIGGER is another
     # system's output but whose subject is a choice the agent controls. That
@@ -500,7 +524,7 @@ def test_reviewer_prompt_preserves_grounded_procedures_and_forbids_substitutes()
     # check 8 into the existing `internal_status` code pruned the target
     # identically but cost 3 healthy entries, because that code must stay
     # revisable while check 8 is fatal.
-    assert len(rendered.split()) <= 1_260
+    assert len(rendered.split()) <= 1_360
 
 
 @pytest.mark.parametrize(
@@ -598,14 +622,32 @@ def test_fatal_reason_codes_require_reject(code: str):
     assert ok.decision == "reject"
 
     for bad in ("accept", "revise"):
-        # Match both the offending code and the decision. The code name is what
-        # an operator reads in a failed run; pinning the decision catches
-        # suffix-concatenating phrasings, which previously rendered "acceptd".
-        with pytest.raises(ValidationError, match=code) as excinfo:
-            CandidateReviewDecision.model_validate(
-                {"id": "C1", "decision": bad, "reason_code": code}
-            )
-        assert f"decision={bad!r} is invalid" in str(excinfo.value)
+        # Coerced, not rejected outright. This validation runs during parse of
+        # the WHOLE review output, so raising here invalidated every decision in
+        # the batch over one self-contradictory entry -- and the repair turn
+        # could not fix it, because the message is stripped to
+        # "decisions.N: value_error" and the constraint never reaches the JSON
+        # schema. The code already asserts nothing salvageable remains, so
+        # reject is the decision it implies.
+        coerced = CandidateReviewDecision.model_validate(
+            {
+                "id": "C1",
+                "decision": bad,
+                "reason_code": code,
+                "evidence_ids": ["C1-E1"],
+                "revision": {
+                    "content": "c",
+                    "trigger": "t",
+                    "rationale": "r",
+                },
+            }
+        )
+        assert coerced.decision == "reject"
+        # A reject must retain no evidence and carry no revision; leaving either
+        # in place would fail semantic validation and reintroduce the batch loss
+        # by another route.
+        assert coerced.evidence_ids == []
+        assert coerced.revision is None
 
     # Other codes are unaffected: revise remains available to them.
     # `internal_status` in particular MUST stay non-fatal. Folding check 8 into
@@ -671,3 +713,164 @@ def test_prompt_reason_codes_match_the_schema_literal():
         f"prompt-only: {sorted(prompt_codes - literal_codes)}; "
         f"schema-only: {sorted(literal_codes - prompt_codes)}"
     )
+
+
+def test_one_fatal_code_slip_does_not_cost_the_whole_batch():
+    """A self-contradictory decision must not invalidate its siblings.
+
+    This is the defect the coercion exists to prevent, asserted end-to-end
+    rather than on the model alone. The pairing raised during parse of the whole
+    PlaybookCandidateReviewOutput, so a single slip lost every candidate in the
+    request -- including healthy ones -- and `service.py` reviews all candidates
+    for a request in one call. The repair turn could not recover it either: the
+    error text is reduced to "decisions.N: value_error" before it reaches the
+    model, and a model_validator never appears in the JSON schema, so the rule
+    it broke was never stated to it.
+
+    Asserts the survivor by content, not by count, so the test cannot pass by
+    dropping the wrong candidate.
+    """
+    interactions = [
+        _interaction_model(201, "The user corrected the agent's assumption."),
+        _interaction_model(202, "Notification failed status=FAILED."),
+    ]
+    candidates = [
+        _candidate(
+            201,
+            "The user corrected the agent's assumption.",
+            content="Honor the stated correction.",
+        ),
+        _candidate(
+            202,
+            "Notification failed status=FAILED.",
+            content="Do not echo the raw failure line.",
+        ),
+    ]
+    # Parsed from raw dicts through the BATCH model, which is the path a
+    # provider response actually takes. Building the decisions individually
+    # would coerce each one before the output model ever saw it, so the
+    # whole-output parse -- the step that used to lose every sibling decision --
+    # would never be exercised.
+    output = PlaybookCandidateReviewOutput.model_validate(
+        {
+            "decisions": [
+                {
+                    "id": "C1",
+                    "decision": "accept",
+                    "reason_code": "grounded_useful",
+                    "evidence_ids": ["C1-E1"],
+                },
+                # The slip: a fatal code the model paired with `revise`.
+                {
+                    "id": "C2",
+                    "decision": "revise",
+                    "reason_code": "not_agent_decision",
+                    "evidence_ids": ["C2-E1"],
+                    "revision": {
+                        "content": "Report the failure plainly.",
+                        "trigger": "When the notification fails",
+                        "rationale": "The cited turn shows the failure.",
+                    },
+                },
+            ]
+        }
+    )
+
+    reviewer, _client = _reviewer(output)
+
+    result = reviewer.review(
+        candidates=candidates,
+        request_interaction_data_models=interactions,
+        existing_playbooks=[],
+        agent_context="Test agent",
+        playbook_definition="Reusable user guidance",
+        tool_context="",
+    )
+
+    assert [item.content for item in result] == ["Honor the stated correction."]
+
+
+def test_fatal_code_backstop_still_raises_when_coercion_is_bypassed():
+    """The invariant holds even on a path that skips normalization.
+
+    Coercion in `normalize_known_provider_shape` is the enforcement; this
+    validator is the backstop that makes "a fatal code is always a reject"
+    total rather than merely usual. It is unreachable through normal
+    construction, so it is exercised directly -- otherwise it would be an
+    untestable guard, and an untestable guard is how the original gap survived.
+
+    It raises rather than coercing a second time: reaching it means the caller
+    is our own code bypassing normalization, where a loud failure is right and
+    no provider batch is at stake.
+    """
+    from reflexio.server.services.playbook.components.reviewer import (
+        CandidateReviewDecision,
+    )
+
+    bypassed = CandidateReviewDecision.model_construct(
+        candidate_id="C1", decision="accept", reason_code="absence_inference"
+    )
+
+    with pytest.raises(ValueError, match="absence_inference"):
+        bypassed.fatal_reason_codes_are_rejects()  # pyright: ignore[reportCallIssue]
+
+
+def test_public_reason_code_vocabulary_is_the_reviewer_set_plus_the_skip_code():
+    """The API must advertise exactly what can be produced -- no more, no less.
+
+    `ReviewUserPlaybookResult.reason_code` was a plain `str`, so the public
+    vocabulary was whatever happened to be emitted: the reviewer's codes plus
+    `evidence_unavailable`, which the review *service* raises on its own behalf
+    for an unreviewable row. Nothing enforced or documented that, so a consumer
+    branching on the value silently gained an unhandled case whenever the
+    reviewer's Literal grew -- as it did when `not_agent_decision` was added.
+
+    Asserted as set equality rather than membership: a subset check would pass
+    while the API under-advertised, and a superset check would pass while it
+    promised codes nothing can emit.
+    """
+    from typing import get_args
+
+    from reflexio.models.api_schema.domain.entities import ReviewUserPlaybookResult
+    from reflexio.server.services.playbook.components.reviewer import (
+        CandidateReviewDecision,
+    )
+
+    reviewer_codes = set(
+        get_args(CandidateReviewDecision.model_fields["reason_code"].annotation)
+    )
+    public_codes = set(
+        get_args(ReviewUserPlaybookResult.model_fields["reason_code"].annotation)
+    )
+
+    assert public_codes == reviewer_codes | {"evidence_unavailable"}
+
+
+def test_public_result_rejects_a_reason_code_nothing_can_emit():
+    """An unknown code must fail validation rather than reach a consumer.
+
+    This is what "typed" buys over documentation: the field cannot carry a value
+    the producers do not produce.
+    """
+    from pydantic import ValidationError
+
+    from reflexio.models.api_schema.domain.entities import ReviewUserPlaybookResult
+
+    # The real skip pairing still validates.
+    skipped = ReviewUserPlaybookResult.model_validate(
+        {
+            "user_playbook_id": 1,
+            "decision": "skip",
+            "reason_code": "evidence_unavailable",
+        }
+    )
+    assert skipped.reason_code == "evidence_unavailable"
+
+    with pytest.raises(ValidationError):
+        ReviewUserPlaybookResult.model_validate(
+            {
+                "user_playbook_id": 1,
+                "decision": "skip",
+                "reason_code": "not_a_real_code",
+            }
+        )

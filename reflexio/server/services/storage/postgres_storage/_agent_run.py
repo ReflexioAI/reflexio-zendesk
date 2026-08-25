@@ -43,6 +43,13 @@ def _dt_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(UTC)
 
 
+def _valid_finalized_learning_ids(value: object) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(learning_id, str) and bool(learning_id.strip())
+        for learning_id in value
+    )
+
+
 def _record_to_prior_answer_match(
     record: PendingToolCallRecord,
     *,
@@ -141,6 +148,7 @@ class PostgresAgentRunMixin:
     _fetch_all: Any
     _table_identifier: Any
     _current_timestamp: Any
+    commit_scope: Any
     pool: Any
     org_id: str
     schema_name: str
@@ -370,6 +378,90 @@ class PostgresAgentRunMixin:
             [run_id],
         )
         return _row_to_agent_run(rows[0]) if rows else None
+
+    @handle_exceptions
+    def get_agent_run_finalization_receipt(
+        self,
+        *,
+        run_id: str,
+        entity_type: str,
+    ) -> list[str] | None:
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT receipt.entity_type, receipt.learning_ids
+                FROM {} AS receipt
+                JOIN {} AS run ON run.id = receipt.run_id
+                WHERE receipt.run_id = %s AND run.org_id = %s
+                """
+            ).format(
+                self._table_identifier("_agent_run_finalization_receipts"),
+                self._table_identifier("_agent_runs"),
+            ),
+            [run_id, self.org_id],
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        if row["entity_type"] != entity_type:
+            raise ValueError("agent-run finalization receipt entity type changed")
+        learning_ids = row["learning_ids"]
+        if not _valid_finalized_learning_ids(learning_ids):
+            raise ValueError("agent-run finalization receipt is corrupt")
+        return list(learning_ids)
+
+    @handle_exceptions
+    def save_agent_run_finalization_receipt(
+        self,
+        *,
+        run_id: str,
+        entity_type: str,
+        learning_ids: list[str],
+    ) -> bool:
+        expected_by_extractor = {
+            "profile": "profile",
+            "playbook": "user_playbook",
+        }
+        if not _valid_finalized_learning_ids(learning_ids):
+            raise ValueError(
+                "agent-run finalization receipt learning ids must be non-empty strings"
+            )
+        with self.commit_scope():
+            runs = self._fetch_all(
+                sql.SQL(
+                    "SELECT org_id, extractor_kind FROM {} WHERE id = %s FOR UPDATE"
+                ).format(self._table_identifier("_agent_runs")),
+                [run_id],
+            )
+            if not runs or runs[0]["org_id"] != self.org_id:
+                raise ValueError("agent-run finalization receipt owner is invalid")
+            if expected_by_extractor.get(runs[0]["extractor_kind"]) != entity_type:
+                raise ValueError(
+                    "agent-run finalization receipt entity type is invalid"
+                )
+            inserted = self._fetch_all(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (run_id, entity_type, learning_ids)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (run_id) DO NOTHING
+                    RETURNING run_id
+                    """
+                ).format(self._table_identifier("_agent_run_finalization_receipts")),
+                [run_id, entity_type, Json(learning_ids)],
+            )
+            stored = self._fetch_all(
+                sql.SQL(
+                    "SELECT entity_type, learning_ids FROM {} WHERE run_id = %s"
+                ).format(self._table_identifier("_agent_run_finalization_receipts")),
+                [run_id],
+            )
+            if not stored or stored[0]["entity_type"] != entity_type:
+                raise ValueError("agent-run finalization receipt is immutable")
+            stored_ids = stored[0]["learning_ids"]
+            if not _valid_finalized_learning_ids(stored_ids):
+                raise ValueError("agent-run finalization receipt is corrupt")
+        return bool(inserted)
 
     @handle_exceptions
     def update_agent_run_status(

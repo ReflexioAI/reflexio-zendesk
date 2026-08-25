@@ -13,6 +13,7 @@ Interactive tutorials for learning Reflexio, from your first workflow to advance
 | 04 | [Configuration](04_configuration.ipynb) | Intermediate | 15 min | Customize extraction prompts, models, and pipeline behavior |
 | 05 | [Concurrent Sessions](05_concurrent_sessions.ipynb) | Advanced | 15 min | Simulate multi-user load and verify data isolation |
 | 06 | [Simulation](06_real_world_simulation.ipynb) | Advanced | 20 min | Run a multi-turn simulation and watch profiles evolve over time |
+| 07 | [mem0 Drop-In Wrapper](07_mem0_dropin_wrapper.ipynb) | Beginner | 10 min | Keep your mem0 code, add Reflexio learning with a one-line import change (needs `MEM0_API_KEY` and `pip install 'reflexio-ai[mem0]'`) |
 | 08 | [Resumable Human Questions](08_resumable_agent_human_questions.ipynb) | Advanced | 10-20 min | Answer human clarification questions and resume playbook generation |
 
 ## Prerequisites

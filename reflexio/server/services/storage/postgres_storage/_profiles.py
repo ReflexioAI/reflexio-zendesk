@@ -1065,7 +1065,25 @@ class ProfileMixin(SchemaScopedClient):
         if self._opensearch:
             filters = [
                 {"term": {"user_id": search_user_profile_request.user_id}},
-                {"range": {"expiration_timestamp": {"gte": current_timestamp}}},
+                {
+                    "bool": {
+                        "minimum_should_match": 1,
+                        "should": [
+                            {
+                                "bool": {
+                                    "must_not": [
+                                        {"exists": {"field": "expiration_timestamp"}}
+                                    ]
+                                }
+                            },
+                            {
+                                "range": {
+                                    "expiration_timestamp": {"gte": current_timestamp}
+                                }
+                            },
+                        ],
+                    }
+                },
             ]
             terms = status_filter_terms(status_filter)
             if terms is not None:
@@ -1101,6 +1119,12 @@ class ProfileMixin(SchemaScopedClient):
                 status_filter=list(status_filter),
             )
             ordered_profiles = _order_by_ids(profiles, ids, "profile_id")
+            if search_user_profile_request.source:
+                ordered_profiles = [
+                    profile
+                    for profile in ordered_profiles
+                    if profile.source == search_user_profile_request.source
+                ]
             if search_user_profile_request.custom_feature:
                 custom_feature = search_user_profile_request.custom_feature.lower()
                 ordered_profiles = [
@@ -1162,7 +1186,7 @@ class ProfileMixin(SchemaScopedClient):
 
             if search_user_profile_request.source and (
                 not profile.source
-                or search_user_profile_request.source.lower() != profile.source.lower()
+                or search_user_profile_request.source != profile.source
             ):
                 continue
             if search_user_profile_request.custom_feature and (

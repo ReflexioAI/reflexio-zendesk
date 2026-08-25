@@ -146,6 +146,27 @@ def test_postgres_agent_run_round_trip(postgres_storage: PostgresStorage) -> Non
     assert created.id == run_id
     assert created.binding.source_interaction_ids == [1, 2]
     assert created.status == AgentRunStatus.RUNNING
+    assert (
+        postgres_storage.get_agent_run_finalization_receipt(
+            run_id=run_id,
+            entity_type="profile",
+        )
+        is None
+    )
+    assert postgres_storage.save_agent_run_finalization_receipt(
+        run_id=run_id,
+        entity_type="profile",
+        learning_ids=["profile-1", "profile-2"],
+    )
+    assert not postgres_storage.save_agent_run_finalization_receipt(
+        run_id=run_id,
+        entity_type="profile",
+        learning_ids=["profile-1", "profile-2"],
+    )
+    assert postgres_storage.get_agent_run_finalization_receipt(
+        run_id=run_id,
+        entity_type="profile",
+    ) == ["profile-1", "profile-2"]
 
     updated = postgres_storage.update_agent_run_status(
         run_id,
@@ -367,6 +388,24 @@ def test_postgres_upstream_storage_contract_round_trip(
         expected_context=context,
     )
     assert outcome.recorded
+    assert outcome.outcome_id
+    assert outcome.outcome_revision == 1
+    assert outcome.outcome_contract_digest
+    assert outcome.finalized_trajectory_digest
+    exact_retry = postgres_storage.record_session_outcome(
+        SetSessionOutcomeRequest(
+            session_id=session_id,
+            outcome=SessionOutcomeKind.SUCCESS,
+            occurred_at=now + 1,
+            label="resolved",
+            metadata={"path": "postgres"},
+        ),
+        created_at=now + 2,
+        expected_context=context,
+    )
+    assert not exact_retry.recorded
+    assert exact_retry.reason is None
+    assert exact_retry.outcome_id == outcome.outcome_id
     stored_outcomes = postgres_storage.get_session_outcomes(
         GetSessionOutcomesRequest(session_ids=[session_id])
     )
@@ -487,12 +526,30 @@ def test_postgres_upstream_storage_contract_round_trip(
         scope_type="user",
         subject_ref=subject_ref,
         request_ref="reqref_v1_contract_e2e",
+        authoritative_user_id=user_id,
     )
-    postgres_storage.begin_subject_erasure_barrier(subject_ref, purge_id)
+    execution_claim = postgres_storage.claim_purge_operation_execution(
+        purge_id,
+        lease_owner="postgres-contract-e2e",
+        lease_ttl_seconds=60,
+    )
+    assert execution_claim is not None
+    postgres_storage.begin_subject_erasure_barrier(
+        subject_ref,
+        purge_id,
+        execution_claim=execution_claim,
+    )
     postgres_storage.prepare_governance_erase_targets(
-        purge_id, user_id, {int(playbook.user_playbook_id)}
+        purge_id,
+        user_id,
+        execution_claim=execution_claim,
+        owned_user_playbook_ids={int(playbook.user_playbook_id)},
     )
-    deleted = postgres_storage.apply_governance_user_data_delete(purge_id, user_id)
+    deleted = postgres_storage.apply_governance_user_data_delete(
+        purge_id,
+        user_id,
+        execution_claim=execution_claim,
+    )
 
     assert deleted["session_outcomes"] == 1
     assert deleted["retrieved_learning_evaluation_results"] == 1
