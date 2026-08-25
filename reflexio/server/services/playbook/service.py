@@ -9,8 +9,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from reflexio.server.api_endpoints.request_context import RequestContext
     from reflexio.server.llm.litellm_client import LiteLLMClient
-    from reflexio.server.services.deferred_learning_plan import GenerationComputePlan
-    from reflexio.server.services.storage.storage_base import BaseStorage
+    from reflexio.server.services.deferred_learning_plan import (
+        ExtractorBookmarkAdvance,
+        GenerationComputePlan,
+    )
+    from reflexio.server.services.storage.storage_base import (
+        AgentRunRecord,
+        BaseStorage,
+    )
 
 from reflexio.models.api_schema.common import sanitise_for_log
 from reflexio.models.api_schema.domain.entities import LineageContext
@@ -31,7 +37,11 @@ from reflexio.server.services.base_generation_service import (
     BaseGenerationService,
     StatusChangeOperation,
 )
-from reflexio.server.services.deferred_learning_plan import PlaybookWritePlan
+from reflexio.server.services.deferred_learning_plan import (
+    FinalizationResult,
+    PlaybookWritePlan,
+    _FinalizationReceiptAlreadyExistsError,
+)
 from reflexio.server.services.playbook.aggregation_trigger import (
     maybe_trigger_user_playbook_aggregation,
 )
@@ -45,6 +55,10 @@ from reflexio.server.services.playbook.playbook_service_utils import (
     has_expert_content,
     is_evidence_validated,
     uses_evidence_grounded_extraction,
+)
+from reflexio.server.services.playbook.review_window import (
+    PlaybookReviewWindowError,
+    reconstruct_playbook_review_window,
 )
 from reflexio.server.services.service_utils import (
     extract_interactions_from_request_interaction_data_models,
@@ -100,7 +114,7 @@ class PlaybookGenerationServiceConfig:
 
     request_id: str
     agent_version: str
-    user_id: str | None = None
+    user_id: str
     source: str | None = None
     allow_manual_trigger: bool = False
     rerun_start_time: int | None = None
@@ -108,6 +122,13 @@ class PlaybookGenerationServiceConfig:
     auto_run: bool = True
     force_extraction: bool = False
     review_tool_result_context: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.user_id, str):
+            raise ValueError("Playbook generation requires a non-empty user_id")
+        self.user_id = self.user_id.strip()
+        if not self.user_id:
+            raise ValueError("Playbook generation requires a non-empty user_id")
 
 
 def _consolidation_search_keys(playbooks: list[UserPlaybook]) -> set[str]:
@@ -158,6 +179,7 @@ class PlaybookGenerationService(
         self.output_pending_status = output_pending_status
         self.skip_aggregation = skip_aggregation
         self._review_window_cache: list[RequestInteractionDataModel] | None = None
+        self._review_run: AgentRunRecord | None = None
 
     def _load_generation_service_config(
         self, request: PlaybookGenerationRequest
@@ -174,6 +196,7 @@ class PlaybookGenerationService(
         # One service instance can process multiple users in a batch. Never let
         # a review window loaded for the previous request cross that boundary.
         self._review_window_cache = None
+        self._review_run = None
         generation_request_id = request.request_id
         return PlaybookGenerationServiceConfig(
             request_id=generation_request_id,
@@ -192,37 +215,52 @@ class PlaybookGenerationService(
         return getattr(root_config, "user_playbook_extractor_config", None)
 
     def _review_interaction_window(
-        self, playbook_config: PlaybookConfig
+        self, _candidates: list[UserPlaybook]
     ) -> list[RequestInteractionDataModel]:
-        """Load the interaction window the reviewer reasons over, once per run.
-
-        The reviewer needs the same chronology extraction saw. Extraction runs in
-        a separate step that does not hand its window back, so this reloads it —
-        memoized because ``_resolve_write_plan`` may be reached more than once for
-        one generation.
-
-        Args:
-            playbook_config (PlaybookConfig): Config whose window/source filters
-                define the interaction window.
-
-        Returns:
-            list[RequestInteractionDataModel]: The reloaded interaction window.
-
-        Raises:
-            RuntimeError: If the configured source filter excludes the reviewer
-                reload after extraction already produced candidates.
-        """
+        """Reconstruct the exact persisted extraction window once per run."""
         if self._review_window_cache is None:
             if self.service_config is None:
-                raise RuntimeError("service_config must be set before review")
-            loaded_window = self._create_extractor(
-                playbook_config, self.service_config
-            )._get_interactions()
-            if loaded_window is None:
-                raise RuntimeError(
-                    "Normal playbook review source filter excluded its interaction window"
+                raise PlaybookReviewWindowError(
+                    "service_config must be set before playbook review"
                 )
-            self._review_window_cache = loaded_window
+            if not self.service_config.user_id:
+                raise PlaybookReviewWindowError(
+                    "Normal playbook review has no owning user_id"
+                )
+
+            run = self._review_run
+            if run is None:
+                if len(self._last_extraction_run_ids) != 1:
+                    raise PlaybookReviewWindowError(
+                        "Normal playbook review has no unambiguous extraction run"
+                    )
+                run = self.storage.get_agent_run(  # type: ignore[reportOptionalMemberAccess]
+                    self._last_extraction_run_ids[0]
+                )
+            if run is None:
+                raise PlaybookReviewWindowError(
+                    "Normal playbook review extraction run is missing"
+                )
+
+            binding = run.binding
+            if (
+                binding.extractor_kind != "playbook"
+                or binding.org_id != self.request_context.org_id
+                or binding.user_id != self.service_config.user_id
+                or binding.request_id != self.service_config.request_id
+            ):
+                raise PlaybookReviewWindowError(
+                    "Normal playbook review extraction run does not match its request"
+                )
+
+            self._review_window_cache = reconstruct_playbook_review_window(
+                storage=self.storage,  # type: ignore[arg-type]
+                source_interaction_ids=binding.source_interaction_ids,
+                user_id=self.service_config.user_id,
+                subject=(
+                    f"Playbook generation request {self.service_config.request_id}"
+                ),
+            )
         return self._review_window_cache
 
     def _load_extractor_config(self) -> PlaybookConfig | None:
@@ -409,10 +447,10 @@ class PlaybookGenerationService(
             and self.service_config is not None
             and os.getenv("MOCK_LLM_RESPONSE", "").lower() != "true"
         ):
-            review_interactions = self._review_interaction_window(playbook_config)
+            review_interactions = self._review_interaction_window(all_playbooks)
             if not review_interactions:
-                raise RuntimeError(
-                    "Normal playbook review could not reload its interaction window"
+                raise PlaybookReviewWindowError(
+                    "Normal playbook review could not reconstruct its interaction window"
                 )
             flat_review_interactions = (
                 extract_interactions_from_request_interaction_data_models(
@@ -609,10 +647,10 @@ class PlaybookGenerationService(
         Phantom-billing gate: on the durable / ``.run()`` path this is invoked
         from ``emit_generation_side_effects`` (post-commit), so a fence-lost
         (superseded) job never enqueues optimization or triggers aggregation. On
-        the synchronous resume/manual path the permanent
-        ``_finalize_extracted_items`` wrapper invokes it right after persist,
-        keeping that path identical to the pre-split monolith. The two callers
-        are mutually exclusive, so the schedulers fire exactly once per run.
+        the synchronous resume/manual path ``_finalize_extracted_items`` invokes
+        it after persistence. Dispatch is best-effort and at most once per
+        committed finalization attempt; derived scheduler work has no durable
+        replay idempotency.
         """
         try:
             self._enqueue_user_playbook_optimization(plan.new_playbooks)
@@ -640,6 +678,11 @@ class PlaybookGenerationService(
         superseded one) — the phantom-billing gate.
         """
         super().emit_generation_side_effects(plan)
+        if (
+            plan.finalization_result is not None
+            and not plan.finalization_result.won_receipt
+        ):
+            return
         write_plan = plan.write_plan
         if write_plan is not None:
             self._dispatch_playbook_schedulers(write_plan)
@@ -649,25 +692,133 @@ class PlaybookGenerationService(
         all_playbooks: list[UserPlaybook],
         *,
         model_provenance: ModelProvenance | None = None,
-    ) -> list[UserPlaybook]:
-        """Permanent V3 wrapper: compute→persist→schedulers together (no fence).
+        extraction_run: AgentRunRecord | None = None,
+        finalization_run_id: str | None = None,
+    ) -> list[str]:
+        """Finalize extracted playbooks for synchronous resume/manual callers.
 
-        Kept for the synchronous resume/manual callers
-        (``ExtractionResumeWorker`` calls this directly). Routes them through the
-        same ``_resolve_write_plan`` (compute) + ``_persist_write_plan``
-        (persist) split the durable worker uses — with no external
-        ``commit_scope`` — then dispatches the same off-thread schedulers, so the
-        result is identical to the pre-split monolith.
+        Compatibility surface for synchronous callers that expect ordered
+        learning ids. Routes them through the same ``_resolve_write_plan``
+        (compute) + ``_persist_write_plan`` (persist) split the durable worker
+        uses. Derived schedulers dispatch best-effort after the finalization
+        transaction commits. When an existing finalization receipt is found,
+        the method returns its learning ids without replaying those schedulers.
         """
+        return self._finalize_extracted_items_with_outcome(
+            all_playbooks,
+            model_provenance=model_provenance,
+            extraction_run=extraction_run,
+            finalization_run_id=finalization_run_id,
+        ).learning_ids
+
+    def _finalize_extracted_items_with_outcome(
+        self,
+        all_playbooks: list[UserPlaybook],
+        *,
+        model_provenance: ModelProvenance | None = None,
+        extraction_run: AgentRunRecord | None = None,
+        finalization_run_id: str | None = None,
+    ) -> FinalizationResult:
+        """Finalize playbooks and expose the atomic receipt winner internally."""
+        if finalization_run_id is not None:
+            receipt = self.storage.get_agent_run_finalization_receipt(  # type: ignore[reportOptionalMemberAccess]
+                run_id=finalization_run_id,
+                entity_type="user_playbook",
+            )
+            if receipt is not None:
+                # Receipts make persistence/billing idempotent. Derived schedulers
+                # are best-effort at-most-once and lack durable replay idempotency.
+                return FinalizationResult(receipt, won_receipt=False)
         if model_provenance is not None:
             self._last_model_provenance = model_provenance
-        plan = self._resolve_write_plan([all_playbooks])
-        if plan is None:
-            return []
-        with self.storage.commit_scope():  # type: ignore[reportOptionalMemberAccess]
-            self._persist_write_plan(plan)
-        self._dispatch_playbook_schedulers(plan)
-        return plan.new_playbooks
+        previous_review_run = self._review_run
+        previous_review_window = self._review_window_cache
+        if extraction_run is not None:
+            self._review_run = extraction_run
+            self._review_window_cache = None
+        try:
+            plan = self._resolve_write_plan([all_playbooks])
+        finally:
+            self._review_run = previous_review_run
+            self._review_window_cache = previous_review_window
+        if finalization_run_id is None:
+            if plan is not None:
+                with self.storage.commit_scope():  # type: ignore[reportOptionalMemberAccess]
+                    self._persist_write_plan(plan)
+                self._dispatch_playbook_schedulers(plan)
+            return FinalizationResult(
+                learning_ids=(
+                    [
+                        str(playbook.user_playbook_id)
+                        for playbook in plan.new_playbooks
+                        if playbook.user_playbook_id
+                    ]
+                    if plan is not None
+                    else []
+                ),
+                won_receipt=False,
+            )
+
+        result = self._finalize_write_plan_with_outcome(
+            plan,
+            finalization_run_id=finalization_run_id,
+            bookmark_advance=None,
+        )
+        if plan is not None and result.won_receipt:
+            self._dispatch_playbook_schedulers(plan)
+        return result
+
+    def _finalize_write_plan_with_outcome(
+        self,
+        write_plan: PlaybookWritePlan | None,
+        *,
+        finalization_run_id: str,
+        bookmark_advance: ExtractorBookmarkAdvance | None,
+    ) -> FinalizationResult:
+        """Commit a resolved playbook plan, bookmark, and receipt atomically."""
+        entity_type = "user_playbook"
+        receipt = self.storage.get_agent_run_finalization_receipt(  # type: ignore[reportOptionalMemberAccess]
+            run_id=finalization_run_id,
+            entity_type=entity_type,
+        )
+        if receipt is not None:
+            return FinalizationResult(receipt, won_receipt=False)
+        learning_ids: list[str] = []
+
+        try:
+            with self.storage.commit_scope():  # type: ignore[reportOptionalMemberAccess]
+                receipt = self.storage.get_agent_run_finalization_receipt(  # type: ignore[reportOptionalMemberAccess]
+                    run_id=finalization_run_id,
+                    entity_type=entity_type,
+                )
+                if receipt is not None:
+                    return FinalizationResult(receipt, won_receipt=False)
+                if write_plan is not None:
+                    self._persist_write_plan(write_plan)
+                    learning_ids = [
+                        str(playbook.user_playbook_id)
+                        for playbook in write_plan.new_playbooks
+                        if playbook.user_playbook_id
+                    ]
+                self._apply_bookmark_advance(bookmark_advance)
+                inserted = self.storage.save_agent_run_finalization_receipt(  # type: ignore[reportOptionalMemberAccess]
+                    run_id=finalization_run_id,
+                    entity_type=entity_type,
+                    learning_ids=learning_ids,
+                )
+                if not inserted:
+                    raise _FinalizationReceiptAlreadyExistsError
+        except _FinalizationReceiptAlreadyExistsError:
+            receipt = self.storage.get_agent_run_finalization_receipt(  # type: ignore[reportOptionalMemberAccess]
+                run_id=finalization_run_id,
+                entity_type=entity_type,
+            )
+            if receipt is None:
+                raise RuntimeError(
+                    "finalization receipt disappeared after insert conflict"
+                ) from None
+            return FinalizationResult(receipt, won_receipt=False)
+        return FinalizationResult(learning_ids, won_receipt=True)
 
     def _apply_consolidation_lineage(
         self,

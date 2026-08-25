@@ -15,6 +15,7 @@ from reflexio.models.api_schema.retriever_schema import (
 from reflexio.models.api_schema.service_schemas import (
     AgentPlaybook,
     ProfileTimeToLive,
+    Status,
     UserPlaybook,
     UserProfile,
 )
@@ -30,6 +31,7 @@ from reflexio.server.services.storage.sqlite_storage import (
     _true_rrf_merge,
     _vector_rank_rows,
 )
+from reflexio.server.services.storage.sqlite_storage import _base as sqlite_storage_base
 from reflexio.server.services.storage.sqlite_storage._base import (
     _epoch_to_iso,
     _iso_to_epoch,
@@ -55,6 +57,42 @@ def storage():
         patch.object(SQLiteStorage, "_get_embedding", return_value=[0.0] * 512),
     ):
         yield SQLiteStorage(org_id="0", db_path=f"{temp_dir}/reflexio.db")
+
+
+def test_sqlite_storage_rejects_sqlite_before_returning_support(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(sqlite_storage_base.sqlite3, "sqlite_version_info", (3, 34, 99))
+    db_path = tmp_path / "missing" / "nested" / "old.db"
+
+    with (
+        patch.object(SQLiteStorage, "_get_embedding", return_value=[0.0] * 512),
+        pytest.raises(
+            RuntimeError,
+            match=r"SQLite 3\.35\.0 or newer is required; detected 3\.34\.99",
+        ),
+    ):
+        SQLiteStorage(org_id="version-check", db_path=str(db_path))
+
+    assert not db_path.parent.exists()
+    assert not db_path.exists()
+
+
+def test_sqlite_storage_accepts_sqlite_with_returning_support(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(sqlite_storage_base.sqlite3, "sqlite_version_info", (3, 35, 0))
+
+    with patch.object(SQLiteStorage, "_get_embedding", return_value=[0.0] * 512):
+        storage = SQLiteStorage(
+            org_id="version-check", db_path=str(tmp_path / "supported.db")
+        )
+    try:
+        assert storage.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'purge_operations'"
+        ).fetchone()
+    finally:
+        storage.conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +523,151 @@ def test_search_agent_playbooks_with_agent_version_filter(storage):
     )
     assert len(results) == 1
     assert results[0].agent_version == "v2"
+
+
+def test_playbook_search_filters_by_exact_source_and_agent_provenance(storage):
+    user_playbooks = [
+        UserPlaybook(
+            user_id="user1",
+            agent_version="v1",
+            request_id="r-api",
+            content="resolve billing issue",
+            source="api",
+        ),
+        UserPlaybook(
+            user_id="user1",
+            agent_version="v1",
+            request_id="r-webhook",
+            content="resolve billing issue",
+            source="webhook",
+        ),
+    ]
+    storage.save_user_playbooks(user_playbooks)
+    agent_playbooks = storage.save_agent_playbooks(
+        [
+            AgentPlaybook(agent_version="v1", content="api billing guidance"),
+            AgentPlaybook(agent_version="v1", content="webhook billing guidance"),
+            AgentPlaybook(agent_version="v1", content="orphan billing guidance"),
+        ]
+    )
+    storage.set_source_user_playbook_ids_for_agent_playbook(
+        agent_playbooks[0].agent_playbook_id,
+        [user_playbooks[0].user_playbook_id],
+    )
+    storage.set_source_user_playbook_ids_for_agent_playbook(
+        agent_playbooks[1].agent_playbook_id,
+        [user_playbooks[1].user_playbook_id],
+    )
+
+    user_query_results = storage.search_user_playbooks(
+        SearchUserPlaybookRequest(query="billing", source="api", top_k=10)
+    )
+    user_queryless_results = storage.search_user_playbooks(
+        SearchUserPlaybookRequest(source="webhook", top_k=10)
+    )
+    agent_query_results = storage.search_agent_playbooks(
+        SearchAgentPlaybookRequest(query="billing", source="api", top_k=10)
+    )
+    agent_queryless_results = storage.search_agent_playbooks(
+        SearchAgentPlaybookRequest(source="webhook", top_k=10)
+    )
+
+    assert [item.request_id for item in user_query_results] == ["r-api"]
+    assert [item.request_id for item in user_queryless_results] == ["r-webhook"]
+    assert [item.agent_playbook_id for item in agent_query_results] == [
+        agent_playbooks[0].agent_playbook_id
+    ]
+    assert [item.agent_playbook_id for item in agent_queryless_results] == [
+        agent_playbooks[1].agent_playbook_id
+    ]
+
+
+@pytest.mark.parametrize("query", [None, "lifecycle default"])
+@pytest.mark.parametrize("source", [None, "api"])
+def test_agent_playbook_search_defaults_to_current_and_pending(storage, query, source):
+    user_playbook = UserPlaybook(
+        user_id="user1",
+        agent_version="v1",
+        request_id="r-api-lifecycle",
+        content="lifecycle source",
+        source="api",
+    )
+    storage.save_user_playbooks([user_playbook])
+    agent_playbooks = storage.save_agent_playbooks(
+        [
+            AgentPlaybook(
+                agent_version="v1",
+                content="lifecycle default current",
+            ),
+            AgentPlaybook(
+                agent_version="v1",
+                content="lifecycle default pending",
+                status=Status.PENDING,
+            ),
+            AgentPlaybook(
+                agent_version="v1",
+                content="lifecycle default archived",
+                status=Status.ARCHIVED,
+            ),
+        ]
+    )
+    for playbook in agent_playbooks:
+        storage.set_source_user_playbook_ids_for_agent_playbook(
+            playbook.agent_playbook_id,
+            [user_playbook.user_playbook_id],
+        )
+
+    results = storage.search_agent_playbooks(
+        SearchAgentPlaybookRequest(query=query, source=source, top_k=10)
+    )
+
+    assert {item.status for item in results} == {None, Status.PENDING}
+    assert {item.agent_playbook_id for item in results} == {
+        agent_playbooks[0].agent_playbook_id,
+        agent_playbooks[1].agent_playbook_id,
+    }
+
+
+def test_source_filter_is_applied_before_vector_top_k(storage):
+    playbooks = [
+        UserPlaybook(
+            user_id="user1",
+            agent_version="v1",
+            request_id="r-wrong",
+            content="wrong source",
+            source="webhook",
+        ),
+        UserPlaybook(
+            user_id="user1",
+            agent_version="v1",
+            request_id="r-right",
+            content="right source",
+            source="api",
+        ),
+    ]
+    storage.save_user_playbooks(playbooks)
+    storage.conn.execute(
+        "UPDATE user_playbooks SET embedding = ? WHERE request_id = ?",
+        (json.dumps(_pad_embedding([1.0, 0.0])), "r-wrong"),
+    )
+    storage.conn.execute(
+        "UPDATE user_playbooks SET embedding = ? WHERE request_id = ?",
+        (json.dumps(_pad_embedding([0.5, 0.5])), "r-right"),
+    )
+    storage.conn.commit()
+
+    results = storage.search_user_playbooks(
+        SearchUserPlaybookRequest(
+            query="source",
+            source="api",
+            search_mode=SearchMode.VECTOR,
+            top_k=1,
+            threshold=0.0,
+        ),
+        SearchOptions(query_embedding=_pad_embedding([1.0, 0.0])),
+    )
+
+    assert [item.request_id for item in results] == ["r-right"]
 
 
 # ---------------------------------------------------------------------------

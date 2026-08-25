@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import socket
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -150,8 +151,8 @@ def test_find_pids_on_port_falls_back_to_ss(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(
-    shutil.which("lsof") is None and shutil.which("ss") is None,
-    reason="neither lsof nor ss is available",
+    shutil.which("ss" if sys.platform.startswith("linux") else "lsof") is None,
+    reason="the platform's bound-socket inspection tool is unavailable",
 )
 def test_find_pids_on_port_detects_bound_socket_without_listen() -> None:
     # Regression: an orphaned process can hold a port bound without listening
@@ -160,7 +161,18 @@ def test_find_pids_on_port_detects_bound_socket_without_listen() -> None:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
 
-        assert os.getpid() in utils.find_pids_on_port(port)
+        detected = utils.find_pids_on_port(port)
+        if sys.platform.startswith("linux") and os.getpid() not in detected:
+            probe = utils.subprocess.run(
+                ["ss", "-tanpH", "sport", "=", f":{port}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if f"pid={os.getpid()}" not in probe.stdout:
+                pytest.skip("ss cannot expose process metadata for this socket")
+
+        assert os.getpid() in detected
 
 
 def test_requested_port_conflicts_detect_duplicate_service_ports(
@@ -240,6 +252,7 @@ def test_run_services_cleans_up_when_initial_service_start_fails(
         return proc
 
     monkeypatch.setattr(utils.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(utils, "_wait_for_all_ready", lambda *_args: True)
 
     with pytest.raises(OSError, match="simulated initial spawn failure"):
         utils.run_services(
@@ -291,6 +304,71 @@ def test_run_services_calls_on_all_ready_once(
     )
 
     assert ready_calls == [{"backend": 8071}]
+
+
+@pytest.mark.unit
+def test_run_services_waits_for_local_embedding_before_starting_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Do not start backend lifespan work before local inference is ready."""
+    _patch_run_services_environment(monkeypatch, tmp_path)
+    lifecycle: list[str] = []
+
+    def fake_popen(command, **_kwargs) -> _FakeProcess:
+        lifecycle.append(f"start:{command[0]}")
+        return _FakeProcess(pid=1000 + len(lifecycle), polls_to_exit=1)
+
+    def fake_wait_for_ready(ready_events, processes) -> bool:
+        assert set(ready_events) == {"embedding"}
+        assert set(processes) == {"embedding"}
+        lifecycle.append("ready:embedding")
+        return True
+
+    monkeypatch.setattr(utils.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(utils, "_wait_for_all_ready", fake_wait_for_ready)
+
+    utils.run_services(
+        [
+            utils.ServiceConfig(name="embedding", command=["embedding"]),
+            utils.ServiceConfig(name="backend", command=["backend"]),
+        ],
+        {"embedding": 8072, "backend": 8071},
+    )
+
+    assert lifecycle[:3] == [
+        "start:embedding",
+        "ready:embedding",
+        "start:backend",
+    ]
+
+
+@pytest.mark.unit
+def test_run_services_aborts_when_local_embedding_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Clean up local inference and never start backend when readiness fails."""
+    _patch_run_services_environment(monkeypatch, tmp_path)
+    started: list[tuple[str, _FakeProcess]] = []
+
+    def fake_popen(command, **_kwargs) -> _FakeProcess:
+        proc = _FakeProcess(pid=1000 + len(started), polls_to_exit=1)
+        started.append((command[0], proc))
+        return proc
+
+    monkeypatch.setattr(utils.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(utils, "_wait_for_all_ready", lambda *_args: False)
+
+    with pytest.raises(RuntimeError, match=r"embedding.*ready"):
+        utils.run_services(
+            [
+                utils.ServiceConfig(name="embedding", command=["embedding"]),
+                utils.ServiceConfig(name="backend", command=["backend"]),
+            ],
+            {"embedding": 8072, "backend": 8071},
+        )
+
+    assert [name for name, _proc in started] == ["embedding"]
+    assert started[0][1].terminated is True
 
 
 @pytest.mark.unit

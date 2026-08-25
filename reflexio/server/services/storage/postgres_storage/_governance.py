@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import time
 from typing import Any, Literal, cast
 
@@ -20,6 +22,10 @@ from reflexio.server.services.governance.config import (
     governance_subject_ref,
 )
 from reflexio.server.services.storage.error import SubjectWriteBarrierError
+from reflexio.server.services.storage.governance_claims import (
+    PurgeExecutionClaim,
+    validate_purge_execution_claim,
+)
 from reflexio.server.services.storage.governance_validation import (
     _CANONICAL_DELETE_TARGET_NAMES,
     _PREPARE_PHASE,
@@ -134,6 +140,71 @@ class PostgresGovernanceMixin(SchemaScopedClient):
     def _subject_ref_for_user_id(self, user_id: str) -> str:
         return governance_subject_ref(self.org_id, user_id, get_governance_ref_secret())
 
+    def _authoritative_user_digest(self, purge_id: str, user_id: str) -> str:
+        material = f"authoritative-user-v1\0{self.org_id}\0{purge_id}\0{user_id}"
+        return hmac.new(
+            get_governance_ref_secret().encode(),
+            material.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _assert_authoritative_user_identity_locked(
+        self, purge_id: str, user_id: str
+    ) -> str:
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT operation_type, scope_type, subject_ref,
+                       authoritative_user_digest
+                FROM {}
+                WHERE org_id = %s AND purge_id = %s
+                FOR UPDATE
+                """
+            ).format(self._table_identifier("purge_operations")),
+            [self.org_id, purge_id],
+        )
+        expected_digest = self._authoritative_user_digest(purge_id, user_id)
+        if (
+            not rows
+            or rows[0]["operation_type"] != "user_erasure"
+            or rows[0]["scope_type"] != "user"
+            or rows[0]["subject_ref"] != self._subject_ref_for_user_id(user_id)
+            or rows[0]["authoritative_user_digest"] != expected_digest
+        ):
+            raise ValueError("Purge authoritative user identity does not match")
+        return expected_digest
+
+    def _assert_purge_operation_execution_claim_locked(
+        self,
+        purge_id: str,
+        execution_claim: PurgeExecutionClaim,
+    ) -> None:
+        claim = validate_purge_execution_claim(purge_id, execution_claim)
+        now = _now()
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                SELECT status, execution_claim_owner, execution_claim_fence,
+                       execution_claim_expires_at
+                FROM {}
+                WHERE org_id = %s AND purge_id = %s
+                FOR UPDATE
+                """
+            ).format(self._table_identifier("purge_operations")),
+            [self.org_id, purge_id],
+        )
+        if not rows:
+            raise ValueError(f"Purge operation {purge_id!r} not found")
+        row = rows[0]
+        if (
+            row["status"] != "running"
+            or row.get("execution_claim_owner") != claim.owner
+            or int(row.get("execution_claim_fence") or 0) != claim.fence
+            or row.get("execution_claim_expires_at") is None
+            or int(row["execution_claim_expires_at"]) <= now
+        ):
+            raise ValueError("purge execution claim is no longer active")
+
     def _active_subject_barrier(self, subject_ref: str) -> dict[str, Any] | None:
         rows = self._fetch_all(
             sql.SQL(
@@ -192,7 +263,11 @@ class PostgresGovernanceMixin(SchemaScopedClient):
 
     @handle_exceptions
     def begin_subject_erasure_barrier(
-        self, subject_ref: str, purge_id: str
+        self,
+        subject_ref: str,
+        purge_id: str,
+        *,
+        execution_claim: PurgeExecutionClaim,
     ) -> SubjectWriteBarrier:
         _validate_governance_prefixed_ref(
             "subject_ref", subject_ref, prefix="subref_v1_"
@@ -200,6 +275,9 @@ class PostgresGovernanceMixin(SchemaScopedClient):
         validated_purge_id = _validate_governance_purge_id("purge_id", purge_id)
         now = _now()
         with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                validated_purge_id, execution_claim
+            )
             purge_rows = self._fetch_all(
                 sql.SQL(
                     "SELECT * FROM {} WHERE org_id = %s AND purge_id = %s FOR UPDATE"
@@ -249,7 +327,12 @@ class PostgresGovernanceMixin(SchemaScopedClient):
 
     @handle_exceptions
     def complete_subject_erasure_barrier_after_empty_check(
-        self, purge_id: str, audit_event: AuditEvent
+        self,
+        purge_id: str,
+        audit_event: AuditEvent,
+        *,
+        authoritative_user_id: str,
+        execution_claim: PurgeExecutionClaim,
     ) -> PurgeOperation:
         validated_purge_id = _validate_governance_purge_id("purge_id", purge_id)
         if audit_event.org_id != self.org_id:
@@ -263,6 +346,12 @@ class PostgresGovernanceMixin(SchemaScopedClient):
         audit_event = _canonicalize_audit_event_for_persistence(audit_event)
         now = _now()
         with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                validated_purge_id, execution_claim
+            )
+            self._assert_authoritative_user_identity_locked(
+                validated_purge_id, authoritative_user_id
+            )
             purge_rows = self._fetch_all(
                 sql.SQL(
                     "SELECT * FROM {} WHERE org_id = %s AND purge_id = %s FOR UPDATE"
@@ -366,7 +455,9 @@ class PostgresGovernanceMixin(SchemaScopedClient):
             completed = self._fetch_all(
                 sql.SQL(
                     """UPDATE {} SET status = 'complete', error_code = NULL,
-                           error_detail = NULL, updated_at = %s, completed_at = %s
+                           error_detail = NULL, updated_at = %s, completed_at = %s,
+                           execution_claim_owner = NULL,
+                           execution_claim_expires_at = NULL
                        WHERE org_id = %s AND purge_id = %s RETURNING *"""
                 ).format(self._table_identifier("purge_operations")),
                 [now, now, self.org_id, validated_purge_id],
@@ -380,6 +471,8 @@ class PostgresGovernanceMixin(SchemaScopedClient):
         purge_id: str,
         error_code: str,
         error_detail: str,
+        *,
+        execution_claim: PurgeExecutionClaim,
     ) -> SubjectWriteBarrier:
         _validate_governance_prefixed_ref(
             "subject_ref", subject_ref, prefix="subref_v1_"
@@ -389,6 +482,9 @@ class PostgresGovernanceMixin(SchemaScopedClient):
         detail = _validate_governance_error_detail(error_detail)
         now = _now()
         with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                validated_purge_id, execution_claim
+            )
             rows = self._fetch_all(
                 sql.SQL(
                     """UPDATE {} SET status = 'failed', error_code = %s,
@@ -405,7 +501,9 @@ class PostgresGovernanceMixin(SchemaScopedClient):
             self._fetch_all(
                 sql.SQL(
                     """UPDATE {} SET status = 'failed', error_code = %s,
-                           error_detail = %s, updated_at = %s, completed_at = %s
+                           error_detail = %s, updated_at = %s, completed_at = %s,
+                           execution_claim_owner = NULL,
+                           execution_claim_expires_at = NULL
                        WHERE org_id = %s AND purge_id = %s RETURNING 1"""
                 ).format(self._table_identifier("purge_operations")),
                 [code, detail, now, now, self.org_id, validated_purge_id],
@@ -489,37 +587,190 @@ class PostgresGovernanceMixin(SchemaScopedClient):
         scope_type: Literal["user", "org"],
         subject_ref: str | None,
         request_ref: str,
+        authoritative_user_id: str | None = None,
     ) -> PurgeOperation:
+        if operation_type == "user_erasure" and scope_type == "user":
+            if not authoritative_user_id:
+                raise ValueError("authoritative user identity is required")
+            if subject_ref != self._subject_ref_for_user_id(authoritative_user_id):
+                raise ValueError("authoritative user identity must match subject_ref")
+        elif authoritative_user_id:
+            raise ValueError(
+                "authoritative user identity is only valid for user erasure"
+            )
+        authoritative_user_digest = (
+            self._authoritative_user_digest(purge_id, authoritative_user_id)
+            if authoritative_user_id
+            else None
+        )
+        now = _now()
+        with self.commit_scope():
+            existing = self._fetch_all(
+                sql.SQL(
+                    "SELECT * FROM {} WHERE org_id = %s AND idempotency_key = %s FOR UPDATE"
+                ).format(self._table_identifier("purge_operations")),
+                [self.org_id, idempotency_key],
+            )
+            if existing:
+                operation = _purge_operation(existing[0])
+                expected = {
+                    "purge_id": purge_id,
+                    "operation_type": operation_type,
+                    "scope_type": scope_type,
+                    "subject_ref": subject_ref,
+                    "request_ref": request_ref,
+                }
+                if (
+                    any(
+                        getattr(operation, name) != value
+                        for name, value in expected.items()
+                    )
+                    or existing[0].get("authoritative_user_digest")
+                    != authoritative_user_digest
+                ):
+                    raise ValueError(
+                        "Existing purge operation for idempotency_key has mismatched identity"
+                    )
+                return operation
+            rows = self._fetch_all(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (
+                        org_id, purge_id, operation_type, scope_type, subject_ref,
+                        request_ref, idempotency_key, authoritative_user_digest,
+                        status, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s)
+                    RETURNING *
+                    """
+                ).format(self._table_identifier("purge_operations")),
+                [
+                    self.org_id,
+                    purge_id,
+                    operation_type,
+                    scope_type,
+                    subject_ref,
+                    request_ref,
+                    idempotency_key,
+                    authoritative_user_digest,
+                    now,
+                    now,
+                ],
+            )
+        return _purge_operation(rows[0])
+
+    @handle_exceptions
+    def claim_purge_operation_execution(
+        self,
+        purge_id: str,
+        *,
+        lease_owner: str,
+        lease_ttl_seconds: int,
+    ) -> PurgeExecutionClaim | None:
+        purge_id = _validate_governance_purge_id("purge_id", purge_id)
+        if not lease_owner.strip():
+            raise ValueError("lease_owner is required")
+        if lease_ttl_seconds <= 0:
+            raise ValueError("lease_ttl_seconds must be positive")
         now = _now()
         rows = self._fetch_all(
             sql.SQL(
                 """
-                INSERT INTO {} (
-                    org_id, purge_id, operation_type, scope_type, subject_ref,
-                    request_ref, idempotency_key, status, created_at, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s)
-                ON CONFLICT (org_id, idempotency_key)
-                DO UPDATE SET updated_at = {}.updated_at
-                RETURNING *
+                UPDATE {}
+                SET status = 'running', error_code = NULL, error_detail = NULL,
+                    completed_at = NULL, updated_at = %s,
+                    execution_claim_owner = %s,
+                    execution_claim_fence = execution_claim_fence + 1,
+                    execution_claim_expires_at = %s
+                WHERE org_id = %s AND purge_id = %s
+                  AND (
+                    status IN ('pending', 'failed')
+                    OR (
+                        status = 'running'
+                        AND (
+                            execution_claim_expires_at IS NULL
+                            OR execution_claim_expires_at <= %s
+                        )
+                    )
+                  )
+                RETURNING execution_claim_owner, execution_claim_fence,
+                          execution_claim_expires_at
                 """
-            ).format(
-                self._table_identifier("purge_operations"),
-                self._table_identifier("purge_operations"),
-            ),
+            ).format(self._table_identifier("purge_operations")),
             [
+                now,
+                lease_owner,
+                now + lease_ttl_seconds,
                 self.org_id,
                 purge_id,
-                operation_type,
-                scope_type,
-                subject_ref,
-                request_ref,
-                idempotency_key,
-                now,
                 now,
             ],
         )
-        return _purge_operation(rows[0])
+        if not rows:
+            return None
+        return PurgeExecutionClaim(
+            purge_id=purge_id,
+            owner=str(rows[0]["execution_claim_owner"]),
+            fence=int(rows[0]["execution_claim_fence"]),
+            expires_at=int(rows[0]["execution_claim_expires_at"]),
+        )
+
+    @handle_exceptions
+    def assert_purge_operation_execution_claim(
+        self, purge_id: str, execution_claim: PurgeExecutionClaim
+    ) -> None:
+        purge_id = _validate_governance_purge_id("purge_id", purge_id)
+        with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                purge_id, execution_claim
+            )
+
+    @handle_exceptions
+    def renew_purge_operation_execution_claim(
+        self,
+        purge_id: str,
+        execution_claim: PurgeExecutionClaim,
+        *,
+        lease_ttl_seconds: int,
+    ) -> PurgeExecutionClaim:
+        purge_id = _validate_governance_purge_id("purge_id", purge_id)
+        claim = validate_purge_execution_claim(purge_id, execution_claim)
+        if lease_ttl_seconds <= 0:
+            raise ValueError("lease_ttl_seconds must be positive")
+        now = _now()
+        rows = self._fetch_all(
+            sql.SQL(
+                """
+                UPDATE {}
+                SET execution_claim_expires_at = %s, updated_at = %s
+                WHERE org_id = %s AND purge_id = %s
+                  AND status = 'running'
+                  AND execution_claim_owner = %s
+                  AND execution_claim_fence = %s
+                  AND execution_claim_expires_at IS NOT NULL
+                  AND execution_claim_expires_at > %s
+                RETURNING execution_claim_owner, execution_claim_fence,
+                          execution_claim_expires_at
+                """
+            ).format(self._table_identifier("purge_operations")),
+            [
+                now + lease_ttl_seconds,
+                now,
+                self.org_id,
+                purge_id,
+                claim.owner,
+                claim.fence,
+                now,
+            ],
+        )
+        if not rows:
+            raise ValueError("purge execution claim is no longer active")
+        return PurgeExecutionClaim(
+            purge_id=purge_id,
+            owner=str(rows[0]["execution_claim_owner"]),
+            fence=int(rows[0]["execution_claim_fence"]),
+            expires_at=int(rows[0]["execution_claim_expires_at"]),
+        )
 
     @handle_exceptions
     def record_purge_target(
@@ -528,15 +779,21 @@ class PostgresGovernanceMixin(SchemaScopedClient):
         target_name: str,
         phase: str,
         status: Literal["pending", "running", "failed", "complete"],
+        *,
+        execution_claim: PurgeExecutionClaim,
         target_ref: str = "",
         detail: dict[str, object] | None = None,
         deleted_count: int = 0,
         error_detail: str | None = None,
     ) -> None:
         now = _now()
-        self._fetch_all(
-            sql.SQL(
-                """
+        with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                purge_id, execution_claim
+            )
+            self._fetch_all(
+                sql.SQL(
+                    """
                 INSERT INTO {} (
                     org_id, purge_id, target_name, target_ref, phase, status,
                     detail, deleted_count, error_detail, started_at, completed_at
@@ -552,24 +809,40 @@ class PostgresGovernanceMixin(SchemaScopedClient):
                     completed_at = EXCLUDED.completed_at
                 RETURNING 1
                 """
-            ).format(
-                self._table_identifier("purge_operation_targets"),
-                self._table_identifier("purge_operation_targets"),
-            ),
-            [
-                self.org_id,
-                purge_id,
-                target_name,
-                target_ref,
-                phase,
-                status,
-                Json(detail),
-                deleted_count,
-                error_detail,
-                now if status == "running" else None,
-                now if status == "complete" else None,
-            ],
-        )
+                ).format(
+                    self._table_identifier("purge_operation_targets"),
+                    self._table_identifier("purge_operation_targets"),
+                ),
+                [
+                    self.org_id,
+                    purge_id,
+                    target_name,
+                    target_ref,
+                    phase,
+                    status,
+                    Json(detail),
+                    deleted_count,
+                    error_detail,
+                    now if status in {"running", "failed", "complete"} else None,
+                    now if status in {"failed", "complete"} else None,
+                ],
+            )
+            self._fetch_all(
+                sql.SQL(
+                    """
+                    UPDATE {}
+                    SET status = CASE
+                        WHEN status IN ('complete', 'failed') THEN status
+                        WHEN %s IN ('running', 'complete') THEN 'running'
+                        ELSE status
+                    END,
+                    updated_at = %s
+                    WHERE org_id = %s AND purge_id = %s
+                    RETURNING 1
+                    """
+                ).format(self._table_identifier("purge_operations")),
+                [status, now, self.org_id, purge_id],
+            )
 
     @handle_exceptions
     def list_purge_targets(
@@ -617,8 +890,17 @@ class PostgresGovernanceMixin(SchemaScopedClient):
         self,
         purge_id: str,
         user_id: str,
+        *,
+        execution_claim: PurgeExecutionClaim,
         owned_user_playbook_ids: set[int] | None = None,
     ) -> None:
+        with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                purge_id, execution_claim
+            )
+            authoritative_user_digest = self._assert_authoritative_user_identity_locked(
+                purge_id, user_id
+            )
         if self.purge_targets_prepared(purge_id):
             return
         if owned_user_playbook_ids is None:
@@ -685,6 +967,7 @@ class PostgresGovernanceMixin(SchemaScopedClient):
                 target_name,
                 "delete",
                 "pending",
+                execution_claim=execution_claim,
                 target_ref="all",
                 detail={"count": count},
             )
@@ -693,8 +976,10 @@ class PostgresGovernanceMixin(SchemaScopedClient):
             "target_snapshot",
             "prepare_targets",
             "complete",
+            execution_claim=execution_claim,
             target_ref="all",
             detail={
+                "authoritative_user_digest": authoritative_user_digest,
                 "owned_user_playbook_ids": sorted(owned_user_playbook_ids or []),
                 "affected_agent_playbook_ids": [],
             },
@@ -710,49 +995,75 @@ class PostgresGovernanceMixin(SchemaScopedClient):
         return int(rows[0]["count"]) if rows else 0
 
     @handle_exceptions
-    def hide_governance_agent_playbooks_for_rebuild(self, purge_id: str) -> list[int]:
-        rows = self._fetch_all(
-            sql.SQL(
-                """
-                SELECT target_ref FROM {}
-                WHERE org_id = %s AND purge_id = %s
-                  AND target_name = 'agent_playbook'
-                  AND phase = 'rebuild_without_erased_sources'
-                  AND target_ref != ''
-                  AND status != 'complete'
-                ORDER BY target_ref
-                """
-            ).format(self._table_identifier("purge_operation_targets")),
-            [self.org_id, purge_id],
-        )
-        ids = [int(row["target_ref"]) for row in rows]
-        if ids:
-            self._fetch_all(
-                sql.SQL(
-                    "UPDATE {} SET status = 'archive_in_progress' "
-                    "WHERE agent_playbook_id = ANY(%s) RETURNING 1"
-                ).format(self._table_identifier("agent_playbooks")),
-                [ids],
+    def hide_governance_agent_playbooks_for_rebuild(
+        self,
+        purge_id: str,
+        *,
+        execution_claim: PurgeExecutionClaim,
+    ) -> list[int]:
+        with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                purge_id, execution_claim
             )
-            for agent_playbook_id in ids:
-                self.record_purge_target(
-                    purge_id,
-                    "agent_playbook",
-                    "hide_for_rebuild",
-                    "complete",
-                    target_ref=str(agent_playbook_id),
+            rows = self._fetch_all(
+                sql.SQL(
+                    """
+                    SELECT target_ref FROM {}
+                    WHERE org_id = %s AND purge_id = %s
+                      AND target_name = 'agent_playbook'
+                      AND phase = 'rebuild_without_erased_sources'
+                      AND target_ref != ''
+                      AND status != 'complete'
+                    ORDER BY target_ref
+                    """
+                ).format(self._table_identifier("purge_operation_targets")),
+                [self.org_id, purge_id],
+            )
+            ids = [int(row["target_ref"]) for row in rows]
+            if ids:
+                self._fetch_all(
+                    sql.SQL(
+                        "UPDATE {} SET status = 'archive_in_progress' "
+                        "WHERE agent_playbook_id = ANY(%s) RETURNING 1"
+                    ).format(self._table_identifier("agent_playbooks")),
+                    [ids],
                 )
+                for agent_playbook_id in ids:
+                    self.record_purge_target(
+                        purge_id,
+                        "agent_playbook",
+                        "hide_for_rebuild",
+                        "complete",
+                        execution_claim=execution_claim,
+                        target_ref=str(agent_playbook_id),
+                    )
         return ids
 
     @handle_exceptions
     def apply_governance_user_data_delete(
-        self, purge_id: str, user_id: str
+        self,
+        purge_id: str,
+        user_id: str,
+        *,
+        execution_claim: PurgeExecutionClaim,
     ) -> dict[str, int]:
         with self.commit_scope():
-            return self._apply_governance_user_data_delete(purge_id, user_id)
+            self._assert_purge_operation_execution_claim_locked(
+                purge_id, execution_claim
+            )
+            self._assert_authoritative_user_identity_locked(purge_id, user_id)
+            return self._apply_governance_user_data_delete(
+                purge_id,
+                user_id,
+                execution_claim=execution_claim,
+            )
 
     def _apply_governance_user_data_delete(
-        self, purge_id: str, user_id: str
+        self,
+        purge_id: str,
+        user_id: str,
+        *,
+        execution_claim: PurgeExecutionClaim,
     ) -> dict[str, int]:
         session_ids = [
             str(row["session_id"])
@@ -843,6 +1154,7 @@ class PostgresGovernanceMixin(SchemaScopedClient):
                 target_names.get(key, key),
                 "delete",
                 "complete",
+                execution_claim=execution_claim,
                 target_ref="all",
                 detail={"count": int(value)},
                 deleted_count=int(value),
@@ -861,93 +1173,125 @@ class PostgresGovernanceMixin(SchemaScopedClient):
         blocking_issue: dict[str, object] | None,
         expanded_terms: str | None,
         tags: list[str] | None,
+        *,
+        execution_claim: PurgeExecutionClaim,
     ) -> None:
-        self._table("agent_playbooks").update(
-            {
-                "content": content or "",
-                "trigger": trigger,
-                "rationale": rationale,
-                "blocking_issue": blocking_issue,
-                "expanded_terms": expanded_terms,
-                "tags": tags,
-                "status": None,
-            }
-        ).eq("agent_playbook_id", agent_playbook_id).execute()
-        self._table("agent_playbook_source_user_playbooks").delete().eq(
-            "agent_playbook_id", agent_playbook_id
-        ).execute()
-        if remaining_source_windows:
-            source_window_rows: list[dict[str, Any]] = []
-            for window in remaining_source_windows:
-                user_playbook_id = window.get("user_playbook_id")
-                if user_playbook_id is None:
-                    continue
-                source_window_rows.append(
-                    {
-                        "agent_playbook_id": agent_playbook_id,
-                        "user_playbook_id": int(cast(Any, user_playbook_id)),
-                        "source_interaction_ids": window.get(
-                            "source_interaction_ids", []
-                        ),
-                    }
-                )
-            self._table("agent_playbook_source_user_playbooks").insert(
-                source_window_rows
-            ).execute()
-        self.record_purge_target(
-            purge_id,
-            "agent_playbook",
-            "rebuild_without_erased_sources",
-            "complete",
-            target_ref=str(agent_playbook_id),
-        )
-        if self._opensearch:
-            response = (
-                self._table("agent_playbooks")
-                .select("*")
-                .eq("agent_playbook_id", agent_playbook_id)
-                .execute()
+        with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                purge_id, execution_claim
             )
-            self._opensearch.index_rows("agent_playbooks", response.data or [])
+            self._table("agent_playbooks").update(
+                {
+                    "content": content or "",
+                    "trigger": trigger,
+                    "rationale": rationale,
+                    "blocking_issue": blocking_issue,
+                    "expanded_terms": expanded_terms,
+                    "tags": tags,
+                    "status": None,
+                }
+            ).eq("agent_playbook_id", agent_playbook_id).execute()
+            self._table("agent_playbook_source_user_playbooks").delete().eq(
+                "agent_playbook_id", agent_playbook_id
+            ).execute()
+            if remaining_source_windows:
+                source_window_rows: list[dict[str, Any]] = []
+                for window in remaining_source_windows:
+                    user_playbook_id = window.get("user_playbook_id")
+                    if user_playbook_id is None:
+                        continue
+                    source_window_rows.append(
+                        {
+                            "agent_playbook_id": agent_playbook_id,
+                            "user_playbook_id": int(cast(Any, user_playbook_id)),
+                            "source_interaction_ids": window.get(
+                                "source_interaction_ids", []
+                            ),
+                        }
+                    )
+                self._table("agent_playbook_source_user_playbooks").insert(
+                    source_window_rows
+                ).execute()
+            self.record_purge_target(
+                purge_id,
+                "agent_playbook",
+                "rebuild_without_erased_sources",
+                "complete",
+                execution_claim=execution_claim,
+                target_ref=str(agent_playbook_id),
+            )
+            if self._opensearch:
+                response = (
+                    self._table("agent_playbooks")
+                    .select("*")
+                    .eq("agent_playbook_id", agent_playbook_id)
+                    .execute()
+                )
+                self._opensearch.index_rows("agent_playbooks", response.data or [])
 
     @handle_exceptions
     def complete_purge_operation_with_audit(
-        self, purge_id: str, audit_event: AuditEvent
+        self,
+        purge_id: str,
+        audit_event: AuditEvent,
+        *,
+        authoritative_user_id: str,
+        execution_claim: PurgeExecutionClaim,
     ) -> PurgeOperation:
-        audit_event.idempotency_key = audit_event.idempotency_key or purge_id
-        self.append_audit_event(audit_event)
-        now = _now()
-        rows = self._fetch_all(
-            sql.SQL(
-                """
-                UPDATE {} SET status = 'complete', error_code = NULL,
-                    error_detail = NULL, updated_at = %s, completed_at = %s
-                WHERE org_id = %s AND purge_id = %s
-                RETURNING *
-                """
-            ).format(self._table_identifier("purge_operations")),
-            [now, now, self.org_id, purge_id],
-        )
+        with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                purge_id, execution_claim
+            )
+            self._assert_authoritative_user_identity_locked(
+                purge_id, authoritative_user_id
+            )
+            audit_event.idempotency_key = audit_event.idempotency_key or purge_id
+            self.append_audit_event(audit_event)
+            now = _now()
+            rows = self._fetch_all(
+                sql.SQL(
+                    """
+                    UPDATE {} SET status = 'complete', error_code = NULL,
+                        error_detail = NULL, updated_at = %s, completed_at = %s,
+                        execution_claim_owner = NULL,
+                        execution_claim_expires_at = NULL
+                    WHERE org_id = %s AND purge_id = %s
+                    RETURNING *
+                    """
+                ).format(self._table_identifier("purge_operations")),
+                [now, now, self.org_id, purge_id],
+            )
         if not rows:
             raise ValueError(f"Purge operation {purge_id!r} not found")
         return _purge_operation(rows[0])
 
     @handle_exceptions
     def fail_purge_operation(
-        self, purge_id: str, error_code: str, error_detail: str
+        self,
+        purge_id: str,
+        error_code: str,
+        error_detail: str,
+        *,
+        execution_claim: PurgeExecutionClaim,
     ) -> PurgeOperation:
-        now = _now()
-        rows = self._fetch_all(
-            sql.SQL(
-                """
-                UPDATE {} SET status = 'failed', error_code = %s,
-                    error_detail = %s, updated_at = %s, completed_at = %s
-                WHERE org_id = %s AND purge_id = %s
-                RETURNING *
-                """
-            ).format(self._table_identifier("purge_operations")),
-            [error_code, error_detail, now, now, self.org_id, purge_id],
-        )
+        with self.commit_scope():
+            self._assert_purge_operation_execution_claim_locked(
+                purge_id, execution_claim
+            )
+            now = _now()
+            rows = self._fetch_all(
+                sql.SQL(
+                    """
+                    UPDATE {} SET status = 'failed', error_code = %s,
+                        error_detail = %s, updated_at = %s, completed_at = %s,
+                        execution_claim_owner = NULL,
+                        execution_claim_expires_at = NULL
+                    WHERE org_id = %s AND purge_id = %s
+                    RETURNING *
+                    """
+                ).format(self._table_identifier("purge_operations")),
+                [error_code, error_detail, now, now, self.org_id, purge_id],
+            )
         if not rows:
             raise ValueError(f"Purge operation {purge_id!r} not found")
         return _purge_operation(rows[0])

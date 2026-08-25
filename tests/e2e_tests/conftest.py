@@ -24,13 +24,34 @@ from reflexio.models.config_schema import (
     StorageConfigSQLite,
     ToolUseConfig,
 )
+from reflexio.server import usage_metrics
 from reflexio.server.services.configurator.configurator import DefaultConfigurator
 from reflexio.server.services.tagging.tagging_scheduler import drain_tagging
-from reflexio.test_support.llm_mock import patched_litellm
+from reflexio.test_support.llm_mock import (
+    assert_litellm_unpatched,
+    patched_litellm,
+    unpatched_litellm,
+)
 
 _TEST_DATA_DIR = Path(__file__).resolve().parent.parent / "test_data"
 _SCENARIO_DIR = _TEST_DATA_DIR / "scenarios" / "e2e"
 _CUSTOMER_SUPPORT_WINDOW_SIZE = 20
+# Pin the extraction cadence for e2e fixtures instead of inheriting
+# ``DEFAULT_STRIDE_SIZE``. That default is a production cost knob (raised 5 -> 8
+# in "update stride size to 8 to save cost"), and every raise silently stops
+# extraction from running for tests whose batches are smaller than the new
+# value — the test then asserts against zero profiles/playbooks and fails for a
+# reason that has nothing to do with what it covers. A stride of 1 means one
+# extraction pass per publish call, which is what these tests assume.
+#
+# ``skip_should_run_check=True`` is pinned alongside it for the same reason. It
+# is the OTHER gate that can suppress extraction: a real LLM decides whether a
+# batch is worth extracting, and on the small batches these tests publish it
+# says no often enough to be a coin flip ("Pre-extraction check returned False
+# ... skipping" -- observed on 2 of 4 dedup runs, where it read as the dedup
+# model failing to resolve a contradiction it was never asked about). No e2e
+# test covers the gate itself, so no coverage is lost.
+_E2E_STRIDE_SIZE = 1
 _CUSTOMER_SUPPORT_PROFILE_DEFINITION = """
 name, occupation, location, membership tier, order context, communication preferences,
 formatting preferences, timeline preferences, and other durable customer-support
@@ -39,13 +60,36 @@ personalization facts from the conversation
 
 
 @pytest.fixture(autouse=True)
-def mock_llm(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[None]:
-    """Keep the standard E2E tier deterministic and credential-free."""
-    if request.node.get_closest_marker("requires_credentials"):
-        monkeypatch.delenv("MOCK_LLM_RESPONSE", raising=False)
+def _install_oss_usage_event_exemption() -> Iterator[None]:
+    """Match the explicit billing exemption installed by the OSS app lifespan."""
+    usage_metrics.configure_usage_event_recorder(
+        usage_metrics.exempt_usage_event_recorder
+    )
+    try:
         yield
+    finally:
+        usage_metrics.configure_usage_event_recorder(None)
+
+
+@pytest.fixture(autouse=True)
+def mock_llm(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Keep the standard E2E tier deterministic and credential-free.
+
+    ``requires_credentials`` tests need the real provider, so the session-level
+    patch is *stopped* for them rather than having ``MOCK_LLM_RESPONSE``
+    deleted. Deleting the variable only removed the evidence: whether the patch
+    was live depended on the invocation path (``pytest -m e2e`` carries none,
+    so ``configure_llm_mock`` patched anyway), and a live-provider test would
+    then assert against canned mock text with nothing left to reveal it.
+    """
+    if request.node.get_closest_marker("requires_credentials"):
+        with unpatched_litellm():
+            # Confirm the lift actually took before the test asserts on model
+            # behavior. Anything that patched litellm at another layer, or a
+            # future change that quietly makes the suspend a no-op, surfaces
+            # here as a failure rather than as a test grading canned text.
+            assert_litellm_unpatched()
+            yield
         return
     with patched_litellm():
         yield
@@ -120,6 +164,7 @@ def reflexio_instance(
         agent_context_prompt="this is a sales agent",
         skip_should_run_check=True,
         window_size=_CUSTOMER_SUPPORT_WINDOW_SIZE,
+        stride_size=_E2E_STRIDE_SIZE,
         # Single configured profile extractor (the list-valued field is retired and
         # the Config constructor would ignore it, dropping tagging_definition_prompt).
         profile_extractor_config=ProfileExtractorConfig(
@@ -166,9 +211,10 @@ def reflexio_instance_profile_only(
 ) -> Reflexio:
     """Create an Reflexio instance with only profile extraction config."""
     config = Config(
+        stride_size=_E2E_STRIDE_SIZE,
+        skip_should_run_check=True,
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
-        skip_should_run_check=True,
         window_size=_CUSTOMER_SUPPORT_WINDOW_SIZE,
         user_playbook_extractor_config=None,
         profile_extractor_config=ProfileExtractorConfig(
@@ -200,6 +246,8 @@ def reflexio_instance_lifestyle_profile(
     config = Config(
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a personal assistant that learns about the user over time",
+        stride_size=_E2E_STRIDE_SIZE,
+        skip_should_run_check=True,
         profile_extractor_config=ProfileExtractorConfig(
             extractor_name="lifestyle_extractor",
             context_prompt="""
@@ -265,6 +313,8 @@ def reflexio_instance_playbook_only(
     config = Config(
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
+        stride_size=_E2E_STRIDE_SIZE,
+        skip_should_run_check=True,
         user_playbook_extractor_config=PlaybookConfig(
             extractor_name="test_playbook",
             extraction_definition_prompt="""
@@ -288,6 +338,8 @@ def reflexio_instance_agent_success_only(
 ) -> Reflexio:
     """Create an Reflexio instance with only agent success config."""
     config = Config(
+        stride_size=_E2E_STRIDE_SIZE,
+        skip_should_run_check=True,
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
         agent_success_config=AgentSuccessConfig(
@@ -429,6 +481,8 @@ def reflexio_instance_playbook_source_filtering(
 ) -> Reflexio:
     """Create an Reflexio instance with playbook configs using request_sources_enabled filtering."""
     config = Config(
+        stride_size=_E2E_STRIDE_SIZE,
+        skip_should_run_check=True,
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
         # Single playbook extractor, only enabled for the "api" source. The
@@ -466,6 +520,8 @@ def reflexio_instance_manual_profile(
     - manual_trigger=True on the extractor
     """
     config = Config(
+        stride_size=_E2E_STRIDE_SIZE,
+        skip_should_run_check=True,
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
         window_size=10,  # Required for manual generation
@@ -505,6 +561,8 @@ def reflexio_instance_manual_playbook(
     - window_size set (required for manual generation)
     """
     config = Config(
+        stride_size=_E2E_STRIDE_SIZE,
+        skip_should_run_check=True,
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
         window_size=10,  # Required for manual generation
@@ -540,6 +598,8 @@ def reflexio_instance_multiple_profile_extractors(
     under the singleton profile name regardless of the configured extractor_name.
     """
     config = Config(
+        stride_size=_E2E_STRIDE_SIZE,
+        skip_should_run_check=True,
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
         window_size=20,
@@ -577,6 +637,8 @@ def reflexio_instance_multiple_playbook_extractors(
     extractor_name, and the extractor runs for all sources.
     """
     config = Config(
+        stride_size=_E2E_STRIDE_SIZE,
+        skip_should_run_check=True,
         storage_config=sqlite_storage_config,
         agent_context_prompt="this is a sales agent",
         window_size=20,

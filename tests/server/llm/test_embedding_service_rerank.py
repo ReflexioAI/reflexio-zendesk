@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi.testclient import TestClient
 
+from reflexio.server.llm import embedding_service
 from reflexio.server.llm.embedding_service import create_embedding_app
 from reflexio.server.llm.rerank.common import (
     MULTILINGUAL_RERANK_MODEL,
@@ -133,3 +136,39 @@ def test_service_lifespan_prewarms_runner_directly() -> None:
     with TestClient(create_embedding_app(reranker_runner=runner)) as client:  # type: ignore[arg-type]
         assert client.get("/health").status_code == 200
     assert runner.prewarm_calls == 1
+
+
+def test_service_lifespan_logs_operator_model_and_device_contract(
+    monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr(embedding_service, "_ACTIVE_MODEL", None)
+    monkeypatch.setenv("NOMIC_EMBED_DEVICE", "cuda")
+    monkeypatch.setenv("REFLEXIO_RERANK_DEVICE", "cuda")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    runner = _Runner()
+    model = "local/test-embedding"
+    with (
+        caplog.at_level(logging.INFO, logger="reflexio.server.llm.embedding_service"),
+        TestClient(
+            create_embedding_app(
+                default_model=model,
+                allowed_models={model},
+                model_encoders={model: lambda texts: [[1.0] for _text in texts]},
+                reranker_model=MULTILINGUAL_RERANK_MODEL,
+                reranker_runner=runner,  # type: ignore[arg-type]
+            )
+        ),
+    ):
+        pass
+
+    message = next(
+        record.message
+        for record in caplog.records
+        if "event=inference_service_ready" in record.message
+    )
+    assert f"configured_model={model}" in message
+    assert f"configured_reranker_model={MULTILINGUAL_RERANK_MODEL}" in message
+    assert "embedding_device=cuda" in message
+    assert "reranker_device=cuda" in message
+    assert "reranker_ready=True" in message
+    assert "hf_offline=1" in message

@@ -18,11 +18,13 @@ import pytest
 from psycopg2 import sql
 
 from reflexio.models.api_schema.retriever_schema import (
+    SearchAgentPlaybookRequest,
     SearchUserPlaybookRequest,
     SearchUserProfileRequest,
 )
 from reflexio.models.api_schema.service_schemas import (
     NEVER_EXPIRES_TIMESTAMP,
+    AgentPlaybook,
     Interaction,
     LineageContext,
     ProfileTimeToLive,
@@ -260,3 +262,73 @@ def test_postgres_opensearch_user_playbook_search_excludes_superseded(
 
     assert [item.user_playbook_id for item in results] == [successor.user_playbook_id]
     assert embedding_purposes == ["query"]
+
+
+@skip_in_precommit
+def test_postgres_opensearch_source_filters_use_postgres_ownership_links(
+    postgres_opensearch_storage: PostgresStorage,
+) -> None:
+    run_id = uuid.uuid4().hex[:8]
+    desired_source = f"zendesk-{run_id}"
+    other_source = f"slack-{run_id}"
+    desired_user_playbook = UserPlaybook(
+        user_id=f"source-user-{run_id}",
+        request_id=f"source-request-a-{run_id}",
+        agent_version="codex",
+        content="Use the shared retrieval source routing procedure.",
+        source=desired_source,
+    )
+    other_user_playbook = UserPlaybook(
+        user_id=f"source-user-{run_id}",
+        request_id=f"source-request-b-{run_id}",
+        agent_version="codex",
+        content="Use the shared retrieval source routing procedure.",
+        source=other_source,
+    )
+    postgres_opensearch_storage.save_user_playbooks(
+        [desired_user_playbook, other_user_playbook]
+    )
+
+    desired_agent_playbook = AgentPlaybook(
+        agent_version="codex",
+        content="Apply the shared retrieval source routing procedure.",
+    )
+    other_agent_playbook = AgentPlaybook(
+        agent_version="codex",
+        content="Apply the shared retrieval source routing procedure.",
+    )
+    postgres_opensearch_storage.save_agent_playbooks(
+        [desired_agent_playbook, other_agent_playbook]
+    )
+    postgres_opensearch_storage.set_source_user_playbook_ids_for_agent_playbook(
+        desired_agent_playbook.agent_playbook_id,
+        [desired_user_playbook.user_playbook_id],
+    )
+    postgres_opensearch_storage.set_source_user_playbook_ids_for_agent_playbook(
+        other_agent_playbook.agent_playbook_id,
+        [other_user_playbook.user_playbook_id],
+    )
+
+    user_results = postgres_opensearch_storage.search_user_playbooks(
+        SearchUserPlaybookRequest(
+            query="shared retrieval source routing procedure",
+            source=desired_source,
+            top_k=10,
+            threshold=0.1,
+        )
+    )
+    agent_results = postgres_opensearch_storage.search_agent_playbooks(
+        SearchAgentPlaybookRequest(
+            query="shared retrieval source routing procedure",
+            source=desired_source,
+            top_k=10,
+            threshold=0.1,
+        )
+    )
+
+    assert [item.user_playbook_id for item in user_results] == [
+        desired_user_playbook.user_playbook_id
+    ]
+    assert [item.agent_playbook_id for item in agent_results] == [
+        desired_agent_playbook.agent_playbook_id
+    ]
