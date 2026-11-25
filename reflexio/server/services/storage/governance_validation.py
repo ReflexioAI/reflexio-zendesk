@@ -363,7 +363,7 @@ def _validate_governance_window_list(
         }
         if unexpected_keys:
             _raise_governance_validation_error(
-                f"{field_name}[{index}]", sorted(unexpected_keys)[0]
+                f"{field_name}[{index}]", min(unexpected_keys)
             )
         if "user_playbook_id" not in normalized_item:
             _raise_governance_validation_error(
