@@ -185,7 +185,10 @@ class NomicEmbedder:
             device = os.environ.get("NOMIC_EMBED_DEVICE", "cpu")
             self._model = SentenceTransformer(
                 _HF_MODEL_NAME,
-                trust_remote_code=True,  # Nomic v1.5 ships custom code
+                # Native nomic_bert loading. The checkpoint's legacy remote code
+                # calls get_extended_attention_mask, which transformers 5.17
+                # removed, so trust_remote_code=True fails at first inference.
+                trust_remote_code=False,
                 device=device,
             )
             _LOGGER.info(

@@ -25,7 +25,7 @@ foreign members, Tier-1b idiom) is added.
 
 import logging
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import litellm
 import tiktoken
@@ -42,6 +42,8 @@ from reflexio.server.llm.providers.embedding_service_provider import (
 )
 
 if TYPE_CHECKING:
+    from litellm.types.utils import EmbeddingResponse
+
     from reflexio.server.llm._litellm_types import LiteLLMConfig
 
 _LOGGER = logging.getLogger(__name__)
@@ -371,10 +373,15 @@ class EmbeddingMixin:
                 params["api_version"] = api_version
 
             with provider_slot(params["model"]):
-                response = litellm.embedding(
-                    **params,
-                    timeout=self.config.timeout,
-                    num_retries=self.config.max_retries,
+                # LiteLLM declares ``EmbeddingResponse | Coroutine``; the sync
+                # call (no ``aembedding``) always returns the response.
+                response = cast(
+                    "EmbeddingResponse",
+                    litellm.embedding(
+                        **params,
+                        timeout=self.config.timeout,
+                        num_retries=self.config.max_retries,
+                    ),
                 )
             # Response data may not be in order, sort by index to ensure correct ordering
             sorted_data = sorted(response.data, key=lambda x: x["index"])

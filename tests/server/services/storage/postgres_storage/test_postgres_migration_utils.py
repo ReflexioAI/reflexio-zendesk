@@ -8,7 +8,7 @@ from reflexio.server.services.storage.postgres_storage._migration_utils import (
 
 
 def test_latest_migration_version_uses_packaged_migrations() -> None:
-    latest_migration = sorted(_MIGRATION_DIR.glob("*.sql"))[-1].name.split("_")[0]
+    latest_migration = max(_MIGRATION_DIR.glob("*.sql")).name.split("_")[0]
 
     assert get_latest_migration_version() == latest_migration
 
